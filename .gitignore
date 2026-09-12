@@ -1,7 +1,9 @@
 # Local conversations, databases, attachments, backups, and downloaded models.
 /data/
 /backend/data/
-/models/
+# Keep the folder in fresh clones, but never track downloaded model/runtime files.
+/models/*
+!/models/.gitkeep
 /backups/
 /backend/backups/
 *.db
