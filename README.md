@@ -4,6 +4,7 @@ Privacy-first local AI companion (llama.cpp + GGUF). See `docs/ARCHITECTURE.md`
 and [the v5.1 product review](docs/PRODUCT_REVIEW_2026-09-11.md) for implemented improvements, verification and the remaining full-product roadmap.
 
 ## Layout (§71)
+
 ```
 local-llm-companion/
   backend/   # Rust Axum API: chat, models, tools, agent, search, vision, docs, memory, daio, index, knowledge, plugins
@@ -13,12 +14,144 @@ local-llm-companion/
   models/    # GGUF files in root/subfolders; metadata.json optional
 ```
 
-## Run
+## Install prerequisites (Windows / PowerShell)
+
+Install these before running the project from source:
+
+1. **Git** — install [Git for Windows](https://git-scm.com/downloads/win) to clone
+   the repository and use the app's Git features.
+2. **Node.js 24 LTS with npm** — use the [official Node.js installer](https://nodejs.org/en/download).
+   Keep the npm option enabled; a separate npm installation is not needed.
+   Node.js 24+ is used by this project's tests, which import TypeScript directly.
+3. **Rust stable with Cargo** — install through [rustup](https://rust-lang.org/tools/install/)
+   and choose the default Windows MSVC toolchain. Cargo is included with Rust.
+   If Rust is already installed, run `rustup update stable`.
+4. **Visual Studio C++ build tools and Windows SDK** — follow the
+   [Rust Windows prerequisites](https://rust-lang.github.io/rustup/installation/windows-msvc.html).
+   In the Visual Studio installer, select **Desktop development with C++**, including
+   the MSVC x64/x86 tools and a Windows SDK. These supply the linker and compiler
+   needed by the backend and its bundled SQLite dependency. VS Code alone is not
+   a replacement for these build tools.
+5. **llama.cpp's `llama-server` runtime** — required to generate model responses;
+   it is not installed by Cargo or npm. See the runtime setup below.
+6. **A compatible GGUF model** — download one separately or use the app's model
+   downloader. Model weights are not included in this repository.
+
+Open a **new PowerShell terminal** after installation so PATH changes take effect,
+then check:
+
+```powershell
+git --version
+node --version
+npm --version
+rustc --version
+cargo --version
+```
+
+The current development setup was verified with Rust/Cargo 1.98.1 and Node.js
+24.13.0; these are tested versions, not a declared minimum Rust version.
+React, Vite, TypeScript, and Rust libraries are installed automatically by the
+project's package managers; do not install them globally. A separate SQLite
+server is not required. Python 3 is optional, only for the included
+`scripts/backup-data.py` utility, not for building or running the core app.
+
+Allow disk space for build artifacts and model downloads. RAM/VRAM requirements
+depend on the model, quantization, and context size; model file size alone is not
+the total runtime memory requirement. The first build needs internet access to
+download dependencies. Local inference does not require a cloud API key.
+
+## First-time setup
+
+### 1. Clone the project
+
+```powershell
+git clone https://github.com/Insomniac-Coder/local-llm-companion.git
+cd local-llm-companion
+```
+
+Run the remaining commands from this project directory.
+
+### 2. Install the model runtime
+
+Download a Windows build from the official [llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases).
+Choose a build appropriate for your machine (CPU, or a supported GPU backend).
+Extract `llama-server.exe` **and its accompanying DLLs** into `models/bin/`.
+Keep the release's runtime dependencies together; copying only the executable
+can cause missing-DLL errors. For GPU builds, follow that release's driver and
+runtime requirements. Prebuilt releases avoid having to compile llama.cpp yourself.
+
+The expected layout is:
+
+```text
+models/
+  .gitkeep
+  bin/
+    llama-server.exe
+    ...DLLs from the matching release...
+  my-model.gguf
+```
+
+Verify the runtime can start:
+
+```powershell
+.\models\bin\llama-server.exe --version
+```
+
+Alternatively, install `llama-server` on PATH or set its full path before starting
+the app:
+
+```powershell
+$env:COMPANION_LLAMA_SERVER_BIN = 'C:\path\to\llama-server.exe'
+```
+
+The environment-variable override takes precedence over PATH and `models/bin/`.
+The app launches the model server itself; you do not need to run a second server
+manually. Its default inference port is `3888`.
+
+### 3. Add a model manually (or download one in the app)
+
+The `models/` directory is included in fresh clones via `.gitkeep`. Place a GGUF
+directly inside it, such as `models/my-model.gguf`, or in a model-specific folder,
+such as `models/my-model/model.gguf`. For supported models, `metadata.json` is
+optional: the app reads GGUF metadata to discover the model. Split GGUF models
+need all their shards in the same folder.
+
+If you add files while the app is open, use **Scan** in the model library to
+rediscover them, then select and load the model. Models and runtime binaries stay
+local and are ignored by Git. Building the app does **not** download model weights.
+
+### 4. Build and run
+
 ```powershell
 .\run.ps1                           # builds UI and starts one local process
 # Open http://localhost:5173
 # Press Ctrl+C once to stop the server and llama sidecar cleanly.
 ```
+
+The launcher runs `npm ci` if `frontend/node_modules` is missing, builds the
+frontend, and uses Cargo to build/start the backend. The initial build can take
+several minutes; wait for the server's startup output before opening the page.
+Keep this terminal open while using the app. On later runs, use the same command.
+
+After launch, open **Models**, scan if needed, and load your GGUF model. The app
+can open without model weights/runtime installed, but it cannot generate real
+model responses until both are available.
+
+### Common setup issues
+
+- **`cargo`, `node`, or `npm` is not recognized:** finish the relevant installation
+  and reopen PowerShell so it sees the updated PATH.
+- **`link.exe`, MSVC, or Windows SDK errors:** install the C++ workload and SDK
+  above, then retry from a new terminal.
+- **`llama-server` not found / missing DLLs:** check `models/bin/`, the override
+  variable, and that the complete matching runtime package was extracted.
+- **No models detected:** check the files are actual `.gguf` weights, not ZIP
+  archives or download links, and scan again.
+- **Port `5173` or `3888` already in use:** stop the previous Companion/runtime
+  instance before launching another one. Use Ctrl+C in its terminal for shutdown.
+- **PowerShell blocks script execution:** follow your machine or organization's
+  script-execution policy. Do not globally disable security policies just to run
+  the launcher.
 
 For frontend development with hot reload, run Vite separately from `frontend/`;
 the normal user runtime is the single backend process, which serves both the UI
