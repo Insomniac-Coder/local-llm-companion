@@ -1,0 +1,57 @@
+/* Settings rows own their labels, controls and badges. Optional content can
+   never shift a later field into the wrong column. */
+.settings-page .settings-fields { display: grid; gap: 0; margin-top: 12px; }
+.settings-page .settings-section { padding: 24px; }
+.settings-page .settings-section h2 { margin: 0; color: var(--text-primary); font: 600 19px/1.4 var(--font-display); }
+.settings-page .settings-section-intro { max-width: 72ch; margin: 6px 0 0; color: var(--text-secondary); font-size: 14px; line-height: 1.6; }
+.settings-page .settings-section[hidden] { display: none; }
+.settings-page .settings-capability-note { color:var(--text-secondary); font-size:13px; line-height:1.6; margin:10px 0 0; }
+.settings-page .settings-field { display: grid; grid-template-columns: minmax(170px, 1fr) minmax(180px, 1.3fr); align-items: center; gap: 12px 24px; min-width: 0; padding: 11px 0; }
+.settings-page .settings-field + .settings-field { border-top: 1px solid color-mix(in srgb, var(--border) 55%, transparent); }
+.settings-page .settings-field-label { color: var(--text-secondary); font-size: 14px; line-height: 1.5; margin: 0; }
+.settings-page label.settings-field-label { cursor: pointer; }
+.settings-page .settings-field-control { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.settings-page .settings-field-control > input:not([type='checkbox']), .settings-page .settings-field-control > select, .settings-page .settings-field-control > textarea { flex: 1 1 0; min-width: 0; width: 100%; }
+.settings-page .settings-field-control > span { flex: none; }
+.settings-page .settings-field-control > div { min-width: 0; line-height: 1.6; }
+.settings-page .settings-field-description { grid-column: 2; min-width: 0; color: var(--text-secondary); font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
+.settings-page .settings-model-refresh { flex: none; white-space: nowrap; }
+.settings-page .settings-model-status { display: block; margin-top: 4px; }
+.settings-page .settings-model-status:empty { display: none; }
+.settings-page .settings-model-status[role='alert'] { color: var(--accent); }
+.settings-page .settings-field-control > input[type='checkbox'] { flex: none; width: 18px; height: 18px; margin: 0; accent-color: var(--accent); cursor: pointer; }
+.settings-page .settings-field--toggle { min-height: 48px; }
+.settings-page .settings-field-control > input[type='checkbox']:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+.settings-page .settings-runtime-summary { padding: 16px 0 4px; border-top: 1px solid var(--border-soft); margin-top: 12px; max-width: 76ch; }
+.settings-page .settings-runtime-summary strong { font-size: 14px; font-weight: 600; color: var(--text-primary); }
+.settings-page .settings-runtime-summary p { margin: 6px 0 0; font-size: 14px; line-height: 1.7; color: var(--text-secondary); }
+.settings-page .settings-runtime-details { margin-top: 14px; }
+.settings-page .settings-runtime-details > summary { cursor: pointer; color: var(--text-secondary); padding-block: 8px; font-size: 14px; }
+.settings-page .settings-runtime-details > summary:hover { color: var(--text-primary); }
+.settings-page .settings-runtime-group { margin-top: 20px; }
+.settings-page .settings-runtime-group h3 { margin: 0 0 10px; font-size: 14px; font-weight: 600; color: var(--text-primary); overflow-wrap: anywhere; }
+.settings-page .settings-runtime-values { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 24px; margin: 0; }
+.settings-page .settings-runtime-values > div { min-width: 0; }
+.settings-page .settings-runtime-values dt { color: var(--text-muted); font-size: 13px; }
+.settings-page .settings-runtime-values dd { margin: 3px 0 0; color: var(--text-secondary); font-size: 14px; overflow-wrap: anywhere; }
+.settings-page .settings-runtime-notes, .settings-page .settings-boundaries { margin: 16px 0 0; padding-left: 20px; color: var(--text-secondary); font-size: 14px; line-height: 1.7; max-width: 76ch; }
+.settings-page .settings-boundaries li + li, .settings-page .settings-runtime-notes li + li { margin-top: 6px; }
+.settings-page .settings-policy-error { color: var(--text-secondary); font-size: 14px; }
+.settings-page .settings-policy-error button { margin-left: 8px; }
+.settings-page .settings-expert > summary { cursor: pointer; font-size: 17px; font-weight: 600; color: var(--text-primary); line-height: 1.6; }
+.settings-page .settings-expert > summary::marker { color: var(--accent); }
+.settings-page .settings-expert-caption { display: block; padding-left: 20px; font: 14px/1.6 var(--font-ui); color: var(--text-muted); }
+.settings-page .settings-empty { color: var(--text-secondary); font-size: 14px; }
+.settings-page .settings-empty button { padding: 0; min-height: auto; border: 0; background: none; color: var(--accent); text-decoration: underline; }
+@media (max-width: 850px) {
+  .settings-page .settings-section { padding: 20px; }
+  .settings-page .settings-field { grid-template-columns: minmax(0, 1fr); gap: 8px; padding: 14px 0; }
+  .settings-page .settings-field-description { grid-column: 1; }
+  .settings-page .settings-field--toggle { grid-template-columns: minmax(0, 1fr) auto; gap: 20px; }
+  .settings-page .settings-field--toggle .settings-field-control { justify-content: flex-end; }
+  .settings-page .settings-field--toggle .settings-field-description { grid-column: 1 / -1; }
+}
+@media (max-width: 440px) {
+  .settings-page .settings-section { padding: 16px; }
+  .settings-page .settings-runtime-values { grid-template-columns: minmax(0, 1fr); }
+}

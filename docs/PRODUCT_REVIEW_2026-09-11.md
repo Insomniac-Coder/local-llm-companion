@@ -1,0 +1,96 @@
+# Companion product review and uplift
+
+Reference: `Local_LLM_PC_Companion_Product_Design_v5.1_FULL.md`, supplied September 11, 2026. This is a review of the implemented application, not a claim that every capability in the full product design already exists.
+
+## Product direction
+
+The strongest product is a trustworthy local workbench: talk in Chat, explicitly choose how to work in Code, inspect actions alongside the conversation, and understand the cost on your machine. The full v5.1 vision remains the destination. This pass prioritizes foundations whose failures currently undermine otherwise useful features.
+
+Design tokens: near-black canvas `#0c0c0f`, navigation `#111115`, working surface `#19191f`, signal red `#ff5266`, primary text `#f5f4f7`, secondary text `#c8c5d0`. Segoe UI Variable handles controls and body; Bahnschrift gives large headings a restrained workstation character. Body content is 15px, ordinary controls 14px, compact labels 12px. Light mode has its own contrast-appropriate tokens.
+
+Layout: a quiet navigation column, a centered conversation with a fixed composer, and an adjustable inspector. Navigation owns sessions and app destinations; the project header owns Changes/Build/Test/Run; the composer owns message intent, attachments, reasoning, search and Send/Stop. Avoid duplicated primary controls, decorative motion and hidden destructive semantics.
+
+## Findings addressed
+
+| Finding | Change |
+|---|---|
+| Multiple redesigns accumulated contradictory shell selectors, tiny text and a blue palette that contradicted the requested red/black theme | Replaced superseded shell rules with one tokenized `workbench.css`; retained feature-specific styles. Readable text, stationary branding, proper mobile drawer, clear active navigation and responsive layout. |
+| Every normal Code message started a writing agent, including acknowledgments | Explicit Ask / Plan / Agent intent. Ask is the default. Plan has a backend-enforced read-only gate. Agent retains the implementation workflow. |
+| Casual replies and vague continuations were treated as new work | Conservative whole-message acknowledgment/greeting handling produces a conversational reply without tools, even with Agent selected. Mixed requests such as “thanks, now fix X” still reach the task workflow. Continue requires a saved unfinished task or proposed plan in this session and canonical workspace; completed implementation work is not replayed. This is not a universal natural-language classifier. |
+| Multiple action blocks could skip prerequisites | Accept exactly one complete standalone action fence. Reject multiple, unfinished, quoted and malformed blocks; JSON file contents can still contain legitimate Markdown. Permission checks remain independent of parsing. |
+| A missing workspace could silently become another registered project | Removed silent fallback on frontend/backend. Validate workspace IDs and canonical paths; relinking requires selection. A failed relink no longer changes the selector as if it succeeded. |
+| Streaming updates replaced the last visible message and asynchronous history fetches could affect another session | ID-targeted updates, active-session checks and draft preservation. Auto-follow respects a user scrolling up; a Latest response control returns to the bottom. |
+| Stored transcript could be deleted/replaced during compaction | Derived context summaries retain canonical history and message identity. |
+| Tool syntax was treated as proof an action ran; failed edits could display successful-looking diffs | Persist structured activity, real results and before/after diffs; explicit failed tool events; legacy parsed syntax is not treated as verified execution. |
+| Agent follow-ups lost session context | Agent runs include prior context and attachments. |
+| A model worker disappearing could leave an agent looking active indefinitely | Failure/cancellation reconciliation and persisted partial activity; further durable run recovery remains roadmap work. |
+| Auto behavior did not match the explicitly requested no-prompt workflow | Auto now permits registered actions, including commands and deletion, without per-action prompts. Ask retains confirmation, and both modes retain tool path/argument/safety checks. Search requires explicit task consent and honors Deny. A shell working directory is not represented as a process sandbox. |
+| Auto looked enabled after restart but runtime still asked | Settings and approval changes previously lived only in memory. They now persist to SQLite before applying; startup restores the saved policy. The UI reads that authoritative policy instead of treating browser storage as permission. Per-action grants are not silently restored. |
+| An unrelated website could address the local API | Reject foreign browser origins and untrusted Host headers, including DNS-rebinding hosts. Trusted loopback UI origins remain supported; this is not authentication or a claim of safe public/LAN deployment. |
+| Saved memory existed in management screens but was absent from inference prompts | Include relevant user, selected-workspace and current-conversation memories with explicit provenance and a 2,000-character total budget. Memories from other workspace/session IDs are excluded. |
+| Creating a new file through an existing symlink/junction could escape the project | Validate the nearest existing ancestor before adding nonexistent path components. Regression tests exercise real Windows junctions, including dangling/outside ancestors. |
+| Launching from another directory could select a different history database | Stable installation-relative default roots. Existing `backend/data` history takes precedence when present; explicit environment configuration remains available. Both existing databases are retained, with a warning rather than silent merge or deletion. Startup fails clearly if persistence cannot open. |
+| Filename guesses and repeated scans made discovery unreliable | Bounded GGUF header/tensor-location validation, actual metadata, cached unchanged headers, variants/split checks and safe deletion targeting. No filename-only claim of reasoning support. Structural checks are not a full checksum. |
+| CPU readings used a new system snapshot every sample; missing GPU readings looked like zero | Persistent CPU sampler and honest sensor gaps. Four timestamp-based interactive charts, stale/retry states, live-view pause, keyboard inspection, complete cache details and whole-machine attribution. |
+| Full highlighting grammars loaded before they were needed | Lazy highlighter core/language imports with uncommon-language fallback retained. Initial JS reduced from approximately 1.37 MB to approximately 473 KB (gzip approximately 144 KB instead of 442 KB). Total optional downloaded code is not reduced by the same amount. |
+| Session tools and settings were difficult to find | Ctrl+K action/session search, session filtering, visible utility navigation, resizable/keyboard-adjustable inspector, searchable categorized settings with sticky Save changes, clearer model library and diagnostic surfaces. |
+| The top-right configuration menu duplicated sidebar destinations | Removed the cog menu. Models, Resources, Runtime & diagnostics, Tools & plugins and Settings now live together once in the bottom-left utility navigation, including collapsed and mobile navigation. Keyboard search uses the same destination list. |
+| Generation had little visible feedback near the composer | Animated activity text sits directly above the composer, with actual preparation/writing/agent/approval states and elapsed time. Waiting states do not pretend to be generating; reduced-motion preferences disable animation. |
+| The context meter showed only saved chat text while the agent used a separate working transcript | Separate saved-history estimates from current/last agent input. Record assembled-request estimates and runtime-reported prompt usage per iteration, with the original context limit, pruning and output budget. Do not add separate requests or entire execution journals together. Old runs without accounting remain explicitly unmeasured. |
+| Output speed included the delay before text arrived | Separate time to first visible text from output-only speed. Live estimates begin at nonempty output and exclude separate processing/tool waits. New final metrics are versioned; older inclusive rates are labeled Legacy overall. Thinking is only shown when the runtime explicitly reports it; hidden reasoning content is not displayed. |
+| Extra Auto badges shifted later Settings controls into the wrong grid columns | Explicit labeled field rows keep each control and badge together. The subsequent managed-settings pass removes inactive controls and groups useful technical overrides under Expert tuning; checkboxes have clickable native labels. |
+| Native popup menus had square edges and a blue focus highlight | Progressively enhance supported native selects with rounded pickers, readable option spacing, charcoal hover/focus and red selection accents. Native keyboard semantics and a fallback remain. Implementation reference: [customizable selects](https://developer.mozilla.org/en-US/docs/Learn_web_development/Extensions/Forms/Customizable_select). |
+| Advanced and directory-list preferences appeared to promise enforcement they did not implement | Removed their inactive editors while preserving saved values for compatibility. The settings page describes actual protections, not inactive network/privacy/directory toggles. The actual workspace boundary remains enforced by file tools; native command isolation remains future work. |
+| Default model required an internal model ID | Detected-model dropdown displays model names, with Refresh, loading/error/retry/empty states and preservation of an unavailable saved default. Save persists the preference; startup respects it without automatically loading or switching a live model. |
+| A model's details appeared in a detached card below the whole library | Each model owns its inline, collapsible details, loading and error state. Details stay attached to the selected card; recommendation tools remain available and are explicitly estimates rather than applied runtime configuration. |
+| KV cache field suggested Q8_0 was active or should match Q4_K_M weights | That field was never applied. Managed launches now explicitly use compatibility-first f16 K/V, native automatic attention/GPU placement and model-capped context. Weight quantization is not used to guess cache representation. Actual architecture-specific state is constructed by llama.cpp from GGUF metadata. |
+| Model switching could relabel an old worker before the new one started | One serialized load path starts a fresh worker, then publishes the loaded model after health succeeds. Chat/agent activity blocks switches and unloads, including force requests. Failed replacement clears misleading loaded state. The next reply automatically rebuilds bounded context; the optional readiness check no longer blocks the composer or pretends a warm-up rebuilt the chat. |
+| Model startup logs could fill undrained pipes; another listener could look healthy | Bounded log drains, occupied-port preflight, child-exit checks and cleanup make fresh-worker startup fail clearly. Native worker parallelism is explicitly one, so context is not silently split into auto slots. |
+
+## Feature retention and remaining gaps
+
+| Product area | Current state / follow-on work |
+|---|---|
+| Local inference and model management | GGUF/llama.cpp load, unload, switching, downloads, recommendations, diagnostics and benchmarks retained. Header metadata is stronger; calibrated capability quality, richer projector pairing and model/runtime fingerprints still need expansion. |
+| Chat and Code | Shared local storage, streaming, attachments, read tools and agent execution retained. Explicit intent and verified execution journals added. A single common durable Run/Step protocol is still incomplete. |
+| Context and memory | Context inspection, preparation, compaction, scoped memory and instructions retained. Canonical history preservation improved. Reproducible per-generation ContextManifest and fully model-aware token budgeting need their own implementation. |
+| Files, Git and execution | Index/search, patching, commands, Git and change review retained. Native shell execution is not OS-isolated; proper process sandboxing and narrower grants remain important. |
+| Documents, vision and artifacts | Existing parsing, generation, image paths and artifact UI retained. Format quality/capability coverage requires a dedicated corpus of end-to-end document/vision tests. Do not advertise every v5.1 format or model combination as validated. |
+| Knowledge and research | Existing local knowledge/indexing and explicit web search retained. Hybrid vector retrieval, embedding workers, reranking and complete provenance-first research are not yet the full v5.1 subsystem. |
+| Resources and DAIO | Hardware discovery, resource monitoring, recommendation/optimization and benchmarks retained. Central resource-aware scheduling, reliable per-run attribution, thermal/power feedback and learned calibration profiles remain partial/future. |
+| Plugins | Existing registry/execution retained. Signed trust metadata, isolated plugin workers and a stable public SDK are not complete. |
+| Tasks / background work | Current in-process agent runs are not equivalent to a restart-safe recurring task scheduler. Durable schedules, policy snapshots, resumability, notifications and event triggers remain planned. |
+| Browser / PC automation | Full isolated browser and OS adapters remain planned; no decorative navigation tab claims they work. |
+| Specialist models / multi-agent / distributed | Routing, audio, image generation, orchestration, LAN inference and encrypted sync remain part of the vision, not removed or represented as completed. |
+
+## Verification
+
+- Frontend production build and 50 passing regression tests cover read-only intent, ID-targeted stream updates, configurable shortcuts, safe split widths, telemetry gaps/timestamps, lazy highlighting, code-block rendering, live/idle/waiting activity states, non-running conversational routing responses, detected-model options, managed settings and card-owned model details.
+- Final backend suite: 225 passed, zero failed, one intentionally ignored. Covers compaction history preservation, workspace mismatch, read-only planning, durable approvals/continuations, activity persistence, cancellation, GGUF/configuration, request context, visible-output timing, managed runtime policy and safe model replacement. Parallel repository-index fixtures were isolated after the full suite exposed a shared temporary-directory race; production indexing behavior was not changed.
+- Browser review includes actual dark/light screenshots, desktop and narrow layouts, resource controls and sample inspection. The final default-model popup displayed both installed names with rounded options, red selection and neutral keyboard focus (no blue highlight). Settings search revealed collapsed expert controls. Each model's details expanded inside its own card; the other card remained collapsed. At 390px, model cards measured 342px with no horizontal page overflow. No browser errors or warnings were recorded; the temporary viewport override was reset afterward.
+- Real-model evaluation uses a separate backend, database and disposable project, with Gemma weights opened read-only. Chat passed (1.2s), read-only Code retrieval passed (7.0s), Plan finished without changes (18.8s), and Agent made a verified operator patch and ran passing tests (22.6s).
+- The evaluation exposed a Gemma-specific completion reviewer budget failure. Native thinking is now disabled only for the machine-readable reviewer; read-only plans no longer need an implementation critic. Normal user Reasoning remains an extended-budget preference and is not yet a guaranteed native-thinking on/off switch across every model template.
+- Detailed evidence: [real-model validation](validation/2026-09-11-model-evaluation.md). These are small deterministic checks, not proof of reliability on every large project.
+
+The updated runtime was rebuilt and started against the existing `backend/data` database. Both existing conversation IDs and both workspace IDs were verified unchanged; both installed models remain detected. Current runtime settings were copied through the new persistent settings endpoint without enabling additional permissions. The old stalled acknowledgment run no longer appears active. A direct request probe confirmed acknowledgment returns `conversation`, and an unanchored continuation returns `needs_task`, with no agent run created.
+
+Consistent SQLite snapshots of both existing history databases are retained under `data/backups/20260911T174307487799Z`. The earlier backup folder `data/backups/20260911T170935573821Z` also preserves the old run's 13 in-memory events before the runtime was replaced. No histories were merged or removed. Older runs cannot retrospectively provide exact token accounting that was never recorded.
+
+The managed-settings follow-up was deployed after another verified backup in `data/backups/20260911T180423646376Z`, which also retains the previous executable. Live policy probes correctly distinguish the installed Gemma (`gemma4`) and Qwen Coder (`qwen2`) metadata, keep Q4_K_M weights separate from f16 cache requests, and report native automatic thread/attention/GPU selection. No model was loaded automatically, and the existing Ask approval policy was preserved. [Runtime policy validation and limits](validation/2026-09-11-runtime-policy.md) records installed-binary option checks and test evidence; this follow-up is not represented as a new real-model throughput benchmark.
+
+## Next product milestones (not scope reduction)
+
+The 12 September follow-up addresses repeated empty/cut-off agent output,
+bounded response continuation, the user's explicit full-Auto preference, and
+elapsed-time resets across tabs. It includes 264 passing backend tests and 59
+frontend tests. See [recovery and Auto validation](validation/2026-09-12-agent-recovery.md)
+for the live-model findings and limits; the dated validation above remains the
+record of its original runs.
+
+1. Durable Run/Step/ContextManifest and approval records, with restart recovery and a versioned typed event envelope shared by Chat and Code.
+2. Workspace process isolation plus run/session/workspace grants with exact targets, expiry and revocation.
+3. End-to-end model evaluation suite: inspect, patch, test, cancellation, model switch, failure recovery and prompt-injection fixtures; score actual files/tests, not fluency.
+4. Artifact and Knowledge workspaces with provenance, incremental indexing and validated document renderers.
+5. Resource-aware durable Tasks, then isolated Browser/PC automation. Introduce specialist routing and multi-agent work only after single-agent reliability meets the quality bar.
+
+The architecture still concentrates substantial behavior in `api.rs` and `App.tsx`. Extract along these domain boundaries incrementally, with contract tests before each move; a cosmetic folder shuffle would not solve the coupling.

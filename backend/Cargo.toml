@@ -1,0 +1,34 @@
+[package]
+name = "backend"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "companion-backend"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.7", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tower-http = { version = "0.5", features = ["cors", "fs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+sysinfo = "0.30"
+futures = "0.3"
+tower = { version = "0.4", features = ["util"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+sha2 = "0.10"
+tokio-stream = "0.1"
+regex = "1"
+image = "0.25"
+base64 = "0.22"
+rust_xlsxwriter = "0.90"
+rfd = "0.15"
+
+[dev-dependencies]
+tower = { version = "0.4", features = ["util"] }

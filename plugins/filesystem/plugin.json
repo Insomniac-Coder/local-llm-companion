@@ -1,0 +1,14 @@
+{
+  "name": "filesystem",
+  "version": "0.1.0",
+  "description": "Workspace-scoped filesystem tools (Stage 7 expands this plugin).",
+  "tools": [
+    { "name": "list_directory", "risk": "SAFE" },
+    { "name": "read_file", "risk": "SAFE" },
+    { "name": "write_file", "risk": "MODERATE" },
+    { "name": "edit_file", "risk": "MODERATE" },
+    { "name": "search_text", "risk": "SAFE" }
+  ],
+  "permissions": ["workspace read", "explicit approval for writes"],
+  "settings": {}
+}

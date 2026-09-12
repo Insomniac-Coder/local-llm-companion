@@ -1,0 +1,45 @@
+# Local conversations, databases, attachments, backups, and downloaded models.
+/data/
+/backend/data/
+/models/
+/backups/
+/backend/backups/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.gguf
+*.safetensors
+
+# Build products and installed dependencies (keep lockfiles in Git).
+/backend/target/
+node_modules/
+/frontend/dist/
+coverage/
+*.tsbuildinfo
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Machine-local configuration and secrets; safe example files may be committed.
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+
+# Runtime logs and generated evaluation traces (may contain local chat/file data).
+*.log
+/docs/validation/**/*.json
+
+# Editor and OS artifacts.
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
