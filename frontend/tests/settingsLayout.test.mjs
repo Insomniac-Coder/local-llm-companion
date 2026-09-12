@@ -14,6 +14,13 @@ const loaded = { exports: {} };
 new Function('require', 'module', 'exports', result.outputFiles[0].text)(createRequire(import.meta.url), loaded, loaded.exports);
 const { SettingField, HardwareOverrides, RuntimeSummary } = loaded.exports;
 
+test('loaded runtime exposes CPU fallback explanation rather than only next-load settings', () => {
+  const cpu = { architecture: 'test', weights_quantization: 'Q4', effective_context: 8192, cache_type_k: 'f16', cache_type_v: 'f16', threads: 0, gpu_layers: 0, batch_size: 128, flash_attention: 'off', kv_offload: 'off', notes: ['CPU mode selected automatically: no usable GPU.'] };
+  const html = renderToStaticMarkup(createElement(RuntimeSummary, { policy: { active: cpu, next: { ...cpu, notes: [] } }, dirty: false }));
+  assert.match(html, /Loaded session[\s\S]*CPU mode selected automatically: no usable GPU/);
+  assert.match(html, /GPU layers<\/dt><dd>0<\/dd>/);
+});
+
 test('optional Auto badge stays inside the same control row and the label remains linked', () => {
   const html = renderToStaticMarkup(createElement(SettingField, { label: 'GPU layers (-1 auto)' }, createElement('input', { type: 'number', defaultValue: -1 }), createElement('span', null, 'Auto')));
   const labelId = /<label[^>]*for="([^"]+)"/.exec(html)?.[1];

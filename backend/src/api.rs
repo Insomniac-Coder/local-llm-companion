@@ -580,6 +580,14 @@ async fn inference_status(State(s): State<AppState>) -> Json<InferenceStatus> {
         ("stub".to_string(), m, inf.context_size())
     };
     Json(InferenceStatus {
+        runtime_notice: llama
+            .running
+            .as_ref()
+            .filter(|_| running)
+            .filter(|r| r.cfg.n_gpu_layers == 0)
+            .map(|_| {
+                "Running on CPU. No dedicated GPU is required; responses may be slower.".into()
+            }),
         engine,
         running,
         base_url,
@@ -793,20 +801,35 @@ async fn start_sidecar(
     s.llama.write().await.stop().await;
     s.models.write().await.unload_all();
     s.inference.write().await.unload();
-    match RunningSidecar::spawn(&binary.0, cfg.clone(), port).await {
-        Ok(sidecar) => {
+    let devices = if settings.runtime_auto {
+        binary.devices().await
+    } else {
+        crate::runtime_selection::Devices::Unknown
+    };
+    match crate::runtime_selection::load_with_fallback(
+        cfg,
+        settings.runtime_auto,
+        devices,
+        |attempt| RunningSidecar::spawn(&binary.0, attempt, port),
+    )
+    .await
+    {
+        Ok((sidecar, notice)) => {
             let base_url = sidecar.base_url.clone();
+            let cfg = sidecar.cfg.clone();
             s.llama.write().await.running = Some(sidecar);
             s.llama.write().await.last_error = None;
             // Mirror loaded state into the registry + stub engine for UI consistency.
             if let Some(id) = &model_id {
                 let _ = s.models.write().await.switch_to(id);
             }
-            if let Err(e) = s.inference.write().await.load(cfg) {
+            if let Err(e) = s.inference.write().await.load(cfg.clone()) {
                 tracing::warn!("stub mirror load failed: {e}");
             }
             tracing::info!(model = ?model_id, url = %base_url, "inference started");
-            Ok(serde_json::json!({"started": true, "base_url": base_url, "model": model_id}))
+            Ok(
+                serde_json::json!({"started": true, "base_url": base_url, "model": model_id, "notice": notice, "runtime_policy": cfg.runtime_policy}),
+            )
         }
         Err(e) => {
             let msg = e.to_string();
@@ -5828,7 +5851,7 @@ async fn doctor(State(s): State<AppState>) -> Json<serde_json::Value> {
                 "gpu",
                 "GPU/VRAM",
                 "warn",
-                "nvidia-smi unavailable — CPU inference only".into(),
+                "GPU telemetry unavailable. This does not rule out integrated or non-NVIDIA graphics; automatic loading checks the model runtime's device support.".into(),
             ),
         }
     }

@@ -59,7 +59,7 @@ export function RuntimeSummary({ policy, dirty }: { policy: RuntimePolicy; dirty
   return <details className="settings-runtime-details">
     <summary>View runtime configuration</summary>
     <p className="settings-capability-note">These are requested settings, not measurements of memory use. Model-file quantization describes the weights; it does not set cache precision.</p>
-    {policy.active && <div className="settings-runtime-group"><h3>Loaded session</h3>{configuration(policy.active)}</div>}
+    {policy.active && <div className="settings-runtime-group"><h3>Loaded session</h3>{configuration(policy.active)}{policy.active.notes.length > 0 && <ul className="settings-runtime-notes">{policy.active.notes.map((note, index) => <li key={index}>{note}</li>)}</ul>}</div>}
     {!policy.active && <p className="settings-capability-note">No managed model session is loaded.</p>}
     <div className="settings-runtime-group"><h3>Next model load</h3>
       {dirty ? <p className="settings-capability-note">Save your changes to update the planned configuration.</p> : <>{configuration(policy.next)}{policy.next.notes.length > 0 && <ul className="settings-runtime-notes">{policy.next.notes.map((note, index) => <li key={index}>{note}</li>)}</ul>}</>}

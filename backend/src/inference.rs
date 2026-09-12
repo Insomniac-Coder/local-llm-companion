@@ -157,7 +157,7 @@ pub fn resolve_runtime_policy(
         notes.push("Model metadata is unavailable; no model context limit can be verified. Native load validation remains authoritative.".into());
     }
     if automatic {
-        notes.push("CPU thread count, GPU placement and Flash Attention compatibility are selected by the native runtime; the configured context cap is retained.".into());
+        notes.push("The installed runtime is checked for usable devices at load time, including supported integrated GPUs. With no usable GPU, automatic CPU settings are selected; GPU initialization failures retry once on CPU. CPU operation caps context at 8192 and batch size at 128 without changing saved preferences.".into());
     }
     ResolvedRuntimePolicy {
         mode: if automatic { "automatic" } else { "manual" }.into(),

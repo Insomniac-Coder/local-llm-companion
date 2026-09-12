@@ -27,6 +27,7 @@ mod permissions;
 mod recommend;
 mod repo_index;
 mod request_router;
+mod runtime_selection;
 mod search;
 mod settings;
 mod storage;

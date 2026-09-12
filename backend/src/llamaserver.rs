@@ -27,6 +27,56 @@ const HEALTH_TIMEOUT_SECS: u64 = 90;
 pub struct SidecarBinary(pub PathBuf);
 
 impl SidecarBinary {
+    /// Query the runtime that will actually execute the model. In particular,
+    /// lack of nvidia-smi never disables a Vulkan/SYCL integrated GPU.
+    pub async fn devices(&self) -> crate::runtime_selection::Devices {
+        let mut command = Command::new(&self.0);
+        command
+            .arg("--list-devices")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        command.creation_flags(0x08000000);
+        let Ok(mut child) = command.spawn() else {
+            return crate::runtime_selection::Devices::Unknown;
+        };
+        let stdout = Arc::new(Mutex::new(Vec::new()));
+        let stderr = Arc::new(Mutex::new(Vec::new()));
+        let mut tasks = Vec::new();
+        if let Some(pipe) = child.stdout.take() {
+            tasks.push(drain_worker_log(pipe, stdout.clone()));
+        }
+        if let Some(pipe) = child.stderr.take() {
+            tasks.push(drain_worker_log(pipe, stderr.clone()));
+        }
+        let success = match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
+            Ok(Ok(status)) => status.success(),
+            _ => {
+                let _ = child.start_kill();
+                let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+                false
+            }
+        };
+        for mut task in tasks {
+            if tokio::time::timeout(Duration::from_millis(500), &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+            }
+        }
+        let out = stdout
+            .lock()
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default();
+        let err = stderr
+            .lock()
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default();
+        crate::runtime_selection::parse_devices(&format!("{err}\n{out}"), success)
+    }
     /// Search order: env `COMPANION_LLAMA_SERVER_BIN` → PATH → common
     /// release locations → `<models_dir>/bin/`. Returns a user-friendly
     /// error telling the user exactly where to put the binary (§52).
@@ -125,6 +175,12 @@ pub fn server_args(cfg: &InferenceConfig, port: u16) -> Vec<String> {
     if !cfg.kv_cache_gpu {
         a.push("--no-kv-offload".into());
     }
+    if cfg.n_gpu_layers == 0 {
+        a.extend(["--device".into(), "none".into(), "--no-op-offload".into()]);
+        if cfg.projector_path.is_some() {
+            a.push("--no-mmproj-offload".into());
+        }
+    }
     a
 }
 
@@ -164,19 +220,21 @@ impl RunningSidecar {
         drop(port_check);
         let args = server_args(&cfg, port);
         tracing::info!("spawning {} {}", binary.display(), args.join(" "));
-        let mut child = Command::new(binary)
+        let mut command = Command::new(binary);
+        command
             .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| {
-                InferenceError::Generation(format!(
-                    "Could not start llama-server ({}): {e}. Is the binary executable?",
-                    binary.display()
-                ))
-            })?;
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        command.creation_flags(0x08000000);
+        let mut child = command.spawn().map_err(|e| {
+            InferenceError::Generation(format!(
+                "Could not start llama-server ({}): {e}. Is the binary executable?",
+                binary.display()
+            ))
+        })?;
         // Continuously drain both pipes: startup metadata can otherwise fill a
         // pipe and block the worker before /health becomes ready. Keep only a
         // bounded diagnostic tail; never enable prompt logging.
@@ -913,6 +971,7 @@ impl Default for LlamaServerManager {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceStatus {
+    pub runtime_notice: Option<String>,
     pub engine: String, // "stub" | "llama-server"
     pub running: bool,
     pub base_url: Option<String>,
@@ -944,6 +1003,65 @@ mod tests {
         assert!(has("--n-gpu-layers", "45"));
         assert!(has("--port", "3888"));
         assert!(a.contains(&"127.0.0.1".to_string()));
+    }
+
+    #[test]
+    fn cpu_fallback_disables_all_offload_including_vision() {
+        let mut cfg = InferenceConfig::default();
+        cfg.projector_path = Some(PathBuf::from("vision.gguf"));
+        let cpu = crate::runtime_selection::cpu_configuration(cfg, "no usable GPU");
+        let args = server_args(&cpu, 3888);
+        for (key, value) in [
+            ("--device", "none"),
+            ("--n-gpu-layers", "0"),
+            ("--flash-attn", "off"),
+        ] {
+            assert!(args
+                .windows(2)
+                .any(|pair| pair[0] == key && pair[1] == value));
+        }
+        for flag in ["--no-op-offload", "--no-kv-offload", "--no-mmproj-offload"] {
+            assert!(args.contains(&flag.to_string()));
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires idle hardware, COMPANION_CPU_PROBE_BIN and COMPANION_CPU_PROBE_MODEL"]
+    async fn live_cpu_fallback_loads_and_generates_with_same_runtime() {
+        let binary = PathBuf::from(std::env::var("COMPANION_CPU_PROBE_BIN").unwrap());
+        let mut cfg = InferenceConfig {
+            model_path: PathBuf::from(std::env::var("COMPANION_CPU_PROBE_MODEL").unwrap()),
+            n_ctx: 1024,
+            ..Default::default()
+        };
+        crate::inference::resolve_runtime_policy(None, &cfg, true).apply_to(&mut cfg);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        // Simulate no GPU discovery on the test host, then run genuine CPU
+        // inference with the SAME installed binary (not a separate CPU build).
+        let (sidecar, notice) = crate::runtime_selection::load_with_fallback(
+            cfg,
+            true,
+            crate::runtime_selection::Devices::None,
+            |attempt| RunningSidecar::spawn(&binary, attempt, port),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sidecar.cfg.n_gpu_layers, 0);
+        assert!(notice.unwrap().contains("CPU"));
+        let client = SidecarClient::new(sidecar.base_url.clone()).unwrap();
+        let result = client
+            .chat_turns_without_reasoning(
+                &[ChatTurn::text("user", "Reply with the word hello.")],
+                16,
+                &sidecar.cfg,
+            )
+            .await;
+        sidecar.stop().await;
+        let (answer, _) = result.unwrap();
+        assert!(!answer.trim().is_empty());
+        println!("Same-runtime CPU inference succeeded: {answer}");
     }
 
     #[test]

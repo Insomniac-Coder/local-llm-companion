@@ -108,6 +108,30 @@ The environment-variable override takes precedence over PATH and `models/bin/`.
 The app launches the model server itself; you do not need to run a second server
 manually. Its default inference port is `3888`.
 
+#### PCs without a dedicated GPU
+
+The same app handles CPU operation automatically; no separate Companion build
+or manual CPU-settings change is required. Leave automatic hardware management on.
+At model load, Companion asks the installed runtime which devices it can use.
+Supported integrated GPUs are eligible too; a missing NVIDIA monitoring tool is
+not treated as proof that no GPU exists.
+
+If the runtime reports no usable GPU, Companion loads the model on CPU. If GPU
+initialization/allocation fails, it retries once with GPU, KV-cache, operation,
+and vision-projector offloading disabled. Automatic CPU operation caps context
+at 8,192 tokens and batch size at 128 to reduce overhead, without overwriting
+saved settings. The app reports CPU operation and shows the effective settings
+under the loaded session's runtime configuration. Manual hardware overrides are
+respected and do not opt into automatic retries.
+
+This fallback uses the **same installed llama-server**, which must itself be
+able to start and support CPU execution. It cannot repair a missing executable,
+missing mandatory DLLs, an unsupported model, or insufficient RAM, and it does
+not download replacement runtimes silently. CPU responses can be slower; choose
+a model that fits system memory. Actual GPU-less hardware has not yet been
+validated; automated tests simulate device discovery, and a live test verifies
+CPU generation using the same runtime on the development machine.
+
 ### 3. Add a model manually (or download one in the app)
 
 The `models/` directory is included in fresh clones via `.gitkeep`. Place a GGUF

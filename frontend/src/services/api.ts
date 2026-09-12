@@ -84,6 +84,7 @@ export async function scanModels(): Promise<{ registered: number; warnings: stri
 }
 
 export interface InferenceStatus {
+  runtime_notice?: string | null;
   engine: string;
   running: boolean;
   base_url: string | null;

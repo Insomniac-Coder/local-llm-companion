@@ -915,6 +915,7 @@ export default function App() {
       const status = await inferenceStatus();
       setInf(status);
       if (!force) notify('success', kind === 'load' ? `${id} is ready.` : 'Inference started.');
+      if (status.runtime_notice) notify('info', status.runtime_notice);
     } catch (e: any) {
       if (e?.status === 409 && !force) {
         setGuard({ kind, id, detail: e.message });
