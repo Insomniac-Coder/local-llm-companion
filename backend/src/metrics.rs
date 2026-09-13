@@ -34,10 +34,13 @@ pub struct GpuReading {
     pub mem_total_gb: f64,
     pub temp_c: Option<f32>,
     pub power_w: Option<f32>,
+    /// Marketing name of the measured card, so the UI can say which GPU the
+    /// readings belong to. Absent on drivers that do not report it.
+    pub name: Option<String>,
 }
 
 /// Parse one `nvidia-smi --format=csv,noheader,nounits` line:
-/// `util, mem_used_mib, mem_total_mib, temp, power`
+/// `util, mem_used_mib, mem_total_mib, temp, power, name`
 fn parse_smi_line(line: &str) -> Option<GpuReading> {
     let parts: Vec<&str> = line.split(',').map(str::trim).collect();
     if parts.len() < 3 {
@@ -50,6 +53,11 @@ fn parse_smi_line(line: &str) -> Option<GpuReading> {
         mem_total_gb: num(parts[2])? / 1024.0,
         temp_c: parts.get(3).and_then(|s| num(s)).map(|v| v as f32),
         power_w: parts.get(4).and_then(|s| num(s)).map(|v| v as f32),
+        // A name is the last column; rejoin in case a driver ever reports one
+        // containing a comma. "[N/A]"-style placeholders are not names.
+        name: (parts.len() > 5)
+            .then(|| parts[5..].join(", "))
+            .filter(|name| !name.is_empty() && !name.starts_with('[')),
     })
 }
 
@@ -62,7 +70,7 @@ fn read_nvidia_smi() -> Option<GpuReading> {
     }
     let out = command
         .args([
-            "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw",
+            "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,name",
             "--format=csv,noheader,nounits",
         ])
         .output()
@@ -96,6 +104,9 @@ fn now_ts() -> u64 {
 pub struct MetricsLog {
     samples: VecDeque<Sample>,
     smi_missing: bool,
+    /// Name of the card the latest GPU readings came from. Kept once here
+    /// rather than in every sample, which would repeat it in each history row.
+    gpu_name: Option<String>,
 }
 
 impl MetricsLog {
@@ -112,6 +123,16 @@ impl MetricsLog {
 
     pub fn latest(&self) -> Option<Sample> {
         self.samples.back().cloned()
+    }
+
+    pub fn set_gpu_name(&mut self, name: Option<String>) {
+        if name.is_some() {
+            self.gpu_name = name;
+        }
+    }
+
+    pub fn gpu_name(&self) -> Option<&str> {
+        self.gpu_name.as_deref()
     }
 
     /// Downsampled window for graphs (§134): at most ~120 points.
@@ -152,18 +173,19 @@ pub async fn sample_once(active_sessions: usize) -> Sample {
     let mut sys = sysinfo::System::new();
     sys.refresh_cpu_usage();
     tokio::time::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL).await;
-    tokio::task::spawn_blocking(move || collect_sample(&mut sys, active_sessions))
+    tokio::task::spawn_blocking(move || collect_sample(&mut sys, active_sessions).0)
         .await
         .expect("resource sampling task")
 }
 
-fn collect_sample(sys: &mut sysinfo::System, active_sessions: usize) -> Sample {
+/// One reading plus the name of the GPU it measured, when known.
+fn collect_sample(sys: &mut sysinfo::System, active_sessions: usize) -> (Sample, Option<String>) {
     sys.refresh_memory();
     sys.refresh_cpu_usage();
     let gpu = read_nvidia_smi();
     let total_gb = sys.total_memory() as f64 / 1_073_741_824.0;
     let avail = sys.available_memory() as f64 / 1_073_741_824.0;
-    Sample {
+    let sample = Sample {
         ts: now_ts(),
         cpu_pct: sys.global_cpu_info().cpu_usage(),
         ram_used_gb: ((total_gb - avail) * 10.0).round() / 10.0,
@@ -174,7 +196,8 @@ fn collect_sample(sys: &mut sysinfo::System, active_sessions: usize) -> Sample {
         gpu_temp_c: gpu.as_ref().and_then(|g| g.temp_c),
         gpu_power_w: gpu.as_ref().and_then(|g| g.power_w),
         active_sessions,
-    }
+    };
+    (sample, gpu.and_then(|g| g.name))
 }
 
 /// Background sampler. `active` counts live generations + agent runs.
@@ -190,11 +213,11 @@ pub async fn sampler(log: SharedLog, active: Arc<dyn Fn() -> usize + Send + Sync
         // Both sysinfo collection and the optional GPU subprocess stay off the
         // async runtime. Move the same measuring state back each iteration.
         let sampled = tokio::task::spawn_blocking(move || {
-            let sample = collect_sample(&mut sys, active_sessions);
-            (sys, sample)
+            let (sample, gpu_name) = collect_sample(&mut sys, active_sessions);
+            (sys, sample, gpu_name)
         })
         .await;
-        let (next_sys, s) = match sampled {
+        let (next_sys, s, gpu_name) = match sampled {
             Ok(sampled) => sampled,
             Err(error) => {
                 tracing::warn!(%error, "resource sampler failed; reinitializing CPU counters");
@@ -204,7 +227,9 @@ pub async fn sampler(log: SharedLog, active: Arc<dyn Fn() -> usize + Send + Sync
             }
         };
         sys = next_sys;
-        log.lock().expect("lock").push(s);
+        let mut guard = log.lock().expect("lock");
+        guard.set_gpu_name(gpu_name);
+        guard.push(s);
     }
 }
 
@@ -260,8 +285,26 @@ mod tests {
         assert!((r.mem_used_gb - 10.06).abs() < 0.01);
         assert!((r.mem_total_gb - 11.94).abs() < 0.01);
         assert_eq!(r.temp_c, Some(71.0));
+        assert_eq!(r.name, None);
         assert!(parse_smi_line("garbage").is_none());
         assert!(parse_smi_line("1, 2").is_none());
+    }
+
+    #[test]
+    fn parses_gpu_name_column() {
+        let r = parse_smi_line("12, 2048, 12226, 55, 20.1, NVIDIA GeForce RTX 5070 Ti Laptop GPU").unwrap();
+        assert_eq!(r.name.as_deref(), Some("NVIDIA GeForce RTX 5070 Ti Laptop GPU"));
+        let unreported = parse_smi_line("12, 2048, 12226, 55, 20.1, [N/A]").unwrap();
+        assert_eq!(unreported.name, None);
+    }
+
+    #[test]
+    fn keeps_last_known_gpu_name() {
+        let mut log = MetricsLog::new();
+        assert_eq!(log.gpu_name(), None);
+        log.set_gpu_name(Some("Card".into()));
+        log.set_gpu_name(None);
+        assert_eq!(log.gpu_name(), Some("Card"));
     }
 
     #[test]

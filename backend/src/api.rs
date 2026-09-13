@@ -6877,7 +6877,7 @@ async fn system_metrics(
     let samples = log.window(secs);
     let latest = log.latest();
     let alerts = crate::metrics::alerts_for(latest.as_ref());
-    Json(serde_json::json!({"samples": samples, "latest": latest, "alerts": alerts}))
+    Json(serde_json::json!({"samples": samples, "latest": latest, "alerts": alerts, "gpu_name": log.gpu_name()}))
 }
 
 /// Stage 15: one-screen overview — hardware, inference, shared weights,
