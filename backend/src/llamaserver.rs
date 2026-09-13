@@ -850,18 +850,44 @@ impl SidecarClient {
         Ok((completion.text, completion.metrics))
     }
 
+    /// One immediate retry when the request could not even be sent. A
+    /// keep-alive connection the server closed after an early-stopped stream
+    /// fails on its next use before any bytes are exchanged; nothing has been
+    /// generated yet, so repeating the request is free and invisible.
+    async fn send_with_retry(
+        builder: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, InferenceError> {
+        let retry = builder.try_clone();
+        match builder.send().await {
+            Ok(response) => Ok(response),
+            Err(error) if !error.is_timeout() && (error.is_connect() || error.is_request()) => {
+                let Some(retry) = retry else {
+                    return Err(InferenceError::Generation(format!(
+                        "sidecar request failed: {error}"
+                    )));
+                };
+                tracing::warn!("sidecar request failed before any response ({error}); retrying once");
+                retry.send().await.map_err(|e| {
+                    InferenceError::Generation(format!("sidecar request failed: {e}"))
+                })
+            }
+            Err(error) => Err(InferenceError::Generation(format!(
+                "sidecar request failed: {error}"
+            ))),
+        }
+    }
+
     async fn complete_detailed(
         &self,
         body: serde_json::Value,
         cfg: &InferenceConfig,
     ) -> Result<AgentCompletion, InferenceError> {
-        let r = self
-            .inner
-            .post(format!("{}/v1/chat/completions", self.base_url))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| InferenceError::Generation(format!("sidecar request failed: {e}")))?;
+        let r = Self::send_with_retry(
+            self.inner
+                .post(format!("{}/v1/chat/completions", self.base_url))
+                .json(&body),
+        )
+        .await?;
         if !r.status().is_success() {
             let code = r.status();
             let text = r.text().await.unwrap_or_default();
@@ -1012,13 +1038,12 @@ impl SidecarClient {
         apply_options(&mut body, options);
         (handlers.on_phase)("processing");
         let mut phase = "processing";
-        let r = self
-            .inner
-            .post(format!("{}/v1/chat/completions", self.base_url))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| InferenceError::Generation(format!("sidecar request failed: {e}")))?;
+        let r = Self::send_with_retry(
+            self.inner
+                .post(format!("{}/v1/chat/completions", self.base_url))
+                .json(&body),
+        )
+        .await?;
         if !r.status().is_success() {
             let code = r.status();
             let text = r.text().await.unwrap_or_default();

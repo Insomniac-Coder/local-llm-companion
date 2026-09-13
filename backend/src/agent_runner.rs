@@ -150,19 +150,21 @@ struct StructuredReply {
     answer: String,
 }
 
-/// Escape raw control characters inside JSON string literals. Small models
-/// routinely write a multi-line `old`/`content` value with real newlines,
-/// which strict JSON forbids; the intent is unambiguous, so repair it. Text
-/// outside strings is untouched and structurally broken JSON still fails.
+/// Repair the JSON slips small models make whose intent is unambiguous:
+/// raw newlines and tabs inside string values (a multi-line `old` or
+/// `content`), a trailing comma before `]` or `}`, and an unquoted
+/// spreadsheet formula such as `=SUM(C2:C6)` in value position. Text inside
+/// strings is otherwise untouched and structurally broken JSON still fails.
 fn repair_json_strings(body: &str) -> std::borrow::Cow<'_, str> {
-    if !body.contains(['\n', '\r', '\t']) {
+    if !body.contains(['\n', '\r', '\t', ',', '=']) {
         return std::borrow::Cow::Borrowed(body);
     }
     let mut out = String::with_capacity(body.len() + 16);
     let mut in_string = false;
     let mut escaped = false;
     let mut changed = false;
-    for ch in body.chars() {
+    let mut chars = body.chars().peekable();
+    while let Some(ch) = chars.next() {
         if in_string {
             if escaped {
                 escaped = false;
@@ -192,11 +194,50 @@ fn repair_json_strings(body: &str) -> std::borrow::Cow<'_, str> {
                 }
                 _ => out.push(ch),
             }
-        } else {
-            if ch == '"' {
+            continue;
+        }
+        match ch {
+            '"' => {
                 in_string = true;
+                out.push(ch);
             }
-            out.push(ch);
+            ']' | '}' => {
+                // A trailing comma: drop it.
+                let trimmed = out.trim_end_matches(|c: char| c.is_whitespace());
+                if trimmed.ends_with(',') {
+                    let keep = trimmed.len() - 1;
+                    out.truncate(keep);
+                    changed = true;
+                }
+                out.push(ch);
+            }
+            '=' if out
+                .trim_end()
+                .chars()
+                .next_back()
+                .is_some_and(|prev| matches!(prev, ':' | ',' | '[')) =>
+            {
+                // An unquoted formula in value position: quote it up to the
+                // next delimiter outside its parentheses.
+                let mut token = String::from("=");
+                let mut depth = 0i32;
+                while let Some(&next) = chars.peek() {
+                    match next {
+                        '(' => depth += 1,
+                        ')' => depth -= 1,
+                        ',' | ']' | '}' if depth <= 0 => break,
+                        '\n' | '\r' => break,
+                        _ => {}
+                    }
+                    token.push(next);
+                    chars.next();
+                }
+                out.push('"');
+                out.push_str(&token.trim_end().replace('"', "\\\""));
+                out.push('"');
+                changed = true;
+            }
+            _ => out.push(ch),
         }
     }
     if changed {
@@ -310,7 +351,10 @@ fn action_closing(tail: &str, marker: &str) -> Result<Option<usize>, ()> {
     };
     let rest = &tail[start..];
     let Some(after) = rest.strip_prefix(marker) else {
-        return Err(());
+        // No closing marker at all: the object is complete, so what follows
+        // is the model's narrative ("The file is ready…") unless it holds
+        // another action. Small models skip the fence and keep talking.
+        return if has_action_marker(rest) { Err(()) } else { Ok(None) };
     };
     if marker == "```" {
         if !tail[..start].contains('\n') {
@@ -490,9 +534,47 @@ pub fn action_complete(text: &str) -> bool {
     (trimmed.starts_with('{') || has_action_marker(text)) && locate_action(text).is_some()
 }
 
+/// Why an attempted action could not be read, in the JSON parser's words,
+/// so the correction names the actual mistake (an unquoted formula, a
+/// trailing comma) instead of restating the format. `None` when the text
+/// holds no attempt or the attempt parses.
+pub fn action_problem(text: &str) -> Option<String> {
+    if !looks_like_action_attempt(text) || locate_action(text).is_some() {
+        return None;
+    }
+    let mut offset = 0;
+    let mut body_start = None;
+    for line in text.split_inclusive('\n') {
+        offset += line.len();
+        if fence_opener(line) == Some(true) {
+            body_start = Some(offset);
+            break;
+        }
+    }
+    let body_start = body_start.or_else(|| {
+        text.find("<tool_call>").map(|index| index + "<tool_call>".len())
+    })?;
+    let body = &text[body_start..];
+    let end = body
+        .find("\n```")
+        .or_else(|| body.find("</tool_call>"))
+        .unwrap_or(body.len());
+    let repaired = repair_json_strings(&body[..end]);
+    match serde_json::from_str::<serde_json::Value>(repaired.trim()) {
+        Ok(value) => {
+            if value.get("name").and_then(|name| name.as_str()).is_none() {
+                Some("the object has no \"name\" field".into())
+            } else {
+                Some("the arguments are not a JSON object".into())
+            }
+        }
+        Err(error) => Some(error.to_string()),
+    }
+}
+
 /// Did the model try to produce an action, even if none could be read? Such
 /// a reply is retried as unreadable rather than reviewed as a final answer.
-fn looks_like_action_attempt(text: &str) -> bool {
+pub fn looks_like_action_attempt(text: &str) -> bool {
     if text.contains("```tool") || text.contains("<tool_call>") || text.contains("<|tool_call>") {
         return true;
     }
@@ -630,6 +712,9 @@ pub fn system_prompt(
             "web_search" => r#"{"query":"search terms"}"#,
             "git_commit" => r#"{"message":"commit message"}"#,
             "system_info" | "list_processes" => "{}",
+            "create_document" => {
+                r#"{"filename":"report.xlsx","sheets":[{"name":"Data","rows":[["Item","Amount"],["Example",1]]}]} (spec by file type: xlsx = sheets[{name,rows}]; docx and pdf = title + paragraphs[]; pptx = title + slides[{title,bullets[]}]; md/txt = text; csv = rows; html = title + html; json = data. Put the complete content in the spec. The file lands in the conversation's Artifacts panel, not in the workspace)"#
+            }
             _ => "see tool description",
         };
         // Keep the JSON example clean; explanations go on their own line so a
@@ -1019,7 +1104,9 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
     };
     let mut pending_continuation: Option<String> = None;
     let mut completion_reviews = 0u32;
-    let mut verification = VerificationState::default();
+    let mut last_review_reason = String::new();
+    let mut repeated_review = 0u32;
+    let mut verification = VerificationState::for_task(&spec.task);
     let mut failed_calls = FailedCalls::default();
     let mut pruned_turns = 0u32;
     let mut tool_evidence: Vec<String> = Vec::new();
@@ -1256,6 +1343,23 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
                 CompletionReview::Continue(reason) => {
                     completion_reviews += 1;
                     let reason = reason.trim().chars().take(600).collect::<String>();
+                    // The same shortfall three times means the model cannot
+                    // act on it: stop with the shortfall named rather than
+                    // re-producing the same result until the step limit.
+                    if reason == last_review_reason {
+                        repeated_review += 1;
+                    } else {
+                        repeated_review = 0;
+                        last_review_reason = reason.clone();
+                    }
+                    if repeated_review >= 2 {
+                        let final_message = format!(
+                            "I produced the same result three times without addressing what the check found, so I stopped. Remaining work: {reason}. Existing files were kept."
+                        );
+                        persist_final(&state, &run, &final_message).await;
+                        run.emit(AgentEvent::activity("error", S::Failed, final_message, it));
+                        return S::Failed;
+                    }
                     run.emit(AgentEvent::activity(
                         "status",
                         S::Planning,
@@ -1491,8 +1595,22 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
         }
         let shown: String = output.chars().take(TOOL_OUTPUT_CHARS).collect();
         let tool_failed = tool_output_failed(&output);
-        let observation =
-            progress_guard.observe_tool_result(&call.name, &call.args, &output, !tool_failed);
+        // A re-rendered document gets a fresh artifact id but is the same
+        // result when its arguments are the same: judge repeats without the id.
+        let observed_output = if call.name == "create_document" {
+            output
+                .split_once(": ")
+                .map(|(_, rest)| rest.to_owned())
+                .unwrap_or_else(|| output.clone())
+        } else {
+            output.clone()
+        };
+        let observation = progress_guard.observe_tool_result(
+            &call.name,
+            &call.args,
+            &observed_output,
+            !tool_failed,
+        );
         if observation.is_progress() {
             response_policy.useful_progress();
             completion_reviews = 0;
@@ -1713,14 +1831,32 @@ struct VerificationState {
     /// A later mutation re-inserts its path: older reads cannot verify a new revision.
     uninspected: HashSet<PathBuf>,
     unknown_shell_changes: bool,
+    /// The file type the task explicitly asked for (presentation, spreadsheet,
+    /// PDF…): only a produced file fulfils it, never its content in the chat.
+    document_kind: Option<&'static str>,
+    document_created: bool,
 }
 
 impl VerificationState {
+    fn for_task(task: &str) -> Self {
+        Self {
+            document_kind: crate::documents::requested_document_kind(task),
+            ..Self::default()
+        }
+    }
+
     fn needs_evidence(&self) -> bool {
-        !self.uninspected.is_empty() || self.unknown_shell_changes
+        !self.uninspected.is_empty()
+            || self.unknown_shell_changes
+            || (self.document_kind.is_some() && !self.document_created)
     }
 
     fn remaining(&self) -> String {
+        if let (Some(kind), false) = (self.document_kind, self.document_created) {
+            return format!(
+                "The task asks for a {kind} file and none has been produced: writing its content into the chat is not the deliverable. Create it now with one create_document call (filename ending in .{kind}, complete content in the spec), then report the result."
+            );
+        }
         if self.unknown_shell_changes {
             "A command may have changed the project. Run a relevant test, build or validation and report its real result; a directory listing or unrelated read is not verification.".into()
         } else {
@@ -1757,9 +1893,19 @@ impl VerificationState {
         if failed {
             return;
         }
+        if call.name == "create_document" {
+            self.document_created = true;
+            return;
+        }
         let path = arg_str(call, "path").and_then(|path| ws.resolve(path).ok());
         match call.name.as_str() {
             "write_file" | "edit_file" => {
+                // A file written with the requested extension is the deliverable too.
+                if let (Some(kind), Some(path)) = (self.document_kind, arg_str(call, "path")) {
+                    if path.to_ascii_lowercase().ends_with(&format!(".{kind}")) {
+                        self.document_created = true;
+                    }
+                }
                 if let Some(path) = path {
                     self.uninspected.insert(path);
                 }
@@ -2896,7 +3042,7 @@ mod tests {
             format!("{read}\nThen edit:\n{edit}"),
             format!("{read}\n```tool\n{{\"name\":\"write_file\""),
             "```tool\n{\"name\":\"read_file\",\"args\":{".into(),
-            "```tool\n{\"name\":\"read_file\",\"args\":{}}\n``".into(),
+            "```tool\n{\"name\":\"read_file\",\"args\":{}}\nThen:\n```tool\n{\"name\":\"delete_file\",\"args\":{\"path\":\"x\"}}".into(),
         ] {
             assert!(
                 parse_tool_block(&text).is_none(),
@@ -2917,6 +3063,48 @@ mod tests {
         ] {
             assert!(parse_tool_block(text).is_none(), "accepted quoted/example markup: {text}");
         }
+    }
+
+    #[test]
+    fn unreadable_actions_are_explained_in_the_parsers_words() {
+        // A missing comma between fields: not repairable, so the parser's
+        // own words come back.
+        let text = "```tool\n{\"name\":\"create_document\" \"args\":{\"filename\":\"b.xlsx\"}}\n```";
+        let problem = action_problem(text).expect("an attempt that does not parse");
+        assert!(problem.contains("expected"), "{problem}");
+        // The slips that are repaired: an unquoted spreadsheet formula, a
+        // trailing comma, and both at once.
+        let formula = "```tool\n{\"name\":\"create_document\",\"args\":{\"filename\":\"b.xlsx\",\"sheets\":[{\"name\":\"S\",\"rows\":[[\"Total\",=SUM(C2:C6)],[\"Avg\", =AVERAGE(C2, C6) ],]}],}}\n```";
+        let call = parse_tool_block(formula).expect("repaired");
+        assert_eq!(call.args["sheets"][0]["rows"][0][1], "=SUM(C2:C6)");
+        assert_eq!(call.args["sheets"][0]["rows"][1][1], "=AVERAGE(C2, C6)");
+        assert!(action_problem(formula).is_none());
+        // Quoted formulas and equals signs inside strings are left alone.
+        let quoted = "{\"a\":\"=SUM(1)\",\"b\":\"x=y\"}";
+        assert_eq!(repair_json_strings(quoted), quoted);
+        assert!(action_problem("Plain answer, no action.").is_none());
+        assert!(action_problem("```tool\n{\"name\":\"read_file\",\"args\":{\"path\":\"a\"}}\n```").is_none());
+        assert_eq!(
+            action_problem("```tool\n{\"args\":{\"path\":\"a\"}}\n```").as_deref(),
+            Some("the object has no \"name\" field")
+        );
+    }
+
+    #[test]
+    fn a_requested_document_is_only_verified_by_a_produced_file() {
+        let mut state = VerificationState::for_task("make a short presentation about this project");
+        assert!(state.needs_evidence());
+        assert!(state.remaining().contains("pptx"));
+        let ws = crate::workspace::WorkspaceManager::new(std::env::temp_dir());
+        let read = ToolCall { name: "read_file".into(), args: serde_json::json!({"path":"README.md"}) };
+        state.observe(&ws, &read, "contents", false);
+        assert!(state.needs_evidence(), "reading is not producing");
+        let failed = ToolCall { name: "create_document".into(), args: serde_json::json!({"filename":"x.pptx"}) };
+        state.observe(&ws, &failed, "(tool error) no content", true);
+        assert!(state.needs_evidence(), "a failed render is not a file");
+        state.observe(&ws, &failed, "artifact 1: x.pptx (3 KB)", false);
+        assert!(!state.needs_evidence());
+        assert!(!VerificationState::for_task("explain the parser").needs_evidence());
     }
 
     #[test]
@@ -2986,6 +3174,16 @@ mod tests {
         // A closed fence keeps the transcript copy untouched.
         let closed = format!("{open}\n```\n");
         assert_eq!(transcript_reply(&closed), closed);
+        // No fence at all and a narrative after the object (what an 8B model
+        // writes before the tool has even run): the action is taken, the
+        // narrative is the note, and the transcript copy gets the fence in
+        // between.
+        let chatty = format!("{open}\nThe spreadsheet has been created and is ready.");
+        assert_eq!(parse_tool_block(&chatty).unwrap().name, "edit_file");
+        assert!(action_complete(&chatty));
+        assert_eq!(visible_progress(&chatty), "Fixing it.\n\nThe spreadsheet has been created and is ready.");
+        assert_eq!(transcript_reply(&chatty), format!("{open}\n```\nThe spreadsheet has been created and is ready."));
+        assert!(action_problem(&chatty).is_none());
         // Prose after the closing fence is a plan note, not a second action.
         let trailing = format!("{open}\n```\nThen I will run the tests.");
         assert_eq!(parse_tool_block(&trailing).unwrap().name, "edit_file");

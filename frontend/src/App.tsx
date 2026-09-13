@@ -578,7 +578,10 @@ export default function App() {
         if (routingController.signal.aborted || conversationRef.current !== cid) return;
         inferredIntent = decision.intent;
         classified = decision.source === 'model';
-        if (decision.source === 'fallback') notify('info', 'Could not determine the request type. Continuing in chat.');
+        // A heuristic route is a normal outcome (the backend logs why the
+        // model's decision was unusable); only an unusable response is
+        // worth telling the user about, and even then the message goes on.
+        if (decision.source === 'fallback') notify('info', 'The routing check returned nothing usable; answering this as a question.');
       } catch (error: any) {
         if (error?.name !== 'AbortError') notify('error', error?.message ?? 'Could not classify the message. Your draft is kept.');
         return;

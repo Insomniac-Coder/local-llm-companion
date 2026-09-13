@@ -1,12 +1,15 @@
 import type { GenerationPhase, OutputTiming } from './outputTiming';
 export const API = '';
 
-export async function classifyRequest(message: string, conversationId: string, signal: AbortSignal): Promise<{intent: 'ask' | 'plan' | 'agent'; source: 'model' | 'fallback'}> {
+/** `source` says who decided: the model, the wording heuristic when the
+ *  model's decision could not be read, or a client-side fallback when the
+ *  response itself was unusable. Routing never fails a message. */
+export async function classifyRequest(message: string, conversationId: string, signal: AbortSignal): Promise<{intent: 'ask' | 'plan' | 'agent'; source: 'model' | 'heuristic' | 'fallback'}> {
   const result = await req('/api/chat/classify', {
     method: 'POST', headers: {'content-type': 'application/json'},
     body: JSON.stringify({message, conversation_id: conversationId}), signal,
   });
-  if (!['ask', 'plan', 'agent'].includes(result?.intent) || !['model', 'fallback'].includes(result?.source)) {
+  if (!['ask', 'plan', 'agent'].includes(result?.intent) || !['model', 'heuristic', 'fallback'].includes(result?.source)) {
     return {intent: 'ask', source: 'fallback'};
   }
   return result;

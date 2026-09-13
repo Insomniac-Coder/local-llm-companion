@@ -170,10 +170,18 @@ pub fn risk_of(name: &str) -> RiskLevel {
 /// Tool names the in-chat loop may run WITHOUT asking (Stage 31): read-only,
 /// workspace-confined, no side effects. Everything else needs the agent
 /// panel/commands approval flow.
+/// Tools a chat reply may run without approval: read-only inspection, plus
+/// `create_document`, which only ever writes into the app's own artifacts
+/// folder (never the project) and hands the user a file to open or save.
 pub fn chat_safe(name: &str) -> bool {
     matches!(
         name,
-        "list_directory" | "read_file" | "search_text" | "system_info" | "list_processes"
+        "list_directory"
+            | "read_file"
+            | "search_text"
+            | "system_info"
+            | "list_processes"
+            | "create_document"
     )
 }
 
@@ -1057,10 +1065,12 @@ mod tests {
             "execute_command",
             "git_commit",
             "open_path",
-            "create_document",
         ] {
             assert!(!chat_safe(t), "{t}");
         }
+        // Documents never touch the project: they render into the app's own
+        // artifacts folder, so chat may produce them without approval.
+        assert!(chat_safe("create_document"));
     }
 
     #[test]

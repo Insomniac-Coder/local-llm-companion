@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { cancelLoad, getLoadProgress, getMetrics, type InferenceStatus, type LoadProgress, type ModelMeta } from '../services/api';
 import { Button, IconButton, Lamp, Meter, PopDivider, PopItem, PopLabel, Popover } from '../ui/primitives';
 import { Icon } from '../ui/Icon';
-import type { ResourceSample } from './resourceTelemetry';
+import { isReading, type ResourceSample } from './resourceTelemetry';
 
 export type MachineActivity = 'idle' | 'generating' | 'agent' | 'waiting';
 
@@ -139,7 +139,10 @@ export default function Rig(props: Props) {
       <div className="rig-rail">
         <button type="button" className="rig-rail-btn" aria-label={`${label}${shown ? ` · ${shown.name}` : ''}. Open model menu.`} data-tip={shown ? `${label} · ${shown.name}` : label} data-tip-side="right" aria-expanded={menuOpen} onClick={() => setMenuOpen((open) => !open)}>
           <Lamp state={state} pulse={live || state === 'caution'} />
-          <Meter value={sample?.vram_used_gb} max={sample?.vram_total_gb} cells={6} label="Graphics memory" />
+          {/* The memory the model lives in: graphics memory on a GPU machine, system memory otherwise. */}
+          {vramKnown
+            ? <Meter value={sample?.vram_used_gb} max={sample?.vram_total_gb} cells={6} label="Graphics memory" />
+            : <Meter value={sample?.ram_used_gb} max={sample?.ram_total_gb} cells={6} label="System memory" />}
         </button>
         {menu}
       </div>
@@ -177,23 +180,25 @@ export default function Rig(props: Props) {
 
         {sample && backendUp !== false && (
           <div className="rig-meters">
+            {/* Processor and system memory first: they exist on every machine
+                and on a CPU-only one they are the whole engine. Graphics rows
+                follow when a GPU reports. Nothing here is hidden for space. */}
+            <span className="eyebrow">CPU</span>
+            <Meter value={sample.cpu_pct} max={100} label="Processor load" warn={false} />
+            <span className="readout">{isReading(sample.cpu_pct) ? `${Math.round(sample.cpu_pct)}%` : '—'}</span>
+            <span className="eyebrow">RAM</span>
+            <Meter value={sample.ram_used_gb} max={sample.ram_total_gb} label="System memory in use" />
+            <span className="readout">{gb(sample.ram_used_gb, 0)}/{gb(sample.ram_total_gb, 0)} GB</span>
+            {typeof sample.gpu_pct === 'number' && <>
+              <span className="eyebrow" title={gpuName ?? 'Graphics processor'}>GPU</span>
+              <Meter value={sample.gpu_pct} max={100} label="Graphics processor load" warn={false} />
+              <span className="readout">{Math.round(sample.gpu_pct)}%{typeof sample.gpu_temp_c === 'number' ? ` · ${Math.round(sample.gpu_temp_c)}°` : ''}</span>
+            </>}
             {vramKnown && <>
               <span className="eyebrow" title={gpuName ?? 'Dedicated graphics memory'}>VRAM</span>
               <Meter value={sample.vram_used_gb} max={sample.vram_total_gb} label="Graphics memory in use" />
               <span className={`readout${(sample.vram_used_gb ?? 0) / (sample.vram_total_gb ?? 1) >= 0.9 ? ' hot' : ''}`}>{gb(sample.vram_used_gb)}/{gb(sample.vram_total_gb)} GB</span>
             </>}
-            {typeof sample.gpu_pct === 'number' ? <>
-              <span className="eyebrow" title={gpuName ?? 'Graphics processor'}>GPU</span>
-              <Meter value={sample.gpu_pct} max={100} label="Graphics processor load" warn={false} />
-              <span className="readout">{Math.round(sample.gpu_pct)}%{typeof sample.gpu_temp_c === 'number' ? ` · ${Math.round(sample.gpu_temp_c)}°` : ''}</span>
-            </> : <>
-              <span className="eyebrow">CPU</span>
-              <Meter value={sample.cpu_pct} max={100} label="Processor load" warn={false} />
-              <span className="readout">{Math.round(sample.cpu_pct ?? 0)}%</span>
-            </>}
-            <span className="eyebrow rig-ram">RAM</span>
-            <span className="rig-ram"><Meter value={sample.ram_used_gb} max={sample.ram_total_gb} label="System memory in use" /></span>
-            <span className="readout rig-ram">{gb(sample.ram_used_gb, 0)}/{gb(sample.ram_total_gb, 0)} GB</span>
           </div>
         )}
 

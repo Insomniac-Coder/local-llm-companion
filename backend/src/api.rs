@@ -1367,23 +1367,54 @@ async fn classify_request(
     turns.extend(context.turns);
     let turns = crate::request_router::classification_turns_from_prefix(turns);
     let client = SidecarClient::new(url).map_err(|e| ApiError::internal(e.to_string()))?;
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(60),
-        client.classify_request(&turns, &cfg),
-    )
-    .await;
+    // The routing reply is a few tokens; the wait is the prefill of a new
+    // Code session's prefix, which the answer reuses from the cache anyway.
+    // A CPU-only or spilled machine prefills at a tenth of the speed.
+    let on_gpu = cfg
+        .runtime_policy
+        .as_ref()
+        .map(|policy| policy.placement == "gpu")
+        .unwrap_or(true);
+    let routing_wait = std::time::Duration::from_secs(if on_gpu { 60 } else { 240 });
+    let result = tokio::time::timeout(routing_wait, client.classify_request(&turns, &cfg)).await;
     let decision = match result {
-        Ok(Ok(completion)) => crate::request_router::parse_decision(&completion),
+        Ok(Ok(completion)) => {
+            let decision = crate::request_router::parse_decision(&completion);
+            if decision.is_none() {
+                // Diagnosable from the console: what the model produced and
+                // why it did not count (cut off, thinking, empty).
+                tracing::warn!(
+                    finish = ?completion.finish_reason,
+                    reasoning = completion.reasoning_present,
+                    generated = completion.metrics.generated_tokens,
+                    text = %completion.text.chars().take(300).collect::<String>(),
+                    "request routing: the model's decision could not be read; routing by wording instead"
+                );
+            }
+            decision
+        }
         Ok(Err(error)) => {
-            tracing::warn!("request routing failed: {error}");
+            tracing::warn!("request routing failed: {error}; routing by wording instead");
             None
         }
-        Err(_) => None,
+        Err(_) => {
+            tracing::warn!(
+                "request routing timed out after {} s; routing by wording instead",
+                routing_wait.as_secs()
+            );
+            None
+        }
     };
-    Ok(Json(serde_json::json!({
-        "intent": decision.unwrap_or(crate::request_router::RequestIntent::Ask),
-        "source": if decision.is_some() { "model" } else { "fallback" }
-    })))
+    // Routing never fails the message: without a model decision the wording
+    // decides, and anything ambiguous is answered as a question.
+    let (intent, source) = match decision {
+        Some(intent) => (intent, "model"),
+        None => (
+            crate::request_router::heuristic_intent(&req.message),
+            "heuristic",
+        ),
+    };
+    Ok(Json(serde_json::json!({ "intent": intent, "source": source })))
 }
 
 
@@ -1438,11 +1469,18 @@ fn build_system_prompt(mode: &str, snapshot: &str, model_name: &str) -> String {
                  do not inspect unrelated siblings just because they appear in the tree.\n\
                  Writes, edits, builds, commits and commands need approval: do NOT emit those tools here; \
                  instead tell the user which command runs them: /init (inspect), /review [path], /plan <task>, \
-                 /build, /test [filter], /run <cmd>, /diff."
+                 /build, /test [filter], /run <cmd>, /diff. \
+                 One exception: when the user asks for a document, spreadsheet, presentation or PDF about the project, gather what it needs with reads, then produce the file with create_document (pasting slide or document text into the chat does not fulfil such a request), e.g. \
+                 {{\"name\":\"create_document\",\"args\":{{\"filename\":\"overview.pptx\",\"title\":\"Project overview\",\"slides\":[{{\"title\":\"Scope\",\"bullets\":[\"…\"]}}]}}}} \
+                 (xlsx = sheets[{{name,rows}}]; docx and pdf = title + paragraphs[]; md/txt = text; csv = rows). It lands in the Artifacts panel, never in the project."
             ));
         }
     } else {
-        p.push_str("\n\n[Chat session: general assistant. Attached files appear as excerpts. Web search happens only when the user enables it.]");
+        p.push_str("\n\n[Chat session: general assistant. Attached files appear as excerpts. Web search happens only when the user enables it.]\n\
+             When the user asks for a document, spreadsheet, presentation or PDF, produce the file: emit exactly one tool call and wait for its result. Use this complete format with fence markers on separate lines:\n\
+             ```tool\n{\"name\":\"create_document\",\"args\":{\"filename\":\"report.xlsx\",\"sheets\":[{\"name\":\"Data\",\"rows\":[[\"Item\",\"Amount\"],[\"Example\",1]]}]}}\n```\n\
+             Spec by file type: xlsx = sheets[{name,rows}]; docx and pdf = title + paragraphs[] (plain paragraphs); pptx = title + slides[{title,bullets[]}]; md/txt = text; csv = rows; html = title + html; json = data. \
+             Put the complete content in the spec, never placeholders. The file appears in the conversation's Artifacts panel with Open and Save; after the result, tell the user it is ready and summarise what it contains. Answer in the chat unless a file was asked for.");
     }
     p
 }
@@ -1631,9 +1669,13 @@ async fn run_chat_tool_round(
     let status = |msg: &str| {
         let _ = tx_status.send(Ok(Event::default().event("status").data(msg.to_string())));
     };
-    let Some((_, ws_name, ws_path)) = chat_ws else {
+    // Documents render into the app's artifacts folder, so they need no
+    // linked project; every other chat tool inspects the workspace.
+    let is_document = call.name == "create_document";
+    let ws_path = chat_ws.as_ref().map(|(_, _, path)| path.clone());
+    if !is_document && ws_path.is_none() {
         return false;
-    };
+    }
     if call.name != "manage_context" && !crate::tools::chat_safe(&call.name) {
         emit_chat_activity(s, message_id, tx_status, crate::agent::AgentEvent::tool_activity(
             "tool_error", AgentState::Observing, "This action was not run. Ask mode only permits safe inspection; choose Agent to request changes.".into(),
@@ -1673,6 +1715,13 @@ async fn run_chat_tool_round(
                 .and_then(|v| v.as_str())
                 .unwrap_or(".")
         ),
+        "create_document" => format!(
+            "Creating {}…",
+            call.args
+                .get("filename")
+                .and_then(|v| v.as_str())
+                .unwrap_or("document")
+        ),
         _ => format!("Running {}…", call.name),
     };
     status(&label);
@@ -1692,30 +1741,38 @@ async fn run_chat_tool_round(
         ),
     )
     .await;
-    let ws = crate::workspace::WorkspaceManager::new(ws_path.clone());
-    let req = crate::tools::ToolRequest {
-        name: call.name.clone(),
-        args: call.args.clone(),
-        approved: false,
-    };
     let executed = if call.name == "manage_context" {
         memory
             .manage(&call.args, turns)
             .map(crate::tools::ToolResult::ok)
             .map_err(crate::tools::ToolError::InvalidArgs)
-    } else {
-        // File reads and regex searches are blocking filesystem work.
-        let blocking_ws = ws.clone();
-        let blocking_req = req.clone();
-        tokio::task::spawn_blocking(move || {
-            crate::tools::execute(&blocking_req, &blocking_ws, false)
-        })
+    } else if is_document {
+        // Rendered by deterministic code from the model's spec and recorded
+        // as an artifact of this conversation (never written into a project).
+        crate::documents::execute_create_document(
+            &s.storage,
+            &s.artifacts_dir,
+            conv.as_deref().unwrap_or("direct"),
+            &call.args,
+        )
         .await
-        .unwrap_or_else(|error| {
-            Err(crate::tools::ToolError::InvalidArgs(format!(
-                "tool task failed: {error}"
-            )))
-        })
+    } else {
+        let ws = crate::workspace::WorkspaceManager::new(
+            ws_path.clone().expect("workspace checked above"),
+        );
+        let req = crate::tools::ToolRequest {
+            name: call.name.clone(),
+            args: call.args.clone(),
+            approved: false,
+        };
+        // File reads and regex searches are blocking filesystem work.
+        tokio::task::spawn_blocking(move || crate::tools::execute(&req, &ws, false))
+            .await
+            .unwrap_or_else(|error| {
+                Err(crate::tools::ToolError::InvalidArgs(format!(
+                    "tool task failed: {error}"
+                )))
+            })
     };
     let (ok, output) = match executed {
         Ok(r) => (r.ok, r.output),
@@ -1741,10 +1798,11 @@ async fn run_chat_tool_round(
         crate::agent::AgentEvent::tool_activity(
             if ok { "tool_result" } else { "tool_error" },
             AgentState::Observing,
-            if ok {
-                "Inspection finished".into()
-            } else {
-                "Inspection failed".into()
+            match (is_document, ok) {
+                (true, true) => "Document created".into(),
+                (true, false) => "Document failed".into(),
+                (false, true) => "Inspection finished".into(),
+                (false, false) => "Inspection failed".into(),
             },
             iteration,
             call.name.clone(),
@@ -1770,7 +1828,6 @@ async fn run_chat_tool_round(
             created_at: chrono::Utc::now().to_rfc3339(),
         });
     }
-    let _ = ws_name;
     turns.push(ChatTurn::text("assistant", round_text));
     let next_step = if call.name == "search_text" && ok {
         "\n[Host guidance: these are search matches, not whole function bodies. If the original question asks about implementation or return values not visible here, your NEXT response must call read_file on the matching path/line range. Do not ask permission for that read; the user's question already requests this inspection. Otherwise answer from the evidence.]"
@@ -1787,6 +1844,21 @@ async fn run_chat_tool_round(
     ));
     memory.record(turns, &call.name, &call.args);
     true
+}
+
+/// Artifacts recorded for a conversation so far; a chat turn that asked for a
+/// file compares before and after its tool rounds.
+async fn chat_artifact_count(state: &AppState, conv: &Option<String>) -> usize {
+    let Some(conv_id) = conv.as_deref().filter(|id| !id.is_empty()) else {
+        return 0;
+    };
+    state
+        .storage
+        .lock()
+        .await
+        .artifacts_for(conv_id)
+        .map(|rows| rows.len())
+        .unwrap_or(0)
 }
 
 async fn emit_chat_activity(
@@ -2320,6 +2392,14 @@ async fn chat_sse(
         let mut truncated = false;
         let mut reasoning_seen = false;
         let mut failed: Option<String> = None;
+        // A request for a file is only fulfilled by a file: one correction for
+        // an unreadable tool call and one nudge to produce the document, so a
+        // small model that pastes the content into the chat still delivers.
+        let document_requested = crate::documents::requested_document_kind(&req.message).is_some();
+        let artifacts_before = chat_artifact_count(&bg_state, &bg_conv).await;
+        let mut document_created = false;
+        let mut corrections = 0u32;
+        let mut nudges = 0u32;
         let client = match SidecarClient::new(base_url) {
             Ok(c) => Some(c),
             Err(e) => {
@@ -2368,9 +2448,10 @@ async fn chat_sse(
                 let round = tool_uses + 1;
                 let cancel_r = cancel_cb.clone();
                 let round_base = full_cb.lock().expect("lock").len();
-                // In code sessions a complete action fence ends the round: the
-                // runtime is released instead of generating text after it.
-                let stop_on_action = code_activity && chat_ws.is_some();
+                // A complete action ends the round wherever a tool can run
+                // (project inspection in code sessions, documents anywhere):
+                // the runtime is released instead of generating text after it.
+                let stop_on_action = chat_ws.is_some() || !code_activity;
                 let handlers = crate::llamaserver::StreamHandlers {
                     on_token: Box::new(move |tok: &str| {
                         full_r.lock().expect("lock").push_str(tok);
@@ -2463,7 +2544,43 @@ async fn chat_sse(
                         };
                         if worked {
                             tool_uses += 1;
+                            // A produced file is an artifact row: count them
+                            // rather than parse the transcript.
+                            document_created |= chat_artifact_count(&bg_state, &bg_conv).await
+                                > artifacts_before;
                             continue;
+                        }
+                        if tool_uses < CHAT_TOOL_ROUNDS {
+                            // The model tried to act but the call could not be
+                            // read: say what was wrong and let it re-emit once,
+                            // as the agent loop does.
+                            if let Some(problem) =
+                                crate::agent_runner::action_problem(&round_text)
+                                    .filter(|_| corrections == 0)
+                            {
+                                corrections += 1;
+                                turns.push(ChatTurn::text("assistant", round_text.clone()));
+                                turns.push(ChatTurn::text(
+                                    "user",
+                                    format!("[System: your tool call could not be read ({problem}). Nothing was executed. Re-emit exactly one tool envelope with valid JSON: every string value in double quotes (a formula such as =SUM(C2:C6) is a string), no comments, no trailing commas.]"),
+                                ));
+                                let _ = tx_status.send(Ok(Event::default().event("status").data(
+                                    "The tool call was not valid JSON; asking for a corrected one…",
+                                )));
+                                continue;
+                            }
+                            if document_requested && !document_created && nudges == 0 {
+                                nudges += 1;
+                                turns.push(ChatTurn::text("assistant", round_text.clone()));
+                                turns.push(ChatTurn::text(
+                                    "user",
+                                    "[System: the user asked for a file, and no file has been produced. Produce it now with exactly one create_document call that contains the complete content (use what you wrote above). Do not paste the content into the chat instead.]",
+                                ));
+                                let _ = tx_status.send(Ok(Event::default()
+                                    .event("status")
+                                    .data("Producing the requested file…")));
+                                continue;
+                            }
                         }
                         break;
                     }

@@ -485,6 +485,94 @@ fn zip_archive_check(mut f: std::fs::File) -> Result<(), String> {
     }
 }
 
+/// The document kind a request explicitly asks for, by naming a file type.
+/// Only explicit types count: "document the API" is a verb, "a report" may
+/// be an answer in the chat.
+pub fn requested_document_kind(text: &str) -> Option<&'static str> {
+    let lowered = text.to_lowercase();
+    let has = |needle: &str| {
+        lowered.match_indices(needle).any(|(index, _)| {
+            let before = lowered[..index].chars().next_back();
+            let after = lowered[index + needle.len()..].chars().next();
+            !before.is_some_and(|c| c.is_alphanumeric()) && !after.is_some_and(|c| c.is_alphanumeric())
+        })
+    };
+    if ["presentation", "slides", "slide deck", "deck", "pptx", "powerpoint", "keynote"]
+        .iter()
+        .any(|needle| has(needle))
+    {
+        return Some("pptx");
+    }
+    if ["spreadsheet", "excel", "xlsx", "workbook", "excel file", "excel sheet"]
+        .iter()
+        .any(|needle| has(needle))
+    {
+        return Some("xlsx");
+    }
+    if has("pdf") {
+        return Some("pdf");
+    }
+    if ["docx", "word document", "word file", "word doc"]
+        .iter()
+        .any(|needle| has(needle))
+    {
+        return Some("docx");
+    }
+    if ["csv", "csv file"].iter().any(|needle| has(needle)) {
+        return Some("csv");
+    }
+    if ["markdown file", "md file", ".md file"].iter().any(|needle| has(needle)) {
+        return Some("md");
+    }
+    if ["html file", "html page", "web page"].iter().any(|needle| has(needle)) {
+        return Some("html");
+    }
+    None
+}
+
+/// The fields a kind needs, when the spec carries none of them. A blank
+/// document is never a success: the model gets told what to send instead.
+fn missing_content(kind: &str, spec: &serde_json::Value) -> Option<&'static str> {
+    let has_str = |key: &str| {
+        spec.get(key)
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty())
+    };
+    let has_array = |key: &str| {
+        spec.get(key)
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| !a.is_empty())
+    };
+    let missing = match kind.to_lowercase().as_str() {
+        "txt" | "text" => !has_str("text"),
+        "md" | "markdown" => !has_str("markdown") && !has_str("text"),
+        "csv" => !has_array("rows"),
+        "html" => !has_str("html"),
+        "json" => spec.get("data").is_none(),
+        "xlsx" | "spreadsheet" => !has_array("sheets"),
+        "docx" | "word" | "pdf" => {
+            !has_array("paragraphs") && !has_str("text") && !has_str("markdown")
+        }
+        "pptx" | "slides" | "presentation" => {
+            !has_array("slides") && !has_array("paragraphs") && !has_str("text")
+        }
+        _ => false,
+    };
+    if !missing {
+        return None;
+    }
+    Some(match kind.to_lowercase().as_str() {
+        "txt" | "text" => "text (string)",
+        "md" | "markdown" => "markdown (string)",
+        "csv" => "rows (array of arrays)",
+        "html" => "title, html (string)",
+        "json" => "data (any JSON value)",
+        "xlsx" | "spreadsheet" => "sheets (array of {name, rows: array of arrays})",
+        "docx" | "word" | "pdf" => "title, paragraphs (array of strings)",
+        _ => "title, slides (array of {title, bullets: array of strings})",
+    })
+}
+
 /// Async executor for the `create_document` tool (§§36–38).
 /// Args: {"filename": "report.xlsx", "kind": "xlsx"?, ...spec fields}.
 /// Everything except filename/kind IS the render spec (§98).
@@ -505,6 +593,8 @@ pub async fn execute_create_document(
         })?;
     let kind = args
         .get("kind")
+        .or_else(|| args.get("type"))
+        .or_else(|| args.get("format"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .unwrap_or_else(|| {
@@ -518,6 +608,45 @@ pub async fn execute_create_document(
     if let Some(obj) = spec.as_object_mut() {
         obj.remove("filename");
         obj.remove("kind");
+        obj.remove("type");
+        obj.remove("format");
+        // Models often nest the fields under a wrapper key ("content",
+        // "spec", "document") or send the whole text as one string. The
+        // intent is unambiguous, so accept both instead of rendering a blank
+        // file. A json document's own "data" field is not a wrapper.
+        if obj.len() == 1 && kind != "json" {
+            let wrapped = ["content", "spec", "document", "body", "data", "sheet", "slide"]
+                .iter()
+                .find_map(|key| obj.get(*key).and_then(|v| v.as_object()).cloned());
+            if let Some(inner) = wrapped {
+                *obj = inner;
+            }
+        }
+        if let Some(text) = obj.get("content").and_then(|v| v.as_str()).map(str::to_owned) {
+            if !obj.contains_key("text") && !obj.contains_key("markdown") && !obj.contains_key("paragraphs") {
+                obj.insert("text".into(), serde_json::Value::String(text));
+            }
+        }
+        if let Some(sheet) = obj.get("sheet").and_then(|v| v.as_object()).cloned() {
+            if !obj.contains_key("sheets") {
+                obj.insert("sheets".into(), serde_json::json!([sheet]));
+            }
+        }
+        if let Some(rows) = obj.get("rows").cloned() {
+            if matches!(kind.as_str(), "xlsx" | "spreadsheet") && !obj.contains_key("sheets") {
+                obj.insert("sheets".into(), serde_json::json!([{"name": "Sheet1", "rows": rows}]));
+            }
+        }
+    }
+    if let Some(expected) = missing_content(&kind, &spec) {
+        let sent: Vec<&str> = args
+            .as_object()
+            .map(|o| o.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        return Err(ToolError::InvalidArgs(format!(
+            "The {kind} spec had no content, so nothing was created. Put the complete content in these fields: {expected}. You sent keys: {}.",
+            sent.join(", ")
+        )));
     }
     let (bytes, mime) = render(&kind, &spec).map_err(ToolError::InvalidArgs)?;
     let path =
@@ -540,15 +669,85 @@ pub async fn execute_create_document(
         .await
         .record_artifact(&row)
         .map_err(|e| ToolError::Io(std::io::Error::other(e.to_string())))?;
+    // Say what was produced, not only that something was: a model that meant
+    // three slides and sent one can see the shortfall in this result.
     Ok(ToolResult::ok(format!(
-        "artifact {}: {} ({size_kb} KB). Tell the user it is ready with Open/Reveal actions.",
-        row.id, row.filename,
+        "artifact {}: {} ({size_kb} KB) containing {}. Tell the user it is ready with Open/Reveal actions.",
+        row.id,
+        row.filename,
+        content_summary(&kind, &spec),
     )))
+}
+
+/// A one-line description of the rendered content for the tool result.
+fn content_summary(kind: &str, spec: &serde_json::Value) -> String {
+    let count = |key: &str| spec.get(key).and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+    match kind.to_lowercase().as_str() {
+        "xlsx" | "spreadsheet" => {
+            let sheets = spec.get("sheets").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let rows: usize = sheets
+                .iter()
+                .map(|s| s.get("rows").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0))
+                .sum();
+            format!("{} sheet(s), {rows} row(s)", sheets.len())
+        }
+        "pptx" | "slides" | "presentation" => {
+            let slides = spec.get("slides").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            if slides.is_empty() {
+                "1 slide (title plus paragraphs)".into()
+            } else {
+                let titles: Vec<String> = slides
+                    .iter()
+                    .filter_map(|s| s.get("title").and_then(|v| v.as_str()))
+                    .map(|t| t.chars().take(40).collect())
+                    .collect();
+                format!("{} slide(s): {}", slides.len(), titles.join("; "))
+            }
+        }
+        "docx" | "word" | "pdf" => format!("{} paragraph(s)", spec_paragraphs(spec).len()),
+        "csv" => format!("{} row(s)", count("rows")),
+        _ => {
+            let chars = spec
+                .get("text")
+                .or_else(|| spec.get("markdown"))
+                .or_else(|| spec.get("html"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.chars().count())
+                .unwrap_or(0);
+            format!("{chars} character(s)")
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_file_types_are_recognised_and_verbs_are_not() {
+        assert_eq!(requested_document_kind("make a short presentation about this project"), Some("pptx"));
+        assert_eq!(requested_document_kind("Make me a spreadsheet of a weekly budget"), Some("xlsx"));
+        assert_eq!(requested_document_kind("export the table as an Excel file"), Some("xlsx"));
+        assert_eq!(requested_document_kind("a PDF explaining the KV cache"), Some("pdf"));
+        assert_eq!(requested_document_kind("write the notes into a Word document"), Some("docx"));
+        assert_eq!(requested_document_kind("give me a CSV of the models"), Some("csv"));
+        assert_eq!(requested_document_kind("document the public API"), None);
+        assert_eq!(requested_document_kind("write a report on the failures"), None);
+        assert_eq!(requested_document_kind("what is a pdf"), Some("pdf"));
+    }
+
+    #[test]
+    fn nested_and_aliased_specs_render_and_empty_ones_are_refused() {
+        // Shape a small model actually sent: kind under "type", fields under "content".
+        let nested = serde_json::json!({"content":{"title":"KV cache","paragraphs":["one","two"]}});
+        assert!(missing_content("pdf", &nested).is_some(), "still wrapped");
+        let inner = nested.get("content").cloned().unwrap();
+        assert!(missing_content("pdf", &inner).is_none());
+        assert_eq!(missing_content("xlsx", &serde_json::json!({})), Some("sheets (array of {name, rows: array of arrays})"));
+        assert_eq!(missing_content("pptx", &serde_json::json!({"title":"x"})), Some("title, slides (array of {title, bullets: array of strings})"));
+        assert!(missing_content("md", &serde_json::json!({"text":"hello"})).is_none());
+        assert!(missing_content("txt", &serde_json::json!({"text":"  "})).is_some());
+    }
 
     #[test]
     fn csv_quotes_cells() {

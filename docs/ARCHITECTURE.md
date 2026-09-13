@@ -198,6 +198,31 @@ Source of truth: `Local_LLM_PC_Companion_Design.md` (§§1–107).
   last file; rejected completion claims are journaled as `thought` events.
 - Storage: indexes on every conversation/workspace-keyed table, one query for
   all journals of a conversation, `busy_timeout`.
+- Routing (`request_router`, Code sessions only; Chat never routes): the
+  model's schema-constrained decision is read leniently (fences, prose, extra
+  fields, a cut-off object after the intent); when it is unavailable
+  (unreadable, runtime error, timeout, which is 60 s on a GPU and 240 s when
+  the model is on the CPU) `heuristic_intent` routes by wording, sentence by
+  sentence: work anywhere wins, then a plan request, else a question. The
+  response says `source: model | heuristic`; the UI shows no notice for a
+  heuristic route and the backend log records why the model's decision was
+  unusable.
+- Documents (experimental, owner-parked 2026-09-13): `create_document` is
+  chat-safe (it renders into the app's artifacts folder, never the project),
+  so Chat and a Code session's Ask path can produce
+  txt/md/json/csv/html/xlsx/docx/pdf/pptx from a JSON spec. Output is plain
+  (no styling, images or charts) and small models need the corrections
+  below to get there, so treat it as a preview rather than a feature. The
+  spec reader accepts `type`/`format` for `kind`, unwraps a `content`/`spec`
+  wrapper, and refuses a blank document with the expected fields named. A
+  request that names a file type (`documents::requested_document_kind`) is
+  fulfilled only by a produced file: the chat loop nudges once, the agent's
+  verification keeps the run open until `create_document` (or a write with
+  that extension) succeeded. An unreadable tool call in chat gets one
+  correction quoting the JSON parser's error.
+- Machine panel: CPU and RAM rows always, GPU and VRAM rows when a GPU
+  reports; nothing is hidden for screen height. The collapsed rail shows
+  graphics memory on a GPU machine and system memory otherwise.
 
 ## Stage 5 streaming contract
 - Chat is true token-passthrough: sidecar deltas forward into the SSE channel
