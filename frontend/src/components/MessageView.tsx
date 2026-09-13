@@ -1,4 +1,4 @@
-import { Children, isValidElement, useState } from 'react';
+import { Children, isValidElement, useEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type { AgentEvent } from '../services/api';
@@ -6,20 +6,29 @@ import ToolTimeline from './ToolTimeline';
 import CodeBlock from './CodeBlock';
 import ResponseMetrics from './ResponseMetrics';
 import type { OutputTiming } from '../services/outputTiming';
+import { Button, IconButton } from '../ui/primitives';
+import { Icon } from '../ui/Icon';
 
-function renderers() {
-  return {
-    // Render at the fence wrapper, not at <code>: otherwise the rich code
-    // block becomes an invalid nested <pre>. Unlabelled fences get Copy too.
-    pre(props: any) {
-      const child = Children.toArray(props.children)[0];
-      if (!isValidElement(child)) return <pre>{props.children}</pre>;
-      const childProps = child.props as { className?: string; children?: unknown };
-      const lang = /(?:^|\s)language-(\S+)/.exec(childProps.className ?? '')?.[1] ?? '';
-      return <CodeBlock lang={lang} code={String(childProps.children ?? '').replace(/\n$/, '')} />;
-    },
-  };
-}
+// Defined once. Passing freshly created renderer functions on every render
+// makes React treat them as new component types, so each background refresh
+// would unmount every code block and flash it uncoloured before re-highlighting.
+const MARKDOWN_COMPONENTS = {
+  // Render at the fence wrapper, not at <code>: otherwise the rich code
+  // block becomes an invalid nested <pre>. Unlabelled fences get Copy too.
+  pre(props: any) {
+    const child = Children.toArray(props.children)[0];
+    if (!isValidElement(child)) return <pre>{props.children}</pre>;
+    const childProps = child.props as { className?: string; children?: unknown };
+    const lang = /(?:^|\s)language-(\S+)/.exec(childProps.className ?? '')?.[1] ?? '';
+    return <CodeBlock lang={lang} code={String(childProps.children ?? '').replace(/\n$/, '')} />;
+  },
+  // Links open outside the app so a click never navigates the workbench away.
+  a(props: any) {
+    return <a href={props.href} target="_blank" rel="noreferrer">{props.children}</a>;
+  },
+};
+
+const REMARK_PLUGINS = [remarkGfm];
 
 function fmtTime(iso: string): string {
   if (!iso) return '';
@@ -28,7 +37,7 @@ function fmtTime(iso: string): string {
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
-// Design guide §8: search sources render as compact chips, not a text dump.
+// Search sources render as compact chips, not a text dump.
 function splitSources(text: string): { body: string; sources: { title: string; url: string }[] } {
   const m = text.match(/\n\nSources\n([\s\S]*)$/);
   if (!m || m.index == null) return { body: text, sources: [] };
@@ -98,6 +107,41 @@ function parseAgentTranscript(text: string, streaming = false): AgentEvent[] | n
   });
 }
 
+function CopyAction({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+  const timer = useRef<ReturnType<typeof setTimeout>>();
+  useEffect(() => () => clearTimeout(timer.current), []);
+  return (
+    <IconButton
+      icon={copied ? 'check' : 'copy'}
+      label={copied ? 'Copied' : 'Copy message'}
+      size="sm"
+      tipSide="top"
+      onClick={() => {
+        void navigator.clipboard.writeText(text).then(() => {
+          setCopied(true);
+          clearTimeout(timer.current);
+          timer.current = setTimeout(() => setCopied(false), 1500);
+        });
+      }}
+    />
+  );
+}
+
+function Sources({ sources }: { sources: { title: string; url: string }[] }) {
+  if (sources.length === 0) return null;
+  return (
+    <div className="source-chips" aria-label="Sources">
+      {sources.map((source, index) => (
+        <a key={`${index}-${source.url}`} className="chip" href={source.url} target="_blank" rel="noreferrer" title={source.url}>
+          <Icon name="globe" size={13} />
+          <span>{index + 1}. {source.title}</span>
+        </a>
+      ))}
+    </div>
+  );
+}
+
 export default function MessageView({
   role,
   text,
@@ -111,7 +155,10 @@ export default function MessageView({
   detailedMetrics = false,
   activities,
   agentRunId,
+  byline,
   onOpenAgentActivity,
+  onEdit,
+  onRegenerate,
 }: {
   role: 'user' | 'assistant' | 'tool';
   text: string;
@@ -126,9 +173,12 @@ export default function MessageView({
   detailedMetrics?: boolean;
   activities?: AgentEvent[];
   agentRunId?: string;
+  /** Model that produced this reply, when recorded. */
+  byline?: string;
   onOpenAgentActivity?: (runId: string) => void;
+  onEdit?: () => void;
+  onRegenerate?: () => void;
 }) {
-  const [copied, setCopied] = useState(false);
   const { body, sources } = role === 'assistant' ? splitSources(text) : { body: text, sources: [] as { title: string; url: string }[] };
   const isAgentRun = !!activities?.some((event) => event.kind === 'task');
   const isChatActivity = role === 'assistant' && !!activities?.length && !isAgentRun;
@@ -140,81 +190,70 @@ export default function MessageView({
   const answerBody = isChatActivity
     ? chatResponses || (streaming ? body.replace(/```tool\s*[\s\S]*?(?:```|$)/g, '').trim() : '')
     : body;
+
   if (role === 'user') {
     return (
-      <div className="msg user">
-        {text}
+      <>
+        <div className="msg user">{text}</div>
         <div className="meta">
-          {time && <span>{fmtTime(time)}</span>}
-          <span className="msg-actions" style={{ marginTop: 0 }}>
-            <button onClick={() => { void navigator.clipboard.writeText(text).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500); }); }}>
-              {copied ? 'Copied' : 'Copy'}
-            </button>
+          <span className="msg-actions">
+            {onEdit && <IconButton icon="pencil" label="Edit message" size="sm" tipSide="top" onClick={onEdit} />}
+            <CopyAction text={text} />
           </span>
+          {time && <span>{fmtTime(time)}</span>}
         </div>
+      </>
+    );
+  }
+
+  if (role === 'tool') {
+    return (
+      <div className="msg tool" role="note">
+        <Icon name="alertCircle" size={16} />
+        <span>{text}</span>
       </div>
     );
   }
+
+  const meta = (
+    <div className="meta">
+      {byline && <span className="byline">{byline}</span>}
+      {time && <span>{fmtTime(time)}</span>}
+      {showMetrics && <ResponseMetrics tps={tps} live={live} timing={timing} legacy={legacyRate} detailed={detailedMetrics} />}
+      <span className="msg-actions">
+        {onRegenerate && <IconButton icon="refresh" label="Regenerate reply" size="sm" tipSide="top" onClick={onRegenerate} />}
+        <CopyAction text={text} />
+      </span>
+    </div>
+  );
+
   if (agentEvents) {
     return (
       <div className="msg assistant structured-message">
         <ToolTimeline events={agentEvents} />
-        {sources.length > 0 && (
-          <div className="source-chips" style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 6 }} aria-label="Sources">
-            {sources.map((source, index) => (
-              <a key={source.url} className="ui-chip" href={source.url} target="_blank" rel="noreferrer" title={source.url}>
-                {index + 1}. {source.title}
-              </a>
-            ))}
-          </div>
-        )}
+        <Sources sources={sources} />
         {isAgentRun && agentRunId && onOpenAgentActivity && (
-          <button className="agent-inline-open" onClick={() => onOpenAgentActivity(agentRunId)}>
+          <Button size="sm" variant="ghost" iconRight="arrowRight" className="agent-inline-open" onClick={() => onOpenAgentActivity(agentRunId)}>
             Open agent activity
-          </button>
+          </Button>
         )}
-        <div className="meta">
-          {time && <span>{fmtTime(time)}</span>}
-          {showMetrics && <ResponseMetrics tps={tps} live={live} timing={timing} legacy={legacyRate} detailed={detailedMetrics} />}
-          <span className="msg-actions" style={{ marginTop: 0 }}>
-            <button onClick={() => { void navigator.clipboard.writeText(text).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500); }); }}>
-              {copied ? 'Copied' : 'Copy'}
-            </button>
-          </span>
-        </div>
+        {meta}
       </div>
     );
   }
+
   return (
-    <div className={`msg ${role}`}>
+    <div className={`msg ${role}${streaming ? ' streaming' : ''}`}>
       {chatDetails.length > 0 && <details className="chat-file-activity">
         <summary>View file activity</summary>
         <ToolTimeline events={chatDetails} />
       </details>}
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={renderers()}>
-        {answerBody || (streaming ? '…' : '')}
+      <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={MARKDOWN_COMPONENTS}>
+        {answerBody}
       </ReactMarkdown>
-      {streaming && <span className="caret" aria-label="generating">▍</span>}
-      {sources.length > 0 && (
-        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 6 }} aria-label="Sources">
-          {sources.map((s, i) => (
-            <a key={i} className="ui-chip" href={s.url} target="_blank" rel="noreferrer" title={s.url}>
-              <span>{i + 1}. {s.title}</span>
-            </a>
-          ))}
-        </div>
-      )}
-      {(!streaming || tps != null) && (text || streaming) && (
-        <div className="meta">
-          {time && <span>{fmtTime(time)}</span>}
-          {showMetrics && <ResponseMetrics tps={tps} live={live} timing={timing} legacy={legacyRate} detailed={detailedMetrics} />}
-          <span className="msg-actions" style={{ marginTop: 0 }}>
-            <button onClick={() => { void navigator.clipboard.writeText(text).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500); }); }}>
-              {copied ? 'Copied' : 'Copy'}
-            </button>
-          </span>
-        </div>
-      )}
+      {streaming && <span className="live-rule" role="status" aria-label="Generating" />}
+      <Sources sources={sources} />
+      {(!streaming || tps != null) && (text || streaming) && meta}
     </div>
   );
 }

@@ -1,9 +1,8 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import { modelDetail, type ModelDetail, type ModelMeta } from '../services/api';
-import { Badge } from '../ui/primitives';
+import { Badge, Button, IconButton, Lamp } from '../ui/primitives';
 import RecommendCard from './RecommendCard';
 import OptimizeCard from './OptimizeCard';
-import './modelLibrary.css';
 
 type Notify = (kind: 'info' | 'success' | 'warning' | 'error', text: string) => void;
 type Props = { model: ModelMeta; loadingModel: boolean; onLoad: () => void; onDelete: () => void; notify: Notify };
@@ -19,12 +18,12 @@ export function ModelDetails({ detail, notify }: { detail: ModelDetail; notify: 
       <div><dt>Estimated KV cache</dt><dd>~{estimates.kv_cache_gb} GB</dd></div>
       <div><dt>Estimated total memory</dt><dd>{estimates.total_need_gb != null ? `~${estimates.total_need_gb} GB` : 'Unavailable'}</dd></div>
     </dl>
-    <p className="model-library-note">Memory estimates are heuristic and architecture-dependent, not measured usage or the current runtime cache allocation. Model capabilities are metadata declarations, not a compatibility test.</p>
     <div className="model-library-capabilities">
       <Badge tone={metadata.tool_calling ? 'info' : 'neutral'}>{metadata.tool_calling ? 'Tools declared' : 'Tools unverified'}</Badge>
       <Badge tone={metadata.vision ? 'info' : 'neutral'}>{metadata.vision ? 'Vision declared' : 'Text model'}</Badge>
       <Badge tone={metadata.supports_reasoning ? 'info' : 'neutral'}>{metadata.supports_reasoning ? 'Reasoning declared' : 'Reasoning unverified'}</Badge>
     </div>
+    <p className="model-library-note">Memory estimates are heuristic and architecture-dependent, not measured usage or the current runtime cache allocation. Model capabilities are metadata declarations, not a compatibility test.</p>
     {estimates.compat_warnings.length > 0 && <ul className="model-library-warnings">{estimates.compat_warnings.map((warning, index) => <li key={index}>{warning}</li>)}</ul>}
     {detail.recommended && <p className="model-library-note">Estimate only · not applied: {detail.recommended.note}</p>}
     <div className="model-library-tools">
@@ -69,20 +68,32 @@ function ModelLibraryCard({ model, loadingModel, onLoad, onDelete, notify }: Pro
     detailsButton.current?.focus();
   };
 
-  return <article className={`card model-library-card${model.loaded ? ' loaded' : ''}`} aria-labelledby={headingId}>
-    <header className="model-library-heading"><h2 id={headingId}>{model.name}</h2><Badge tone={model.loaded ? 'ok' : 'neutral'}>{model.loaded ? 'Loaded' : 'Idle'}</Badge></header>
-    <p className="model-library-meta">{model.parameters} · {model.quantization} · {model.context_length.toLocaleString()} context</p>
-    <div className="model-library-capabilities"><Badge tone={model.tool_calling ? 'info' : 'neutral'}>{model.tool_calling ? 'Tools declared' : 'Tools unverified'}</Badge><Badge tone={model.vision ? 'info' : 'neutral'}>{model.vision ? 'Vision declared' : 'Text model'}</Badge></div>
-    <div className="model-library-actions">
-      <button type="button" disabled={loadingModel || model.loaded} onClick={onLoad} aria-label={`Load ${model.name}`}>{model.loaded ? 'Loaded' : 'Load model'}</button>
-      <button type="button" ref={detailsButton} aria-expanded={expanded} aria-controls={detailsId} aria-label={`${expanded ? 'Hide' : 'Show'} details for ${model.name}`} onClick={() => { if (expanded) close(); else { setLoading(true); setExpanded(true); } }}>{expanded ? 'Hide details' : 'Details'}</button>
-      <button type="button" className="model-library-delete" onClick={onDelete} aria-label={`Delete ${model.name}`}>Delete</button>
+  const specs = [model.parameters && model.parameters !== 'unknown' ? model.parameters : null, model.quantization, `${model.context_length.toLocaleString()} context`].filter(Boolean);
+
+  return <article className={`model-card${model.loaded ? ' loaded' : ''}${expanded ? ' expanded' : ''}`} aria-labelledby={headingId}>
+    <div className="model-card-main">
+      <Lamp state={model.loaded ? 'ready' : 'off'} />
+      <div className="model-card-copy">
+        <h2 id={headingId}>{model.name}</h2>
+        <p className="readout">{specs.join(' · ')}</p>
+      </div>
+      <div className="model-library-capabilities">
+        {model.loaded && <Badge tone="ok">Loaded</Badge>}
+        {model.tool_calling && <Badge tone="info">Tools</Badge>}
+        {model.vision && <Badge tone="info">Vision</Badge>}
+      </div>
+      <div className="model-library-actions">
+        <Button type="button" size="sm" icon={model.loaded ? 'check' : 'power'} variant={model.loaded ? 'ghost' : 'secondary'} disabled={loadingModel || model.loaded} onClick={onLoad} aria-label={`Load ${model.name}`}>{model.loaded ? 'Loaded' : 'Load'}</Button>
+        <button type="button" className="btn ghost sm" ref={detailsButton} aria-expanded={expanded} aria-controls={detailsId} aria-label={`${expanded ? 'Hide' : 'Show'} details for ${model.name}`} onClick={() => { if (expanded) close(); else { setLoading(true); setExpanded(true); } }}>
+          <span className="btn-label">{expanded ? 'Hide details' : 'Details'}</span>
+        </button>
+        <IconButton icon="trash" label={`Delete ${model.name}`} size="md" tone="danger" tipSide="left" onClick={onDelete} />
+      </div>
     </div>
     <div className="model-library-detail" id={detailsId} hidden={!expanded} role="region" aria-label={`Details for ${model.name}`} aria-busy={expanded && loading}>
       {expanded && <>
-        <div className="model-library-detail-heading"><h3>Model details</h3><button type="button" onClick={close} aria-label={`Close details for ${model.name}`}>Close</button></div>
         {loading && <p className="model-library-note" role="status">Loading details for {model.name}…</p>}
-        {error && <div className="model-library-error" role="alert"><p>{error}</p><button type="button" onClick={() => { setLoading(true); setError(''); setAttempt((value) => value + 1); }}>Retry details</button></div>}
+        {error && <div className="model-library-error" role="alert"><p>{error}</p><Button size="sm" onClick={() => { setLoading(true); setError(''); setAttempt((value) => value + 1); }}>Retry details</Button></div>}
         {!loading && !error && detail && <ModelDetails detail={detail} notify={notify} />}
       </>}
     </div>

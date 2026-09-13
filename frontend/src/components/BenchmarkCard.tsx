@@ -1,7 +1,8 @@
 import { useState } from 'react';
 import { runBenchmark, type BenchmarkResult } from '../services/api';
+import { Button, Section } from '../ui/primitives';
 
-// Stage 38 benchmark card (§89): timed generation, honest when idle.
+// Benchmark: a short timed generation through the running model. Honest when idle.
 export default function BenchmarkCard({ notify }: { notify: (k: 'info' | 'success' | 'error', t: string) => void }) {
   const [res, setRes] = useState<BenchmarkResult | null>(null);
   const [busy, setBusy] = useState(false);
@@ -11,29 +12,28 @@ export default function BenchmarkCard({ notify }: { notify: (k: 'info' | 'succes
     runBenchmark('', 64)
       .then((r) => {
         setRes(r);
-        notify('success', `Benchmark: ${r.generation_tps} tok/s on ${r.model || 'sidecar'}.`);
+        notify('success', `Benchmark: ${r.generation_tps} tok/s on ${r.model || 'the running model'}.`);
       })
       .catch((e) => notify('info', e.message))
       .finally(() => setBusy(false));
   };
 
   return (
-    <div className="card">
-      <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-        <strong>Benchmark</strong>
-        <span style={{ flex: 1 }} />
-        <button disabled={busy} onClick={run}>{busy ? 'Running…' : 'Run benchmark'}</button>
-      </div>
-      <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 4 }}>
-        Short timed generation through the live sidecar. Needs inference running.
-      </div>
-      {res && (
-        <div style={{ fontSize: 13, marginTop: 6 }}>
-          <div>Model: {res.model || '—'}</div>
-          <div>Prompt: {res.prompt_tokens} tok · Generated: {res.generated_tokens} tok in {(res.total_ms / 1000).toFixed(1)}s</div>
-          <div><strong>{res.generation_tps} tok/s</strong> · context limit {res.context_limit}</div>
-        </div>
-      )}
+    <div className="panel">
+      <Section title="Benchmark" icon="zap" actions={<Button size="sm" icon="play" loading={busy} onClick={run}>{busy ? 'Running…' : 'Run benchmark'}</Button>}>
+        <p className="help">A short timed generation through the running model. Needs a loaded model.</p>
+        {res && (
+          <div className="bench">
+            <div className="bench-number"><strong>{res.generation_tps}</strong><span>tok/s</span></div>
+            <dl className="kv">
+              <dt>Model</dt><dd>{res.model || '—'}</dd>
+              <dt>Prompt</dt><dd>{res.prompt_tokens} tokens</dd>
+              <dt>Generated</dt><dd>{res.generated_tokens} tokens in {(res.total_ms / 1000).toFixed(1)} s</dd>
+              <dt>Context limit</dt><dd>{res.context_limit.toLocaleString()}</dd>
+            </dl>
+          </div>
+        )}
+      </Section>
     </div>
   );
 }

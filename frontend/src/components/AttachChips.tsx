@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react';
-import { Chip } from '../ui/primitives';
 import { deleteAttachment, listAttachments, type AttachmentInfo } from '../services/api';
+import { IconButton } from '../ui/primitives';
+import { Icon } from '../ui/Icon';
 
-// Design guide §7: attachment chips show type, name, size, processing state.
+// Attachment chips show type, name, size and processing state.
 export default function AttachChips({
   convId,
   tick,
@@ -21,23 +22,20 @@ export default function AttachChips({
     listAttachments(convId).then(setItems).catch(() => setItems([]));
   }, [convId, tick]);
   if (!convId || items.length === 0) return null;
-  const icon = (a: AttachmentInfo) =>
-    a.kind === 'image' ? '🖼' : a.status === 'unsupported' ? '✕' : a.status === 'partial' ? '⚠' : '📄';
   return (
-    <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', padding: '8px 16px 0' }} aria-label="Attachments">
+    <div className="attach-chips" aria-label="Attachments">
       {items.map((a) => (
-        <span key={a.id} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-          <Chip title={`${a.mime} · ${(a.size_bytes / 1024).toFixed(1)} KB · ${a.status ?? 'ready'}`}>
-            {icon(a)} {a.filename} · {(a.size_bytes / 1024).toFixed(1)} KB
-          </Chip>
-          <button
-            className="ctx-toggle"
+        <span key={a.id} className={`attach-chip ${a.status ?? 'ready'}`} title={`${a.mime} · ${(a.size_bytes / 1024).toFixed(1)} KB · ${a.status ?? 'ready'}`}>
+          <Icon name={a.status === 'unsupported' || a.status === 'partial' ? 'alert' : a.kind === 'image' ? 'image' : 'fileText'} size={14} />
+          <span>{a.filename}</span>
+          <small>{(a.size_bytes / 1024).toFixed(0)} KB</small>
+          <IconButton
+            icon="x"
+            size="sm"
+            tip={false}
+            label={`Remove ${a.filename}`}
             onClick={() => deleteAttachment(convId, a.id).then(() => setItems((p) => p.filter((x) => x.id !== a.id))).catch((e) => notify('error', e.message))}
-            aria-label={`Remove ${a.filename}`}
-            title="Remove"
-          >
-            ×
-          </button>
+          />
         </span>
       ))}
     </div>

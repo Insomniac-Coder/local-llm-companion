@@ -2,26 +2,27 @@ import { useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type { AgentEvent } from '../services/api';
+import { Icon, type IconName } from '../ui/Icon';
 
 type ActivityKind = 'task' | 'thought' | 'read' | 'list' | 'search' | 'edit' | 'write' | 'delete' | 'command' | 'permission' | 'final' | 'error' | 'tool' | 'status' | 'request' | 'response';
 
-const META: Record<ActivityKind, { label: string; icon: string }> = {
-  task: { label: 'Task', icon: '◇' },
-  thought: { label: 'Progress', icon: '✦' },
-  read: { label: 'Read file', icon: '↳' },
-  list: { label: 'Listed files', icon: '≡' },
-  search: { label: 'Search', icon: '⌕' },
-  edit: { label: 'Modified file', icon: '±' },
-  write: { label: 'Wrote file', icon: '+' },
-  delete: { label: 'Deleted file', icon: '−' },
-  command: { label: 'Command', icon: '›_' },
-  permission: { label: 'Permission', icon: '!' },
-  final: { label: 'Completed', icon: '✓' },
-  error: { label: 'Needs attention', icon: '×' },
-  tool: { label: 'Tool', icon: '◆' },
-  status: { label: 'Status', icon: '·' },
-  request: { label: 'Requested action', icon: '?' },
-  response: { label: 'Response', icon: '·' },
+const META: Record<ActivityKind, { label: string; icon: IconName }> = {
+  task: { label: 'Task', icon: 'target' },
+  thought: { label: 'Progress', icon: 'sparkle' },
+  read: { label: 'Read file', icon: 'eye' },
+  list: { label: 'Listed files', icon: 'folder' },
+  search: { label: 'Search', icon: 'search' },
+  edit: { label: 'Modified file', icon: 'pencil' },
+  write: { label: 'Wrote file', icon: 'filePlus' },
+  delete: { label: 'Deleted file', icon: 'trash' },
+  command: { label: 'Command', icon: 'terminal' },
+  permission: { label: 'Permission', icon: 'shield' },
+  final: { label: 'Completed', icon: 'check' },
+  error: { label: 'Needs attention', icon: 'alert' },
+  tool: { label: 'Tool', icon: 'wrench' },
+  status: { label: 'Status', icon: 'dot' },
+  request: { label: 'Requested action', icon: 'help' },
+  response: { label: 'Response', icon: 'message' },
 };
 
 function classify(e: AgentEvent): ActivityKind {
@@ -55,11 +56,11 @@ function actionTitle(e: AgentEvent, kind: ActivityKind): string {
   return target || e.tool.replace(/_/g, ' ');
 }
 
-function Diff({ value }: { value: string }) {
+export function DiffLines({ value, className = 'activity-diff' }: { value: string; className?: string }) {
   return (
-    <pre className="activity-diff" aria-label="File changes">
+    <pre className={className} aria-label="File changes">
       {value.split('\n').map((line, i) => {
-        const tone = line.startsWith('+++') || line.startsWith('---')
+        const tone = line.startsWith('+++') || line.startsWith('---') || line.startsWith('diff ')
           ? 'file'
           : line.startsWith('+')
             ? 'add'
@@ -84,7 +85,7 @@ function ActivityItem({ event, index }: { event: AgentEvent; index: number }) {
 
   return (
     <article className={`activity-item ${kind}${isRunning ? ' running' : ''}`}>
-      <div className="activity-node" aria-hidden="true"><span>{meta.icon}</span></div>
+      <div className="activity-node" aria-hidden="true"><span><Icon name={meta.icon} size={13} /></span></div>
       <div className="activity-content">
         <div className="activity-titlebar">
           <div className="activity-heading">
@@ -106,13 +107,13 @@ function ActivityItem({ event, index }: { event: AgentEvent; index: number }) {
 
         {hasDetails && (
           <>
-            <button className="activity-disclosure" onClick={() => setExpanded((v) => !v)} aria-expanded={expanded}>
-              <span aria-hidden="true">{expanded ? '⌄' : '›'}</span>
+            <button type="button" className="activity-disclosure" onClick={() => setExpanded((v) => !v)} aria-expanded={expanded}>
+              <Icon name="chevronRight" size={13} />
               {event.diff ? 'View changes' : event.output ? 'View output' : 'View details'}
             </button>
             {expanded && (
               <div className="activity-details">
-                {event.diff && <Diff value={event.diff} />}
+                {event.diff && <DiffLines value={event.diff} />}
                 {!event.diff && event.output && <pre className="activity-output">{event.output}</pre>}
                 {!event.diff && !event.output && event.pending_tool && (
                   <div className="activity-permission-reason">{event.pending_tool.reason}</div>

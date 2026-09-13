@@ -535,6 +535,8 @@ export interface MetricsData {
   samples: any[];
   latest: any | null;
   alerts: { level: string; title: string; detail: string; suggestions: string[] }[];
+  /** Name of the measured graphics card, when the driver reports one. */
+  gpu_name?: string | null;
 }
 
 export async function getMetrics(window: string, signal?: AbortSignal): Promise<MetricsData> {

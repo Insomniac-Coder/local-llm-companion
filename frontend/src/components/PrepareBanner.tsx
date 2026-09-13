@@ -1,27 +1,32 @@
 import { useEffect, useState } from 'react';
 import { checkCompatibility, prepareContext, type CompatInfo, type PrepStage } from '../services/api';
+import { Button, Notice } from '../ui/primitives';
 
 /**
- * Informational model-switch notice. The next request rebuilds bounded
- * history automatically; checking readiness is optional, never a send gate.
+ * Informational model-switch notice above the composer. The next request
+ * rebuilds bounded history automatically; checking readiness is optional,
+ * never a send gate.
  */
 export default function PrepareBanner({
   convId,
-  convTitle,
   lastModel,
   loadedModel,
+  loadedName,
   lastModelAvailable,
   onPrepared,
   onSwitchBack,
+  onDismiss,
   notify,
 }: {
   convId: string;
-  convTitle: string;
+  convTitle?: string;
   lastModel: string;
   loadedModel: string;
+  loadedName?: string;
   lastModelAvailable: boolean;
   onPrepared: () => void;
   onSwitchBack: () => void;
+  onDismiss: () => void;
   notify: (kind: 'info' | 'success' | 'warning' | 'error', text: string) => void;
 }) {
   const [compat, setCompat] = useState<CompatInfo | null>(null);
@@ -40,7 +45,7 @@ export default function PrepareBanner({
       .then((r) => {
         setRunning(false);
         if (r.ready) {
-          notify('success', `Session checked — context will be rebuilt on the next reply.`);
+          notify('success', 'Session checked — context will be rebuilt on the next reply.');
           onPrepared();
         }
       })
@@ -50,37 +55,23 @@ export default function PrepareBanner({
       });
   };
 
+  const warnings = compat?.warnings ?? [];
+  const latest = stages[stages.length - 1];
   return (
-    <div className="card" role="status" style={{ margin: '8px 16px 0' }}>
-      <div><strong>Model changed</strong></div>
-      <div style={{ fontSize: 13 }}>
-        “{convTitle}” was last prepared for <strong>{lastModel || 'no model'}</strong>, now using <strong>{loadedModel}</strong>.
-        {' '}Continue chatting normally. The new model will rebuild its context from saved messages on your next reply; the previous model’s cache is not reused.
-      </div>
-      {compat && compat.warnings.length > 0 && (
-        <div style={{ marginTop: 6 }}>
-          {compat.warnings.map((w, i) => (
-            <div key={i} className="approval" style={{ marginTop: 4, fontSize: 12 }}>{w}</div>
-          ))}
-        </div>
-      )}
-      {stages.length > 0 && (
-        <div style={{ marginTop: 6, fontSize: 13 }}>
-          {stages.map((s, i) => (
-            <div key={i}>
-              {s.status === 'done' ? '✓' : '●'} {s.stage} — {s.detail}
-            </div>
-          ))}
-        </div>
-      )}
-      <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
-        <button disabled={running} onClick={prepare}>
-          {running ? 'Checking session…' : 'Check session readiness'}
-        </button>
-        <button disabled={running || !lastModelAvailable} onClick={onSwitchBack} title={!lastModelAvailable ? 'This model is no longer installed' : 'Load the previous model'}>
-          {lastModelAvailable ? 'Switch Back' : 'Previous Model Unavailable'}
-        </button>
-      </div>
-    </div>
+    <Notice
+      className="dock-notice"
+      tone={warnings.length ? 'caution' : 'neutral'}
+      icon="refresh"
+      title={`Last used with ${lastModel || 'another model'}`}
+      onDismiss={onDismiss}
+      actions={<>
+        <Button size="sm" variant="ghost" loading={running} onClick={prepare}>{running ? 'Checking…' : 'Check readiness'}</Button>
+        <Button size="sm" disabled={running || !lastModelAvailable} onClick={onSwitchBack} title={!lastModelAvailable ? 'This model is no longer installed' : 'Load the previous model'}>
+          {lastModelAvailable ? 'Switch back' : 'Previous model unavailable'}
+        </Button>
+      </>}
+    >
+      {running && latest ? `${latest.stage} — ${latest.detail}` : warnings.length ? warnings.join(' ') : `${loadedName ?? loadedModel} will rebuild this conversation’s context on your next message. Nothing is lost.`}
+    </Notice>
   );
 }

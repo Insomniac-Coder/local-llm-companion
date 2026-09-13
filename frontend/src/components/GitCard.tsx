@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react';
 import { executeTool, getWorkspaceGit, type GitInfo } from '../services/api';
+import { Button, IconButton, Section } from '../ui/primitives';
 
-// Stage 36 git card (§62): read-only status plus a guarded commit box.
-// Destructive git (reset --hard, push --force) is refused server-side.
+// Git: read-only status plus a guarded commit box. Destructive Git
+// (reset --hard, push --force) is refused server-side.
 export default function GitCard({
   wsId,
   wsPath,
@@ -15,7 +16,6 @@ export default function GitCard({
   notify: (k: 'info' | 'success' | 'warning' | 'error', t: string) => void;
 }) {
   const [info, setInfo] = useState<GitInfo | null>(null);
-  const [open, setOpen] = useState(false);
   const [msg, setMsg] = useState('');
 
   const load = () => {
@@ -45,31 +45,29 @@ export default function GitCard({
   };
 
   return (
-    <div className="card" style={{ margin: '0 16px' }}>
-      <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-        <button className="ctx-toggle" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
-          {open ? '▾' : '▸'} Git{info.git && info.branch ? ` (${info.branch})` : ''}
-        </button>
-        <span style={{ flex: 1 }} />
-        <button title="Refresh git state" onClick={load}>Refresh</button>
-      </div>
-      {open && !info.git && <div style={{ fontSize: 13, marginTop: 4 }}>{info.detail}</div>}
-      {open && info.git && (
-        <div style={{ marginTop: 6 }}>
-          <pre className="diff-stat">{(info.status || '(clean)').slice(0, 2000)}</pre>
-          <details style={{ marginTop: 4 }}>
-            <summary style={{ fontSize: 13 }}>Recent commits</summary>
-            <pre className="diff-stat">{(info.log || '(no history)').slice(0, 2000)}</pre>
+    <Section
+      title="Git"
+      icon="branch"
+      meta={info.git ? info.branch || 'detached' : 'not a repository'}
+      collapsible
+      defaultOpen={false}
+      actions={<IconButton icon="refresh" label="Refresh Git status" size="sm" tipSide="bottom-end" onClick={load} />}
+    >
+      {!info.git && <p className="help">{info.detail}</p>}
+      {info.git && (
+        <>
+          <pre className="pre-block">{(info.status || '(clean)').slice(0, 2000)}</pre>
+          <details className="tool-execution">
+            <summary>Recent commits</summary>
+            <pre className="pre-block">{(info.log || '(no history)').slice(0, 2000)}</pre>
           </details>
-          <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
-            <input value={msg} onChange={(e) => setMsg(e.target.value)} placeholder="Commit message (single line)" style={{ flex: 1 }} />
-            <button onClick={commit}>Commit staged</button>
+          <div className="inline-form">
+            <input value={msg} onChange={(e) => setMsg(e.target.value)} placeholder="Commit message (one line)" aria-label="Commit message" />
+            <Button onClick={commit} disabled={!msg.trim()} style={{ height: 34 }}>Commit staged</Button>
           </div>
-          <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 4 }}>
-            Commits staged changes only. Force-push and hard reset are refused — do those in your Git client.
-          </div>
-        </div>
+          <p className="help">Commits staged changes only. Force-push and hard reset are refused — use your Git client for those.</p>
+        </>
       )}
-    </div>
+    </Section>
   );
 }

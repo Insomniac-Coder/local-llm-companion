@@ -1,7 +1,7 @@
 import { useState } from 'react';
-import { useEscape } from '../ui/primitives';
+import { Button, Dialog } from '../ui/primitives';
 
-// Stage 24 share picker (§§98–99): explicit include checkboxes, no leakage.
+// Share picker: explicit include checkboxes, nothing is sent implicitly.
 export interface ShareOptions {
   summary: boolean;
   messages: boolean;
@@ -23,53 +23,44 @@ export default function ShareDialog({
   const [target, setTarget] = useState('');
   const [opts, setOpts] = useState<ShareOptions>({ summary: true, messages: true, attachments: false, memory: false, turns: 6, note: '' });
   const flip = (k: keyof ShareOptions) => setOpts((o) => ({ ...o, [k]: !o[k] }));
-  useEscape(onClose);
   return (
-    <div className="modal-backdrop" onClick={onClose} role="presentation">
-      <div className="modal" role="dialog" aria-modal="true" aria-label="Share context" onClick={(e) => e.stopPropagation()}>
-        <strong>Share context</strong>
-        <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
-          <label>
-            Destination
-            <select value={target} onChange={(e) => setTarget(e.target.value)} style={{ width: '100%', marginTop: 2 }}>
-              <option value="">— destination session —</option>
-              {targets.map((t) => (
-                <option key={t.id} value={t.id}>{t.label}</option>
-              ))}
-            </select>
-          </label>
-          <label style={{ fontSize: 13 }}>
-            <input type="checkbox" checked={opts.summary} onChange={() => flip('summary')} /> Key findings
-          </label>
-          <label style={{ fontSize: 13 }}>
-            <input type="checkbox" checked={opts.messages} onChange={() => flip('messages')} /> Selected messages
-          </label>
-          <label style={{ fontSize: 13 }}>
-            <input type="checkbox" checked={opts.attachments} onChange={() => flip('attachments')} /> Attachments
-          </label>
-          <label style={{ fontSize: 13 }}>
-            <input type="checkbox" checked={opts.memory} onChange={() => flip('memory')} /> Visible memories
-          </label>
-          <label style={{ fontSize: 13 }}>
-            Recent turns (max 20)
-            <input
-              type="number"
-              min={1}
-              max={20}
-              value={opts.turns}
-              onChange={(e) => setOpts((o) => ({ ...o, turns: Number(e.target.value) }))}
-              style={{ width: '100%' }}
-            />
-          </label>
-          <input value={opts.note} onChange={(e) => setOpts((o) => ({ ...o, note: e.target.value }))} placeholder="Note (optional)" />
-          <div style={{ display: 'flex', gap: 8 }}>
-            <button disabled={!target} onClick={() => onShare(target, opts)}>
-              Share
-            </button>
-            <button onClick={onClose}>Cancel</button>
+    <Dialog
+      title="Share context"
+      description="Copy selected context from this session into another one. Only what you tick is included."
+      icon="share"
+      onClose={onClose}
+      footer={<>
+        <Button variant="ghost" onClick={onClose}>Cancel</Button>
+        <Button icon="share" disabled={!target} onClick={() => onShare(target, opts)}>Share</Button>
+      </>}
+    >
+      <div className="form-stack">
+        <label className="field">
+          <span>Destination session</span>
+          <select value={target} onChange={(e) => setTarget(e.target.value)}>
+            <option value="">Choose a session…</option>
+            {targets.map((t) => <option key={t.id} value={t.id}>{t.label}</option>)}
+          </select>
+        </label>
+        <div className="field">
+          <span>Include</span>
+          <div className="checks">
+            <label className="check"><input type="checkbox" checked={opts.summary} onChange={() => flip('summary')} /> Key findings</label>
+            <label className="check"><input type="checkbox" checked={opts.messages} onChange={() => flip('messages')} /> Selected messages</label>
+            <label className="check"><input type="checkbox" checked={opts.attachments} onChange={() => flip('attachments')} /> Attachments</label>
+            <label className="check"><input type="checkbox" checked={opts.memory} onChange={() => flip('memory')} /> Visible memories</label>
           </div>
         </div>
+        <label className="field">
+          <span>Recent turns</span>
+          <input type="number" min={1} max={20} value={opts.turns} disabled={!opts.messages} onChange={(e) => setOpts((o) => ({ ...o, turns: Number(e.target.value) }))} />
+          <span className="field-help">Up to 20 of the most recent turns.</span>
+        </label>
+        <label className="field">
+          <span>Note <em className="muted" style={{ fontStyle: 'normal', fontWeight: 400 }}>(optional)</em></span>
+          <input value={opts.note} onChange={(e) => setOpts((o) => ({ ...o, note: e.target.value }))} placeholder="Why you’re sharing this" />
+        </label>
       </div>
-    </div>
+    </Dialog>
   );
 }

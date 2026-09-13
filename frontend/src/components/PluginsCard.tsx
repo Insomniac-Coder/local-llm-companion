@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react';
 import { listPlugins, runPluginTool, type PluginInfo } from '../services/api';
+import { Badge, Button, IconButton, Notice, Section } from '../ui/primitives';
 
-// Stage 37 plugin card (§61): manifests declare tools; runs use the same
-// permission gate as built-ins. Undeclared tools never execute.
+// Plugins: manifests declare tools; runs use the same permission gate as
+// built-ins. Undeclared tools never execute.
 const SAFE = new Set(['list_directory', 'read_file', 'search_text', 'system_info', 'list_processes']);
 
 export default function PluginsCard({
@@ -19,11 +20,11 @@ export default function PluginsCard({
 
   const run = (pluginId: string, tool: string, needsWs: boolean) => {
     if (needsWs && !wsId) {
-      notify('warning', 'Link a workspace first — this tool is workspace-scoped.');
+      notify('warning', 'Link a project first — this tool works inside a project.');
       return;
     }
     const needsApproval = !SAFE.has(tool);
-    if (needsApproval && !confirm(`Plugin '${pluginId}' wants to run '${tool}' (needs approval). Continue?`)) return;
+    if (needsApproval && !confirm(`Plugin '${pluginId}' wants to run '${tool}', which needs approval. Continue?`)) return;
     const args = tool === 'list_directory' ? { path: '.' } : {};
     runPluginTool(pluginId, wsId, tool, args, needsApproval)
       .then((r: any) => notify(r.ok ? 'success' : 'warning', r.ok ? `Done: ${String(r.output ?? '').slice(0, 300)}` : `Failed: ${String(r.output ?? '').slice(0, 300)}`))
@@ -31,32 +32,31 @@ export default function PluginsCard({
   };
 
   return (
-    <div className="card">
-      <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-        <strong>Plugins</strong>
-        <span style={{ flex: 1 }} />
-        <button onClick={load}>Reload</button>
-      </div>
-      {plugins.length === 0 && <div style={{ fontSize: 13 }}>No plugins found in plugins/.</div>}
-      {plugins.map((p) => (
-        <div key={p.id} style={{ marginTop: 6 }}>
-          <div style={{ fontSize: 13 }}>
-            <strong>{p.manifest?.name ?? p.id}</strong>{' '}
-            <span style={{ color: 'var(--text-secondary)' }}>{p.manifest?.version ?? ''} · {p.enabled ? 'enabled' : 'disabled'}</span>
-          </div>
-          {p.error && <div className="approval" style={{ marginTop: 4 }}>{p.error}</div>}
-          {p.manifest?.description && <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>{p.manifest.description}</div>}
-          {(p.unknown_tools ?? []).length > 0 && (
-            <div className="approval" style={{ marginTop: 4 }}>Unknown tools ignored: {p.unknown_tools!.join(', ')}</div>
-          )}
-          {(p.manifest?.tools ?? []).map((t) => (
-            <div key={t.name} style={{ display: 'flex', gap: 8, fontSize: 13, marginTop: 2, alignItems: 'center' }}>
-              <span style={{ flex: 1 }}><code>{t.name}</code> <span style={{ color: 'var(--text-secondary)' }}>{t.risk}</span></span>
-              <button onClick={() => run(p.id, t.name, t.name !== 'system_info' && t.name !== 'list_processes')}>Run</button>
+    <div className="panel">
+      <Section title="Plugins" icon="box" meta={plugins.length ? `${plugins.length}` : undefined} actions={<IconButton icon="refresh" label="Reload plugins" tipSide="bottom-end" onClick={() => void load()} />}>
+        {plugins.length === 0 && <p className="help">No plugins found in the plugins folder.</p>}
+        {plugins.map((p) => (
+          <div key={p.id} className="plugin">
+            <div className="plugin-head">
+              <strong>{p.manifest?.name ?? p.id}</strong>
+              <span className="readout">{p.manifest?.version ?? ''}</span>
+              <Badge tone={p.enabled ? 'ok' : 'neutral'}>{p.enabled ? 'Enabled' : 'Disabled'}</Badge>
             </div>
-          ))}
-        </div>
-      ))}
+            {p.manifest?.description && <p>{p.manifest.description}</p>}
+            {p.error && <Notice tone="error">{p.error}</Notice>}
+            {(p.unknown_tools ?? []).length > 0 && <Notice tone="caution">Unknown tools ignored: {p.unknown_tools!.join(', ')}</Notice>}
+            <div className="list-rows">
+              {(p.manifest?.tools ?? []).map((t) => (
+                <div key={t.name} className="list-row">
+                  <code className="grow">{t.name}</code>
+                  <Badge tone={t.risk.toLowerCase().startsWith('danger') ? 'err' : t.risk.toLowerCase().startsWith('moderate') ? 'warn' : 'neutral'}>{t.risk}</Badge>
+                  <Button size="sm" variant="ghost" icon="play" onClick={() => run(p.id, t.name, t.name !== 'system_info' && t.name !== 'list_processes')}>Run</Button>
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+      </Section>
     </div>
   );
 }

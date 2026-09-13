@@ -5,6 +5,8 @@ import {
   type AgentEvent,
   type AgentRunSummary,
 } from '../services/api';
+import { Lamp } from '../ui/primitives';
+import { Icon } from '../ui/Icon';
 
 const TERMINAL = ['COMPLETED', 'FAILED', 'CANCELLED'];
 
@@ -177,21 +179,22 @@ export default function AgentChatProgress({
   const waiting = active && (unavailable || state === 'WAITING_PERMISSION');
 
   return (
-    <section className={`agent-chat-progress ${waiting ? 'waiting' : active ? 'live' : (state ?? '').toLowerCase()}`} aria-live="polite" aria-label="Agent progress">
-      <header>
-        <span className="agent-chat-signal" aria-hidden="true"><i /></span>
+    <section className={`agent-run ${waiting ? 'waiting' : 'live'}`} aria-live="polite" aria-label="Agent progress">
+      <header className="agent-run-head">
+        <Lamp state={waiting ? 'caution' : 'live'} pulse />
         <div>
           <strong>{unavailable ? 'Model runtime unavailable' : phaseLabel(state, latest)}</strong>
           <span>{unavailable ? 'This run has not completed, but no model is generating. Stop it before restarting the model.' : state === 'WAITING_PERMISSION' ? 'Paused until you approve or deny the requested action.' : state === 'FAILED' && latest?.message ? latest.message : active ? 'Working on the requested task in this project' : selected.task}</span>
         </div>
+        {selected.iterations > 0 && <span className="readout">{selected.iterations} step{selected.iterations === 1 ? '' : 's'}</span>}
       </header>
       {updates.length > 0 && (
-        <ol className="agent-chat-updates">
-          {updates.map((update, index) => <li key={`${index}-${update}`}><i aria-hidden="true" />{update}</li>)}
+        <ol className="agent-run-steps">
+          {updates.map((update, index) => <li key={`${index}-${update}`}>{update}</li>)}
         </ol>
       )}
-      <button className="agent-chat-open" onClick={() => onOpenActivity(selected.id)}>
-        Open agent activity <span aria-hidden="true">→</span>
+      <button type="button" className="agent-run-open" onClick={() => onOpenActivity(selected.id)}>
+        {state === 'WAITING_PERMISSION' ? 'Review the request' : 'Open agent activity'} <Icon name="arrowRight" size={14} />
       </button>
     </section>
   );

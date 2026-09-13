@@ -13,6 +13,8 @@ interface Props {
   seconds: number;
 }
 
+// Charts are drawn in the neutral ink colour; only the newest reading is lit
+// red, because it is the one live value on the page.
 export default function ResourceChart({ samples, latest, field, label, detail, maximum, unit, tone, seconds }: Props) {
   const gradient = useId().replace(/:/g, '');
   const [inspection, setInspection] = useState<number | null>(null);
@@ -25,7 +27,7 @@ export default function ResourceChart({ samples, latest, field, label, detail, m
   const peak = points.length ? Math.max(...points.map((point) => point.value)) : null;
   const digits = unit === 'GB' ? 1 : 0;
   const fill = isReading(latestValue) ? Math.min(100, latestValue / Math.max(1, maximum) * 100) : null;
-  const active = selected ?? points[points.length - 1];
+  const newest = points[points.length - 1];
   const inspectPointer = (event: React.PointerEvent<HTMLDivElement>) => {
     const bounds = event.currentTarget.getBoundingClientRect();
     const x = (event.clientX - bounds.left) / bounds.width * 600;
@@ -36,7 +38,7 @@ export default function ResourceChart({ samples, latest, field, label, detail, m
   return (
     <article className={`rd-chart rd-chart-${tone}`}>
       <header className="rd-chart-header">
-        <div><h2><span className="rd-swatch" />{label}</h2><p>{detail}</p></div>
+        <div><h2>{label}</h2><p>{detail}</p></div>
         <div className="rd-reading">{formatReading(latestValue, digits)}<span>{unit}</span></div>
       </header>
       <div className="rd-capacity" aria-label={`${label}: ${formatReading(latestValue, digits)} ${unit}`}><span style={{ width: `${fill ?? 0}%` }} /></div>
@@ -55,14 +57,16 @@ export default function ResourceChart({ samples, latest, field, label, detail, m
             else setInspection((value) => Math.max(0, Math.min(points.length - 1, (value ?? points.length - 1) + (event.key === 'ArrowLeft' ? -1 : 1))));
           }}>
           <svg viewBox="0 0 600 144" preserveAspectRatio="none" aria-hidden="true">
-            <defs><linearGradient id={gradient} x1="0" x2="0" y1="0" y2="1"><stop offset="0" stopColor="currentColor" stopOpacity=".18" /><stop offset="1" stopColor="currentColor" stopOpacity=".015" /></linearGradient></defs>
+            <defs><linearGradient id={gradient} x1="0" x2="0" y1="0" y2="1"><stop offset="0" stopColor="currentColor" stopOpacity=".16" /><stop offset="1" stopColor="currentColor" stopOpacity="0" /></linearGradient></defs>
             <g className="rd-grid">{[4, 72, 140].map((y) => <line key={`y${y}`} x1="0" x2="600" y1={y} y2={y} />)}{[0, 150, 300, 450, 600].map((x) => <line key={`x${x}`} x1={x} x2={x} y1="4" y2="140" />)}</g>
             {segments.map((segment, index) => {
               const line = segment.map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(' ');
               return <g key={index}><polygon points={`${segment[0].x},140 ${line} ${segment[segment.length - 1].x},140`} fill={`url(#${gradient})`} /><polyline className="rd-line" points={line} /></g>;
             })}
-            {active && <g>{selected && <line className="rd-crosshair" x1={active.x} x2={active.x} y1="4" y2="140" />}<circle className="rd-endpoint" cx={active.x} cy={active.y} r="3" /></g>}
+            {selected && <line className="rd-crosshair" x1={selected.x} x2={selected.x} y1="4" y2="140" />}
           </svg>
+          {newest && <span className="rd-dot" style={{ left: `${newest.x / 6}%`, top: `${newest.y / 1.44}%` }} aria-hidden="true" />}
+          {selected && selected !== newest && <span className="rd-dot inspect" style={{ left: `${selected.x / 6}%`, top: `${selected.y / 1.44}%` }} aria-hidden="true" />}
           {!points.length && <div className="rd-no-data">{latest && !isReading(latestValue) ? 'This sensor is not available' : 'Collecting telemetry'}</div>}
         </div>
       </div>

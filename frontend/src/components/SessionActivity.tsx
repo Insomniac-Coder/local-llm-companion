@@ -8,6 +8,8 @@ import {
   type AgentRunSummary,
 } from '../services/api';
 import ToolTimeline from './ToolTimeline';
+import { Button, Lamp } from '../ui/primitives';
+import { Icon } from '../ui/Icon';
 
 const TERMINAL = ['COMPLETED', 'FAILED', 'CANCELLED'];
 
@@ -46,6 +48,7 @@ export default function SessionActivity({
   const [selectedId, setSelectedId] = useState<string | null>(focusRun ?? null);
   const [events, setEvents] = useState<AgentEvent[]>([]);
   const [permissionResolved, setPermissionResolved] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const abort = useRef<AbortController | null>(null);
   const finishedCallback = useRef(onFinished);
   const activeCallback = useRef(onActiveChange);
@@ -76,6 +79,7 @@ export default function SessionActivity({
     abort.current?.abort();
     setEvents([]);
     setPermissionResolved(false);
+    setStopping(false);
     if (!selectedId) return;
     const controller = new AbortController();
     abort.current = controller;
@@ -114,40 +118,45 @@ export default function SessionActivity({
   }
 
   if (!convId) {
-    return <div className="activity-empty"><strong>No code session open</strong><span>Open or create a session to see its work.</span></div>;
+    return <div className="empty-state"><Icon name="code" size={28} /><strong>No code session open</strong><p>Open or create a session to see its work.</p></div>;
   }
 
   if (!selected) {
     return (
-      <div className="activity-empty">
-        <span className="activity-orbit" aria-hidden="true" />
-        <strong>Ready to work</strong>
-        <span>Describe what you want in the composer. Planning, file changes, commands, and results will appear here.</span>
+      <div className="empty-state">
+        <Icon name="activity" size={28} />
+        <strong>Nothing running yet</strong>
+        <p>Describe a change in the composer. Planning, file changes, commands and results appear here as they happen.</p>
       </div>
     );
   }
 
+  const summaryTone = active ? 'live' : selected.state === 'COMPLETED' ? 'done' : selected.state === 'CANCELLED' ? '' : 'failed';
   return (
     <div className="session-activity">
-      <header className="work-pulse">
-        <div className={`pulse-mark${active ? ' live' : ''}`} aria-hidden="true"><span /></div>
-        <div>
-          <span>{active ? 'Agent working' : selected.state === 'COMPLETED' ? 'Work completed' : selected.state === 'CANCELLED' ? 'Work stopped' : 'Work needs attention'}</span>
+      <header className={`run-summary ${summaryTone}`}>
+        <Lamp state={active ? (pending ? 'caution' : 'live') : selected.state === 'COMPLETED' ? 'ready' : selected.state === 'CANCELLED' ? 'off' : 'error'} pulse={active} />
+        <div className="run-summary-copy">
+          <span className="eyebrow">{active ? pending ? 'Waiting for you' : 'Agent working' : selected.state === 'COMPLETED' ? 'Work completed' : selected.state === 'CANCELLED' ? 'Work stopped' : 'Needs attention'}</span>
           <strong>{selected.task}</strong>
+          <small className="readout">{selected.iterations} step{selected.iterations === 1 ? '' : 's'} recorded · {active ? 'in progress' : 'run ended'}</small>
         </div>
-        {active && <button onClick={() => stopAgent(selected.id).then(() => notify('info', 'Stopping agent…')).catch((error) => notify('error', error.message))}>Stop</button>}
+        {active && (
+          <Button size="sm" variant="danger" icon="stop" loading={stopping} onClick={() => { setStopping(true); stopAgent(selected.id).then(() => notify('info', 'Stopping the agent…')).catch((error) => { setStopping(false); notify('error', error.message); }); }}>
+            Stop
+          </Button>
+        )}
       </header>
-      <p className="panel-caption">{selected.iterations} step{selected.iterations === 1 ? '' : 's'} recorded · {active ? 'In progress' : 'Run ended'}</p>
 
       {pending?.pending_tool && (
-        <section className="inline-permission" aria-label="Permission required">
-          <strong>Approval needed</strong>
+        <section className="approval-card" aria-label="Permission required">
+          <header><Icon name="shield" size={16} /> Approval needed</header>
           <p>{pending.pending_tool.reason}</p>
           <code>{pending.pending_tool.tool}</code>
-          <div>
-            <button onClick={() => void decide(true)}>Allow once</button>
-            <button onClick={() => void decide(true, true)}>Allow for session</button>
-            <button className="quiet" onClick={() => void decide(false)}>Deny</button>
+          <div className="approval-actions">
+            <Button size="sm" variant="secondary" icon="check" onClick={() => void decide(true)}>Allow once</Button>
+            <Button size="sm" variant="ghost" onClick={() => void decide(true, true)}>Allow for session</Button>
+            <Button size="sm" variant="danger" onClick={() => void decide(false)}>Deny</Button>
           </div>
         </section>
       )}
@@ -155,11 +164,11 @@ export default function SessionActivity({
       <ToolTimeline events={events} />
 
       {runs.length > 1 && (
-        <details className="session-runs">
-          <summary>Earlier work in this session</summary>
+        <details className="run-history">
+          <summary><Icon name="history" size={14} /> Earlier work in this session</summary>
           {runs.filter((run) => run.id !== selected.id).reverse().map((run) => (
-            <button key={run.id} onClick={() => setSelectedId(run.id)}>
-              <span>{run.state.toLowerCase()}</span>{run.task}
+            <button type="button" key={run.id} onClick={() => setSelectedId(run.id)}>
+              <span>{run.state.toLowerCase().replace(/_/g, ' ')}</span><span>{run.task}</span>
             </button>
           ))}
         </details>

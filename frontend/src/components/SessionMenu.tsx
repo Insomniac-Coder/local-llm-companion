@@ -1,8 +1,7 @@
 import { useState } from 'react';
-import { Popover, PopItem } from '../ui/primitives';
+import { IconButton, PopDivider, PopItem, Popover } from '../ui/primitives';
 
-// Design guide §4: hover/right-click session actions — rename,
-// duplicate/fork, pin, export, close. Never color-alone state.
+// Row actions for a session in the sidebar. Right-click opens the same menu.
 export default function SessionMenu({
   pinned,
   onRename,
@@ -19,28 +18,30 @@ export default function SessionMenu({
   onClose: () => void;
 }) {
   const [open, setOpen] = useState(false);
+  const act = (fn: () => void) => () => { setOpen(false); fn(); };
   return (
     <>
-      <button
-        className="ctx-toggle convmenu-btn"
-        onClick={() => setOpen((v) => !v)}
+      <IconButton
+        icon="more"
+        label="Session actions"
+        size="sm"
+        className="sb-row-menu"
+        tip={false}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={(event) => { event.stopPropagation(); setOpen((v) => !v); }}
         onContextMenu={(e) => {
           e.preventDefault();
           setOpen(true);
         }}
-        aria-label="Session actions"
-        title="Session actions (rename, duplicate, pin, export, close)"
-      >
-        ⋯
-      </button>
+      />
       <Popover open={open} onClose={() => setOpen(false)} label="Session actions">
-        <PopItem onClick={() => { setOpen(false); onRename(); }}>Rename</PopItem>
-        <PopItem onClick={() => { setOpen(false); onDuplicate(); }}>Duplicate / fork</PopItem>
-        <PopItem onClick={() => { setOpen(false); onTogglePin(); }}>{pinned ? 'Unpin' : 'Pin'}</PopItem>
-        <PopItem onClick={() => { setOpen(false); onExport(); }}>Export</PopItem>
-        <PopItem danger onClick={() => { setOpen(false); onClose(); }}>
-          Close
-        </PopItem>
+        <PopItem icon="pencil" onClick={act(onRename)}>Rename</PopItem>
+        <PopItem icon="pin" onClick={act(onTogglePin)}>{pinned ? 'Unpin' : 'Pin to top'}</PopItem>
+        <PopItem icon="fork" onClick={act(onDuplicate)}>Duplicate</PopItem>
+        <PopItem icon="download" onClick={act(onExport)}>Export</PopItem>
+        <PopDivider />
+        <PopItem icon="trash" danger onClick={act(onClose)}>Delete…</PopItem>
       </Popover>
     </>
   );

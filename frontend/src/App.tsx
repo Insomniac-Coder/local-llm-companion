@@ -1,45 +1,43 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import MessageView from './components/MessageView';
 import PrepareBanner from './components/PrepareBanner';
-import ModelLibraryItem from './components/ModelLibraryItem';
 import ResourcesPanel from './components/ResourcesPanel';
 import SettingsPanel from './components/SettingsPanel';
 import Toasts, { pushToast, type Toast } from './components/Toasts';
-import ContextBar from './components/ContextBar';
+import { ContextGauge } from './components/ContextBar';
 import DiffModal from './components/DiffModal';
-import LoadProgress from './components/LoadProgress';
 import ShareDialog, { type ShareOptions } from './components/ShareDialog';
 import RecoveryBanner from './components/RecoveryBanner';
-import DoctorCard from './components/DoctorCard';
-import BenchmarkCard from './components/BenchmarkCard';
-import PluginsCard from './components/PluginsCard';
-import SetupWizard from './components/SetupWizard';
-import CodeHeader from './components/CodeHeader';
+import ProjectActions, { useWorkspaceBranch } from './components/CodeHeader';
 import AttachChips from './components/AttachChips';
 import SessionMenu from './components/SessionMenu';
-import ModelSelect from './components/ModelSelect';
 import PermissionsModal from './components/PermissionsModal';
 import RightPanel from './components/RightPanel';
 import RightPanelTabs from './components/RightPanelTabs';
 import ProjectLauncher from './components/ProjectLauncher';
 import AgentChatProgress from './components/AgentChatProgress';
-import CommandPalette from './components/CommandPalette';
+import CommandPalette, { type QuickAction } from './components/CommandPalette';
 import WorkStatus from './components/WorkStatus';
+import Rig, { machineState, type MachineActivity } from './components/Rig';
+import Welcome from './components/Welcome';
+import ModelsPage from './components/ModelsPage';
+import RuntimePage from './components/RuntimePage';
+import ToolsPage from './components/ToolsPage';
 import { AUTO_POLICY_DESCRIPTION, PROJECT_BOUNDARY_DESCRIPTION, SEARCH_PERMISSION_DESCRIPTION } from './components/permissionCopy';
 import { VisibleOutputMeter, type GenerationPhase, type OutputTiming } from './services/outputTiming';
 import { applyAgentContext } from './services/contextUsage';
 import { currentActivitySnapshot, parseActivityStart, visibleWorkActivity } from './services/workElapsed';
 import { type CodeIntent, matchesShortcut, selectAvailableModel, shouldStartAgent, updateMessage, WORKBENCH_DESTINATIONS } from './services/workbench';
-import { Badge, Button, PopItem, Popover, Toggle, Tooltip } from './ui/primitives';
-import { activityLabel } from './services/events';
+import { Button, Dialog, IconButton, Kbd, Lamp, Notice, PopDivider, PopItem, PopLabel, Popover, Toggle } from './ui/primitives';
+import { Icon, type IconName } from './ui/Icon';
 import {
-  agentRuns, classifyRequest, compactConversation, createConversation, deleteConversation, deleteModel, discardStale, downloadAction, editMessage, exportConversation, forkConversation,
-  getContext, getConversationMetrics, getMessages, getOverview, getRecovery, getPermissionMode, getSettings, inferenceStart,
-  inferenceStatus, inferenceStop, listCommands, listConversations, listDownloads,
+  agentRuns, classifyRequest, compactConversation, createConversation, deleteConversation, deleteModel, discardStale, editMessage, exportConversation, forkConversation,
+  getContext, getConversationMetrics, getMessages, getRecovery, getPermissionMode, getSettings, inferenceStart,
+  inferenceStatus, listCommands, listConversations, listDownloads,
   listModels, listSessions, listTools, listWorkspaces, patchSession, stopAgent,
-  loadModel, modelDetail, patchConversation, scanModels, shareConversation,
-  setPermissionMode as updatePermissionMode, startAgent, startDownload, stopChat, streamChat, unloadModels,
-  systemInfo, uploadAttachment,
+  loadModel, patchConversation, shareConversation,
+  setPermissionMode as updatePermissionMode, startAgent, stopChat, streamChat, unloadModels,
+  systemInfo, uploadAttachment, modelDetail,
   type AgentEvent, type CommandItem, type ContextInfo, type Conversation, type DownloadInfo,
   type InferenceStatus, type ModelMeta, type RecoveryInfo, type SessionInfo,
   type StreamUsage, type PersistedMetric, type ToolDescriptor, type Workspace,
@@ -48,33 +46,40 @@ import {
 type Msg = { id: string; role: 'user' | 'assistant' | 'tool'; text: string; time: string; activities?: AgentEvent[] };
 
 type Theme = 'dark' | 'light' | 'system';
+type PageId = 'models' | 'resources' | 'system' | 'tools' | 'settings';
+type Perf = { tps: number | null; timing?: OutputTiming | null; legacy: boolean; model?: string };
 
-type AppIconName = 'chat' | 'code' | 'models' | 'resources' | 'system' | 'settings' | 'tools';
+const PAGE_META: Record<PageId, { title: string; description: string; icon: IconName }> = {
+  models: { title: 'Models', description: 'Load, inspect and add GGUF models on this PC', icon: 'layers' },
+  resources: { title: 'Resources', description: 'Live processor, memory and graphics readings for the whole machine', icon: 'activity' },
+  system: { title: 'Runtime & diagnostics', description: 'The inference runtime, health checks and speed', icon: 'gauge' },
+  tools: { title: 'Tools & plugins', description: 'Every action Companion can take and the approval it needs', icon: 'terminal' },
+  settings: { title: 'Settings', description: 'Appearance, assistant behaviour, search and performance', icon: 'sliders' },
+};
 
-function AppIcon({ name }: { name: AppIconName }) {
-  const paths: Record<AppIconName, ReactNode> = {
-    chat: <><path d="M4.5 5.5h15v10h-9l-4 3v-3h-2z" /><path d="M8 9h8M8 12h5" /></>,
-    code: <><path d="m8.5 7-5 5 5 5M15.5 7l5 5-5 5M13.5 4l-3 16" /></>,
-    models: <><path d="m12 3 8 4-8 4-8-4z" /><path d="m4 11 8 4 8-4M4 15l8 4 8-4" /></>,
-    resources: <><path d="M5 19V9M12 19V4M19 19v-7" /><path d="M3 19h18" /></>,
-    system: <><rect x="3.5" y="4" width="17" height="16" rx="2" /><path d="M7 9h4M7 13h7M7 17h10" /></>,
-    settings: <><path d="M4 7h10M18 7h2M4 17h2M10 17h10M4 12h4M12 12h8" /><circle cx="16" cy="7" r="2" /><circle cx="8" cy="17" r="2" /><circle cx="10" cy="12" r="2" /></>,
-    tools: <><path d="M4 5h16v14H4z" /><path d="m8 10 2 2-2 2M13 15h4" /></>,
-  };
-  return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-      {paths[name]}
-    </svg>
-  );
-}
+const PRIORITIES = [
+  { id: 'background', label: 'Background' },
+  { id: 'normal', label: 'Normal' },
+  { id: 'high', label: 'High' },
+] as const;
 
 function applyTheme(t: Theme) {
   const mq = matchMedia('(prefers-color-scheme: light)');
   document.documentElement.dataset.theme = t === 'system' ? (mq.matches ? 'light' : 'dark') : t;
 }
 
+/** Keep the previous value when a poll returns identical data, so background
+ *  refreshes do not re-render the whole conversation for nothing. */
+function same<T>(next: T) {
+  return (previous: T) => JSON.stringify(previous) === JSON.stringify(next) ? previous : next;
+}
+
+function shortcutLabel(binding: string) {
+  return binding.split('+').map((part) => part.trim()).map((part) => part.length === 1 ? part.toUpperCase() : part[0].toUpperCase() + part.slice(1)).join(' ');
+}
+
 export default function App() {
-  const [tab, setTab] = useState<'chat' | 'models' | 'resources' | 'system' | 'settings' | 'tools'>('chat');
+  const [tab, setTab] = useState<'chat' | PageId>('chat');
   const [mode, setMode] = useState<'chat' | 'code'>(() => (localStorage.getItem('companion.mode') as any) || 'chat');
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [paletteShortcut, setPaletteShortcut] = useState('ctrl+k');
@@ -99,9 +104,6 @@ export default function App() {
   const [inf, setInf] = useState<InferenceStatus | null>(null);
   const [usage, setUsage] = useState<StreamUsage | null>(null);
   const [downloads, setDownloads] = useState<DownloadInfo[]>([]);
-  const [dlId, setDlId] = useState('');
-  const [dlUrl, setDlUrl] = useState('');
-  const [dlSha, setDlSha] = useState('');
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [ctx, setCtx] = useState<ContextInfo | null>(null);
   const [editing, setEditing] = useState<{ mid: string; draft: string } | null>(null);
@@ -112,24 +114,23 @@ export default function App() {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [wsId, setWsId] = useState(() => localStorage.getItem('companion.workspace') ?? '');
   const [projectLauncherOpen, setProjectLauncherOpen] = useState(false);
+  const [projectMenuOpen, setProjectMenuOpen] = useState(false);
   const [showShare, setShowShare] = useState(false);
   const [focusRun, setFocusRun] = useState<string | null>(null);
   const [guard, setGuard] = useState<{ kind: 'load' | 'start'; id: string; detail: string } | null>(null);
+  const [confirmState, setConfirmState] = useState<{ title: string; body: string; action: string; icon?: IconName; onConfirm: () => void } | null>(null);
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
-  const [pill, setPill] = useState('');
-  // Stages 21–27 shell state.
-  const [collapsed, setCollapsed] = useState(() => typeof window !== 'undefined' && window.matchMedia('(max-width: 850px)').matches);
+  const [collapsed, setCollapsed] = useState(() => typeof window !== 'undefined' && window.matchMedia('(max-width: 860px)').matches);
+  const [narrow, setNarrow] = useState(() => typeof window !== 'undefined' && window.matchMedia('(max-width: 860px)').matches);
   const [mobileNav, setMobileNav] = useState(false);
   const [showLatest, setShowLatest] = useState(false);
   const [backendUp, setBackendUp] = useState<boolean | null>(null);
-  // UI guide §3: three-zone shell. Right panel content lands in Stage 41.
   const [rightOpen, setRightOpen] = useState(false);
   const [rightTab, setRightTab] = useState(mode === 'code' ? 'activity' : 'context');
-  // UI guide §4: pinned sessions, inline rename.
   const [pinnedIds, setPinnedIds] = useState<string[]>(() => {
     try { return JSON.parse(localStorage.getItem('companion.pinned') ?? '[]'); } catch { return []; }
   });
-  const [renaming, setRenaming] = useState<{ id: string; draft: string } | null>(null);
+  const [renaming, setRenaming] = useState<{ id: string; draft: string; where: 'list' | 'head' } | null>(null);
   const [sessionMenuOpen, setSessionMenuOpen] = useState(false);
   const [permOpen, setPermOpen] = useState(false);
   const [registry, setRegistry] = useState<ToolDescriptor[]>([]);
@@ -146,11 +147,12 @@ export default function App() {
   const [diffWs, setDiffWs] = useState<string | null>(null);
   const [recovery, setRecovery] = useState<RecoveryInfo | null>(null);
   const [recoveryOff, setRecoveryOff] = useState(false);
+  const [prepareDismissed, setPrepareDismissed] = useState<Record<string, boolean>>({});
   const [dragOver, setDragOver] = useState(false);
   const [liveTps, setLiveTps] = useState<number | null>(null);
   const [showGenerationSpeed, setShowGenerationSpeed] = useState(true);
   const [showDetailedMetrics, setShowDetailedMetrics] = useState(false);
-  const [perfMap, setPerfMap] = useState<Record<string, { tps: number | null; timing?: OutputTiming | null; legacy: boolean }>>({});
+  const [perfMap, setPerfMap] = useState<Record<string, Perf>>({});
   const [generationPhase, setGenerationPhase] = useState<GenerationPhase>('processing');
   const lastTpsPush = useRef(0);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
@@ -159,16 +161,25 @@ export default function App() {
   const conversationRef = useRef<string | null>(convId);
   conversationRef.current = convId;
   const transcriptRef = useRef<HTMLDivElement>(null);
+  const centerRef = useRef<HTMLDivElement>(null);
+  const dockRef = useRef<HTMLDivElement>(null);
   const followOutput = useRef(true);
   const drafts = useRef<Record<string, string>>({});
 
   const notify = useCallback((kind: Toast['kind'], text: string) => pushToast(setToasts, kind, text), []);
-  const setNotice = (text: string) => notify('info', text);
+  const dismissToast = useCallback((id: number) => setToasts((items) => items.filter((toast) => toast.id !== id)), []);
 
   useEffect(() => {
     applyTheme(theme);
     localStorage.setItem('companion.theme', theme);
   }, [theme]);
+
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width: 860px)');
+    const onChange = () => { setNarrow(mq.matches); if (!mq.matches) setMobileNav(false); };
+    mq.addEventListener('change', onChange);
+    return () => mq.removeEventListener('change', onChange);
+  }, []);
 
   useEffect(() => {
     const onAppearance = (event: Event) => {
@@ -206,7 +217,7 @@ export default function App() {
     try {
       const [next, initialSettings] = await Promise.all([listModels(), modelDefaultsRead.current ? Promise.resolve(null) : getSettings().catch(() => null)]);
       if (initialSettings) { preferredDefaultModel.current = initialSettings.general?.default_model ?? ''; modelDefaultsRead.current = true; }
-      setModels(next);
+      setModels(same(next));
       // A model can disappear between launches (for example, after its
       // directory is removed or the models folder is reset). Never keep a
       // stale id in the selector: it would make Load/Start send an id the
@@ -217,7 +228,7 @@ export default function App() {
 
   async function refreshDownloads() {
     try {
-      setDownloads(await listDownloads());
+      setDownloads(same(await listDownloads()));
     } catch { /* backend offline */ }
   }
 
@@ -240,7 +251,7 @@ export default function App() {
   async function refreshSessions() {
     try {
       const r = await listSessions();
-      setSessions(r.sessions);
+      setSessions(same(r.sessions));
     } catch { /* ignore */ }
   }
 
@@ -280,9 +291,12 @@ export default function App() {
     refreshConvs();
     refreshWorkspaces();
     refreshRegistry();
+    refreshSessions();
     getRecovery().then(setRecovery).catch(() => setRecovery(null));
     const t = setInterval(refreshDownloads, 2000);
-    const modelRefresh = setInterval(() => { if (!document.hidden) { void refreshModels(); inferenceStatus().then((state) => { setInf(state); setBackendUp(true); }).catch(() => setBackendUp(false)); } }, 10000);
+    const modelRefresh = setInterval(() => { if (!document.hidden) { void refreshModels(); inferenceStatus().then((state) => { setInf(same<InferenceStatus | null>(state)); setBackendUp(true); }).catch(() => setBackendUp(false)); } }, 10000);
+    // Session activity drives the live lamps in the list; keep it fresh but cheap.
+    const sessionRefresh = setInterval(() => { if (!document.hidden) void refreshSessions(); }, 6000);
     systemInfo().then((v) => { setSys(v); setBackendUp(true); }).catch(() => { setSys(null); setBackendUp(false); });
     inferenceStatus().then(setInf).catch(() => setInf(null));
     getPermissionMode().then((result) => {
@@ -290,15 +304,7 @@ export default function App() {
       localStorage.setItem('companion.permissionMode', result.mode);
     }).catch(() => notify('warning', 'Could not read the saved approval policy. Reconnect to the local runtime before changing it.'))
       .finally(() => setPermissionModeBusy(false));
-    const p = setInterval(() => {
-      getOverview()
-        .then((o) => {
-          const l = o?.resources;
-          setPill(l ? `RAM ${l.ram_used_gb?.toFixed?.(1) ?? '?'}G` : '');
-        })
-        .catch(() => setPill(''));
-    }, 8000);
-    return () => { clearInterval(t); clearInterval(p); clearInterval(modelRefresh); };
+    return () => { clearInterval(t); clearInterval(modelRefresh); clearInterval(sessionRefresh); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -355,6 +361,20 @@ export default function App() {
     if (view && followOutput.current) view.scrollTop = view.scrollHeight;
   }, [msgs, agentBusy]);
 
+  // One notification region for every view: it floats just above the dock
+  // (composer, status, notices) and follows it as the dock grows or shrinks.
+  useEffect(() => {
+    const center = centerRef.current;
+    const dock = dockRef.current;
+    if (!center) return;
+    if (!dock) { center.style.setProperty('--toast-bottom', '24px'); return; }
+    const update = () => center.style.setProperty('--toast-bottom', `${dock.offsetHeight + 8}px`);
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(dock);
+    return () => observer.disconnect();
+  }, [tab]);
+
   useEffect(() => {
     if (!modelId) {
       setReasoningCapable(false);
@@ -385,7 +405,7 @@ export default function App() {
         if (!mounted || !currentActivitySnapshot(convId, conversationRef.current, request, latestRequest, pendingAgentStarts.current.has(convId))) return;
         const live = [...runs].reverse().find((run) => run.conversation_id === convId && !['COMPLETED', 'FAILED', 'CANCELLED'].includes(run.state));
         setAgentBusy(!!live);
-        setAgentActivity(live ? { conversationId: convId, runId: live.id, startedAt: parseActivityStart(live.started_at) } : null);
+        setAgentActivity(same(live ? { conversationId: convId, runId: live.id, startedAt: parseActivityStart(live.started_at) } : null));
         if (live) setAgentPhase(live.state);
         if (live) setFocusRun(live.id);
       }).catch(() => {});
@@ -406,7 +426,7 @@ export default function App() {
     setPerfMap((p) => {
       const next = { ...p };
       for (const m of metrics) {
-        next[m.message_id] = { tps: m.timing ? m.timing.output_tps : m.gen_tps, timing: m.timing, legacy: !m.timing };
+        next[m.message_id] = { tps: m.timing ? m.timing.output_tps : m.gen_tps, timing: m.timing, legacy: !m.timing, model: m.model_id };
       }
       return next;
     });
@@ -432,6 +452,7 @@ export default function App() {
     setEditing(null);
     setFocusRun(null);
     setMsgLimit(150);
+    setMobileNav(false);
     try {
       const conv = source.find((c) => c.id === id);
       const nextMode = (conv?.mode || 'chat') as 'chat' | 'code';
@@ -507,6 +528,7 @@ export default function App() {
       setMsgs([]);
       setCtx(null);
       refreshSessions();
+      requestAnimationFrame(() => composerRef.current?.focus());
     } catch (e: any) {
       notify('error', e?.message ?? 'Could not create conversation (is the backend running?)');
     }
@@ -516,7 +538,7 @@ export default function App() {
     const raw = override ?? input;
     if (!raw.trim() || busy || agentBusy || (convId && pendingAgentStarts.current.has(convId))) return;
     if (!raw.trim().startsWith('/') && (!inf?.running || models.find((model) => model.loaded)?.id !== modelId)) {
-      notify('warning', 'Load the selected model before sending a message. Your draft is kept.');
+      notify('warning', 'No model is loaded. Load one from the panel at the bottom left — your draft is kept.');
       return;
     }
     let cid = convId;
@@ -596,7 +618,7 @@ export default function App() {
             setRightTab('activity');
           }
           void getContext(cid).then((context) => { if (conversationRef.current === cid) setCtx(context); }).catch(() => {});
-          notify('success', 'Work started. Progress and approvals are in Session Activity.');
+          notify('success', 'Work started. Progress and approvals appear in the inspector.');
           void maybeAutoTitle(cid, text);
         } else {
           if (conversationRef.current === cid) {
@@ -633,6 +655,7 @@ export default function App() {
     abort.current = ctl;
     let acc = '';
     setUsage(null);
+    const answeringModel = models.find((model) => model.loaded)?.id;
     setMsgs((m) => [...m, { id: `${tmpId}-a`, role: 'assistant', text: '', time: '' }]);
     try {
       await streamChat(text, cid, {
@@ -672,7 +695,7 @@ export default function App() {
           setStatusLine('');
           setLiveTps(null);
           if (u.timing || u.gen_tps != null) {
-            const entry = { tps: u.timing ? u.timing.output_tps : u.gen_tps ?? null, timing: u.timing, legacy: !u.timing };
+            const entry: Perf = { tps: u.timing ? u.timing.output_tps : u.gen_tps ?? null, timing: u.timing, legacy: !u.timing, model: answeringModel };
             setPerfMap((p) => ({ ...p, [u.message_id ?? `${tmpId}-a`]: entry }));
           }
           const cmd = u.command;
@@ -776,11 +799,11 @@ export default function App() {
     if (!target) return;
     try {
       const r = await forkConversation(target);
-      notify('success', `Forked (${r.messages} messages).`);
+      notify('success', `Duplicated (${r.messages} messages).`);
       refreshConvs(r.forked);
       refreshSessions();
     } catch (e: any) {
-      notify('error', e?.message ?? 'Fork failed.');
+      notify('error', e?.message ?? 'Duplicate failed.');
     }
   }
 
@@ -831,7 +854,6 @@ export default function App() {
     }
   }
 
-  // UI guide §4: hover menu actions + auto-titles ("RageV — Metallic Ghosting").
   function togglePin(id: string) {
     setPinnedIds((prev) => {
       const next = prev.includes(id) ? prev.filter((p) => p !== id) : [...prev, id];
@@ -842,7 +864,7 @@ export default function App() {
 
   async function doRename(id: string, title: string) {
     const t = title.trim().slice(0, 60);
-    if (!t) return;
+    if (!t) { setRenaming(null); return; }
     try {
       await patchConversation(id, { title: t });
       setRenaming(null);
@@ -871,16 +893,39 @@ export default function App() {
     } catch { /* title is cosmetic; never fail the turn */ }
   }
 
-  async function doDelete(id: string) {
-    if (!confirm('Delete this conversation? History will be removed.')) return;
-    try {
-      await deleteConversation(id);
-      if (convId === id) { setConvId(null); setMsgs([]); setCtx(null); }
-      refreshConvs();
-      refreshSessions();
-    } catch (e: any) {
-      notify('error', e?.message ?? 'Delete failed.');
-    }
+  function doDelete(id: string) {
+    const target = convs.find((conversation) => conversation.id === id);
+    setConfirmState({
+      title: 'Delete this conversation?',
+      body: `“${target?.title || 'Untitled'}” and its history will be removed from this PC. This can’t be undone.`,
+      action: 'Delete conversation',
+      icon: 'trash',
+      onConfirm: () => {
+        void (async () => {
+          try {
+            await deleteConversation(id);
+            if (conversationRef.current === id) { conversationRef.current = null; setConvId(null); setMsgs([]); setCtx(null); }
+            refreshConvs();
+            refreshSessions();
+            notify('success', 'Conversation deleted.');
+          } catch (e: any) {
+            notify('error', e?.message ?? 'Delete failed.');
+          }
+        })();
+      },
+    });
+  }
+
+  function confirmDeleteModel(model: ModelMeta) {
+    setConfirmState({
+      title: `Delete ${model.name}?`,
+      body: 'This permanently removes the model file from the models folder. Conversations that used it are kept.',
+      action: 'Delete model',
+      icon: 'trash',
+      onConfirm: () => {
+        deleteModel(model.id).then(() => { notify('success', `Deleted ${model.name}.`); refreshModels(); }).catch((e) => notify('error', e.message));
+      },
+    });
   }
 
   async function setPriority(p: string) {
@@ -893,8 +938,13 @@ export default function App() {
     }
   }
 
-  const visibleConvs = convs.filter((c) => (c.mode || 'chat') === mode && c.title.toLowerCase().includes(sessionFilter.toLowerCase()));
   const loadedModel = models.find((m) => m.loaded)?.id ?? '';
+  // The selection always follows the model that is actually loaded (including
+  // one loaded from another window), so the UI never offers a model you are
+  // not using as if it were the current one.
+  useEffect(() => {
+    if (loadedModel) setModelId(loadedModel);
+  }, [loadedModel]);
   const activeConv = convs.find((c) => c.id === convId) ?? null;
   const needsPrepare = !!(
     activeConv?.last_model &&
@@ -902,7 +952,7 @@ export default function App() {
     activeConv.last_model !== loadedModel
   );
 
-  /** Load/start with the agent-execution guard (§178). */
+  /** Load/start with the agent-execution guard. */
   async function guardedSwitch(kind: 'load' | 'start', id: string, force: boolean) {
     setLoadingModel(true);
     try {
@@ -914,7 +964,8 @@ export default function App() {
       await refreshModels();
       const status = await inferenceStatus();
       setInf(status);
-      if (!force) notify('success', kind === 'load' ? `${id} is ready.` : 'Inference started.');
+      const name = models.find((model) => model.id === id)?.name ?? id;
+      if (!force) notify('success', kind === 'load' ? `${name} is loaded and ready.` : 'Inference started.');
       if (status.runtime_notice) notify('info', status.runtime_notice);
     } catch (e: any) {
       if (e?.status === 409 && !force) {
@@ -933,7 +984,7 @@ export default function App() {
       await unloadModels();
       await refreshModels();
       setInf(await inferenceStatus());
-      notify('info', 'Model unloaded.');
+      notify('info', 'Model ejected. GPU memory is free again.');
     } catch (e: any) {
       notify('error', e?.message ?? 'Could not unload the model.');
     } finally {
@@ -949,6 +1000,58 @@ export default function App() {
     } catch { /* loading below reports the useful error */ }
     setLoadingModel(false);
     await guardedSwitch('load', modelId, false);
+  }
+
+  // Loading, switching and ejecting interrupt whatever the model is doing for
+  // you. Starting a model when none is running is safe in one click; anything
+  // that replaces or removes a running model asks first.
+  function runningModel() {
+    return inf?.running ? models.find((model) => model.loaded) : undefined;
+  }
+
+  function requestLoad(id: string) {
+    const current = runningModel();
+    const target = models.find((model) => model.id === id);
+    if (current?.id === id) return;
+    if (current) {
+      setConfirmState({
+        title: `Switch to ${target?.name ?? id}?`,
+        body: `${current.name} will be unloaded first, so it stops answering while ${target?.name ?? 'the new model'} loads. Your conversations stay as they are; the next reply rebuilds its context with the new model.`,
+        action: 'Switch model',
+        icon: 'refresh',
+        onConfirm: () => { setModelId(id); void guardedSwitch('load', id, false); },
+      });
+      return;
+    }
+    setModelId(id);
+    void guardedSwitch('load', id, false);
+  }
+
+  function chooseModel(id: string) {
+    if (runningModel()) requestLoad(id);
+    else setModelId(id);
+  }
+
+  function requestEject() {
+    const current = runningModel();
+    setConfirmState({
+      title: `Eject ${current?.name ?? 'the model'}?`,
+      body: 'This frees its memory. The model has to load again before it can answer your next message.',
+      action: 'Eject model',
+      icon: 'eject',
+      onConfirm: () => void unloadSelectedModel(),
+    });
+  }
+
+  function requestReload() {
+    const current = runningModel();
+    setConfirmState({
+      title: `Reload ${current?.name ?? 'the model'}?`,
+      body: 'It is unavailable for a moment while it loads again. Use this if replies have become stuck or settings changed.',
+      action: 'Reload model',
+      icon: 'refresh',
+      onConfirm: () => void reloadSelectedModel(),
+    });
   }
 
   async function guardWait() {
@@ -984,166 +1087,281 @@ export default function App() {
     }
   }
 
-  const MODE_ITEMS = [
-    { id: 'chat', label: 'Chat', icon: 'chat' },
-    { id: 'code', label: 'Code', icon: 'code' },
-  ] as const;
-  const statusBadge = loadingModel
-    ? { tone: 'info' as const, label: 'Loading' }
-    : guard
-      ? { tone: 'warn' as const, label: 'Switching' }
-      : inf?.running
-          ? { tone: 'ok' as const, label: 'Ready' }
-          : backendUp === false
-            ? { tone: 'err' as const, label: 'Error' }
-            : { tone: 'neutral' as const, label: 'Standby' };
-  const pinnedConvs = pinnedIds.map((id) => convs.find((c) => c.id === id)).filter((c) => c != null);
+  function stopAgentRuns() {
+    void agentRuns().then(async (runs) => {
+      await Promise.all(runs.filter((run) => run.conversation_id === convId && !['COMPLETED', 'FAILED', 'CANCELLED'].includes(run.state)).map((run) => stopAgent(run.id)));
+      if (conversationRef.current === convId) refreshAgentActivity.current();
+      if (convId) void reloadMsgs(convId);
+    }).catch((error) => notify('error', error.message));
+  }
+
+  function stopGeneration() {
+    abort.current?.abort();
+    void stopChat()
+      .then((o) => {
+        if (o.stopped) notify('info', `Stopped — partial reply kept (${o.chars_kept} characters).`);
+      })
+      .catch(() => { /* fetch abort still applies */ });
+  }
+
+  const modeConvs = convs.filter((c) => (c.mode || 'chat') === mode);
+  const pinnedConvs = modeConvs.filter((c) => pinnedIds.includes(c.id));
+  const filterText = sessionFilter.trim().toLowerCase();
+  const listConvs = modeConvs.filter((c) => !pinnedIds.includes(c.id) && (!filterText || c.title.toLowerCase().includes(filterText)));
   const visibleWork = visibleWorkActivity(convId, busy, chatActivity, agentBusy, agentActivity);
+  const selectedModel = models.find((model) => model.id === modelId);
+  const loadedMeta = models.find((model) => model.loaded && inf?.running);
+  const modelReady = !!inf?.running && loadedModel === modelId && !!modelId;
+  const headWorkspace = workspaces.find((workspace) => workspace.id === (activeConv?.workspace ?? wsId));
+  const branch = useWorkspaceBranch(mode === 'code' ? headWorkspace?.id : undefined);
+  const rail = collapsed && !narrow;
+  const anySessionLive = sessions.some((s) => s.id !== convId && (s.activity === 'thinking' || s.activity === 'tool'));
+  const anySessionWaiting = sessions.some((s) => s.id !== convId && s.activity === 'waiting');
+  const machineActivity: MachineActivity = busy ? 'generating'
+    : agentBusy ? (agentPhase === 'WAITING_PERMISSION' || !inf?.running ? 'waiting' : 'agent')
+      : anySessionWaiting ? 'waiting'
+        : anySessionLive ? 'agent'
+          : 'idle';
+  const machine = machineState(backendUp, loadingModel, machineActivity, !!loadedMeta);
+  const lastReplyTps = useMemo(() => {
+    const last = [...msgs].reverse().find((message) => message.role === 'assistant' && perfMap[message.id]?.tps != null);
+    return last ? perfMap[last.id].tps : null;
+  }, [msgs, perfMap]);
+  const lastAssistantId = [...msgs].reverse().find((message) => message.role === 'assistant')?.id;
+  const currentPriority = sessions.find((sn) => sn.id === convId)?.priority ?? 'normal';
+  const modelName = (id?: string) => id ? models.find((model) => model.id === id)?.name ?? id : undefined;
+
+  const paletteActions: QuickAction[] = [
+    { id: 'new', group: 'Actions', icon: 'plus', label: mode === 'code' ? 'New task' : 'New chat', detail: mode === 'code' ? 'Start a code session in the current project' : 'Start a fresh conversation', run: () => void newChat() },
+    { id: 'project', group: 'Actions', icon: 'folderPlus', label: 'Open a project', detail: 'Choose the files your coding agent can access', run: () => setProjectLauncherOpen(true) },
+    { id: 'panel', group: 'Actions', icon: 'panelRight', label: rightOpen ? 'Hide inspector' : 'Show inspector', detail: 'Activity, files and context beside the conversation', run: () => { setTab('chat'); setRightOpen((open) => !open); } },
+    ...(selectedModel && !modelReady ? [{ id: 'load-model', group: 'Actions', icon: 'power' as IconName, label: `Load ${selectedModel.name}`, detail: 'Move the selected model into memory', run: () => requestLoad(selectedModel.id) }] : []),
+    ...(loadedMeta ? [{ id: 'eject-model', group: 'Actions', icon: 'eject' as IconName, label: `Eject ${loadedMeta.name}`, detail: 'Unload the model and free GPU memory', run: () => requestEject() }] : []),
+    ...(['dark', 'light', 'system'] as Theme[]).filter((value) => value !== theme).map((value) => ({ id: `theme-${value}`, group: 'Actions', icon: (value === 'dark' ? 'moon' : value === 'light' ? 'sun' : 'monitor') as IconName, label: value === 'system' ? 'Match system theme' : `Use ${value} theme`, detail: `Current theme: ${theme}`, run: () => setTheme(value) })),
+    { id: 'mode-chat', group: 'Go to', icon: 'chat', label: 'Chat', detail: 'Conversations', run: () => switchMode('chat') },
+    { id: 'mode-code', group: 'Go to', icon: 'code', label: 'Code', detail: 'Project sessions', run: () => switchMode('code') },
+    ...WORKBENCH_DESTINATIONS.map(({ id, label }) => ({ id, group: 'Go to', icon: PAGE_META[id].icon, label, detail: PAGE_META[id].description, run: () => { setTab(id); setMobileNav(false); } })),
+    ...convs.map((conversation) => ({ id: conversation.id, group: 'Sessions', icon: (conversation.mode === 'code' ? 'code' : 'chat') as IconName, label: conversation.title || 'Untitled', detail: conversation.mode === 'code' ? `Code session${workspaces.find((w) => w.id === conversation.workspace) ? ` · ${workspaces.find((w) => w.id === conversation.workspace)!.name}` : ''}` : 'Conversation', run: () => void selectConv(conversation.id) })),
+  ];
+
+  const renderRow = (c: Conversation) => {
+    const sess = sessions.find((sn) => sn.id === c.id);
+    const isActive = convId === c.id;
+    const waiting = sess?.activity === 'waiting' || (isActive && agentBusy && agentPhase === 'WAITING_PERMISSION');
+    const live = !waiting && ((sess?.activity === 'thinking' || sess?.activity === 'tool') || (isActive && (busy || agentBusy)));
+    const stale = !recoveryOff && !!recovery?.stale.some((item) => item.id === c.id);
+    if (renaming?.id === c.id && renaming.where === 'list') {
+      return (
+        <div key={c.id} className="sb-row">
+          <input
+            className="sb-rename"
+            autoFocus
+            value={renaming.draft}
+            onChange={(e) => setRenaming({ id: c.id, draft: e.target.value, where: 'list' })}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') void doRename(c.id, renaming.draft);
+              if (e.key === 'Escape') setRenaming(null);
+            }}
+            onBlur={() => setRenaming(null)}
+            aria-label="Rename session"
+          />
+        </div>
+      );
+    }
+    const status = live ? 'Working' : waiting ? 'Waiting for approval' : sess?.activity === 'error' ? 'Error' : stale ? 'Interrupted' : '';
+    return (
+      <div key={c.id} className={`sb-row${isActive ? ' active' : ''}`}>
+        <button type="button" className="sb-row-main" onClick={() => void selectConv(c.id)} title={status ? `${c.title} · ${status}` : c.title} aria-current={isActive ? 'true' : undefined}>
+          <span className="sb-row-status" aria-hidden="true">
+            {live ? <Lamp state="live" pulse /> : waiting || stale ? <Lamp state="caution" /> : sess?.activity === 'error' ? <Lamp state="error" /> : null}
+          </span>
+          <span className="sb-row-title">{c.title || 'Untitled'}</span>
+          {status && <span className="sr-only">, {status}</span>}
+        </button>
+        <SessionMenu
+          pinned={pinnedIds.includes(c.id)}
+          onRename={() => setRenaming({ id: c.id, draft: c.title || '', where: 'list' })}
+          onDuplicate={() => { void selectConv(c.id); setTimeout(() => void doFork(c.id), 50); }}
+          onTogglePin={() => togglePin(c.id)}
+          onExport={() => void doExport(c.id)}
+          onClose={() => doDelete(c.id)}
+        />
+      </div>
+    );
+  };
+
+  const workLabel = visibleWork?.kind === 'agent'
+    ? agentPhase === 'ROUTING' ? 'Understanding your request…' : !inf?.running ? 'Model stopped · this run needs attention' : agentPhase === 'WAITING_PERMISSION' ? 'Waiting for your approval' : agentPhase === 'EXECUTING_TOOL' ? 'Working through the project…' : agentPhase === 'OBSERVING' ? 'Reviewing the results…' : 'Planning the next step…'
+    : statusLine || (generationPhase === 'thinking' ? `${loadedMeta?.name ?? 'The model'} is thinking…` : generationPhase === 'responding' ? `${loadedMeta?.name ?? 'The model'} is writing…` : 'Processing your request…');
+
+  const receipt: { text: string; warn?: boolean; icon?: IconName }[] = [];
+  if (search) receipt.push({ text: 'Web search is on for your next message — queries leave this PC', warn: true, icon: 'globe' });
+  if (usage && !visibleWork) {
+    receipt.push({ text: `Last reply · ${usage.prompt_tokens.toLocaleString()} in / ${usage.generated_tokens.toLocaleString()} out` });
+    if (usage.stopped) receipt.push({ text: 'Stopped early · partial reply kept', warn: true });
+    if (usage.reasoning && usage.reasoning !== 'off') receipt.push({ text: `Reasoned (${usage.reasoning})`, icon: 'sparkle' });
+    if (usage.sources) receipt.push({ text: `${usage.sources} source${usage.sources === 1 ? '' : 's'}`, icon: 'globe' });
+    if (usage.vision === 'unsupported') receipt.push({ text: 'Images skipped — this model has no vision', warn: true, icon: 'image' });
+    if (usage.tool_rounds) receipt.push({ text: `Read ${usage.tool_rounds} file${usage.tool_rounds === 1 ? '' : 's'}`, icon: 'eye' });
+  }
 
   return (
-    <div className={`shell${collapsed ? ' rail' : ''}${rightOpen && tab === 'chat' ? '' : ' no-right'}${mobileNav ? ' mobile-nav' : ''}`}>
-      {paletteOpen && <CommandPalette onClose={() => setPaletteOpen(false)} actions={[
-        {id:'new', label: mode === 'code' ? 'New code session' : 'New conversation', detail:'Start fresh', run: () => void newChat()},
-        ...WORKBENCH_DESTINATIONS.map(({id, label}) => ({id, label, detail:'Open workspace view', run: () => setTab(id)})),
-        {id:'project',label:'Open a project',detail:'Choose the files your coding agent can access',run: () => setProjectLauncherOpen(true)},
-        {id:'panel',label:'Toggle split view',detail:'Activity, files and context alongside your conversation',run: () => setRightOpen((open) => !open)},
-        ...convs.map((conversation) => ({id:conversation.id,label:conversation.title,detail:conversation.mode === 'code' ? 'Code session' : 'Conversation',run: () => void selectConv(conversation.id)})),
-      ]} />}
-      {mobileNav && <button className="nav-scrim" aria-label="Close navigation" onClick={() => setMobileNav(false)} />}
+    <div className={`shell${rail ? ' rail' : ''}${rightOpen && tab === 'chat' ? '' : ' no-right'}${mobileNav ? ' mobile-nav' : ''}`}>
+      {paletteOpen && <CommandPalette onClose={() => setPaletteOpen(false)} actions={paletteActions} />}
+      {mobileNav && <button type="button" className="nav-scrim" aria-label="Close navigation" onClick={() => setMobileNav(false)} />}
       <a href="#composer" className="skip-link" onClick={(e) => { e.preventDefault(); composerRef.current?.focus(); }}>
         Skip to composer
       </a>
+
       <aside className="sidebar" aria-label="Navigation">
-        <div className="brandline">
-          <strong className="brand rail-hide">
-            <i className="brand-signal" aria-hidden="true" />
-            <span className="brand-copy">Companion<small>Local runtime</small></span>
-          </strong>
-          <Tooltip tip={mode === 'code' ? 'New code chat' : 'New chat'}>
-            <Button variant="ghost" size="sm" className="rail-only" style={{ display: 'none' }} onClick={() => void newChat()} aria-label={mode === 'code' ? 'New code chat' : 'New chat'}>
-              +
-            </Button>
-          </Tooltip>
-          <span style={{ flex: 1 }} />
-          <Tooltip tip={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}>
-            <button className="ctx-toggle sidebar-collapse" onClick={() => {
-              if (window.matchMedia('(max-width: 850px)').matches) setMobileNav(false);
-              else setCollapsed((v) => !v);
-            }} aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}>
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                <path d={collapsed ? 'm9 6 6 6-6 6' : 'm15 6-6 6 6 6'} />
-                <path d={collapsed ? 'M4 5v14' : 'M20 5v14'} opacity=".45" />
-              </svg>
-            </button>
-          </Tooltip>
-        </div>
-        <div className="rail-hide">
-          <Button variant="primary" className="new-session" onClick={() => void newChat()}><span aria-hidden="true">+</span> New {mode === 'code' ? 'task' : 'chat'}</Button>
-          <button className="quick-search" onClick={() => setPaletteOpen(true)}><span>Find anything</span><kbd>{paletteShortcut.replace(/\+/g, ' ')}</kbd></button>
-        </div>
-        {mode === 'code' && (
-          <div className="workspace-switcher rail-hide">
-            <div className="sidebar-section-label">Project</div>
-            <select aria-label="Active project" disabled={busy || agentBusy} value={workspaces.some((workspace) => workspace.id === wsId) ? wsId : ''} onChange={(e) => void changeWorkspace(e.target.value)} style={{ width: '100%', marginTop: 4 }}>
-              <option value="">— select project —</option>
-              {workspaces.map((w) => (
-                <option key={w.id} value={w.id}>{w.name}</option>
-              ))}
-            </select>
-            <button className="open-project" onClick={() => setProjectLauncherOpen(true)}>Open or create project…</button>
+        <div className="sb-top">
+          <div className="sb-brand">
+            {rail ? (
+              <span className="tally-mark" aria-hidden="true"><Lamp state={machine.state} pulse={machine.state === 'live'} /></span>
+            ) : (
+              <div className="sb-wordmark">
+                <span className="tally-mark" aria-hidden="true"><Lamp state={machine.state} pulse={machine.state === 'live'} /></span>
+                <strong>Companion</strong>
+              </div>
+            )}
+            <IconButton
+              icon="panelLeft"
+              label={narrow ? 'Close navigation' : collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+              tipSide={rail ? 'right' : 'bottom-end'}
+              onClick={() => { if (narrow) setMobileNav(false); else setCollapsed((v) => !v); }}
+            />
           </div>
-        )}
-        <div className="sidebar-section-label rail-hide">Work</div>
-        <nav aria-label="Primary" className="primary-nav">
-          {MODE_ITEMS.map((t) => (
-            <Tooltip key={t.id} tip={t.label}>
-              <button
-                className={mode === t.id && tab === 'chat' ? 'active' : ''}
-                aria-label={t.label}
-                onClick={() => switchMode(t.id)}
-                aria-current={mode === t.id && tab === 'chat' ? 'page' : undefined}
-                style={collapsed ? { textAlign: 'center' } : undefined}
-              >
-                <span className="nav-glyph"><AppIcon name={t.icon} /></span>
-                <span className="rail-hide">{t.label}</span>
+          {rail ? (
+            <>
+              <IconButton icon="plus" label={mode === 'code' ? 'New task' : 'New chat'} tipSide="right" onClick={() => void newChat()} />
+              <IconButton icon="search" label="Search" tipSide="right" onClick={() => setPaletteOpen(true)} />
+              <div className="sb-modes-rail" role="group" aria-label="Work mode">
+                <IconButton icon="chat" label="Chat" pressed={mode === 'chat' && tab === 'chat'} tipSide="right" onClick={() => switchMode('chat')} />
+                <IconButton icon="code" label="Code" pressed={mode === 'code' && tab === 'chat'} tipSide="right" onClick={() => switchMode('code')} />
+              </div>
+            </>
+          ) : (
+            <>
+              <Button className="sb-new" icon="plus" onClick={() => void newChat()}>New {mode === 'code' ? 'task' : 'chat'}</Button>
+              <button type="button" className="sb-search" onClick={() => setPaletteOpen(true)}>
+                <Icon name="search" size={15} />
+                <span>Search</span>
+                <Kbd>{shortcutLabel(paletteShortcut)}</Kbd>
               </button>
-            </Tooltip>
+              <div className="sb-modes" role="tablist" aria-label="Work mode">
+                <button type="button" role="tab" aria-selected={mode === 'chat'} onClick={() => switchMode('chat')} title="Chat (Ctrl 1)"><Icon name="chat" size={15} />Chat</button>
+                <button type="button" role="tab" aria-selected={mode === 'code'} onClick={() => switchMode('code')} title="Code (Ctrl 2)"><Icon name="code" size={15} />Code</button>
+              </div>
+              {mode === 'code' && (
+                <div className="project-switch">
+                  <button
+                    type="button"
+                    className={`project-switch-btn${workspaces.some((workspace) => workspace.id === wsId) ? '' : ' empty'}`}
+                    aria-haspopup="menu"
+                    aria-expanded={projectMenuOpen}
+                    aria-label="Active project"
+                    disabled={busy || agentBusy}
+                    onClick={() => setProjectMenuOpen((open) => !open)}
+                  >
+                    <Icon name="folder" size={16} />
+                    <span className="project-switch-copy">
+                      <strong>{workspaces.find((workspace) => workspace.id === wsId)?.name ?? 'Choose a project'}</strong>
+                      {workspaces.find((workspace) => workspace.id === wsId) && <small>{workspaces.find((workspace) => workspace.id === wsId)!.path}</small>}
+                    </span>
+                    <Icon name="chevronsUpDown" size={14} />
+                  </button>
+                  <Popover open={projectMenuOpen} onClose={() => setProjectMenuOpen(false)} label="Projects" side="bottom" align="start">
+                    {workspaces.length > 0 && <PopLabel>Projects</PopLabel>}
+                    {workspaces.map((workspace) => (
+                      <PopItem key={workspace.id} checked={workspace.id === wsId} onClick={() => { setProjectMenuOpen(false); void changeWorkspace(workspace.id); }}>
+                        {workspace.name}
+                      </PopItem>
+                    ))}
+                    {workspaces.length > 0 && <PopDivider />}
+                    <PopItem icon="folderPlus" onClick={() => { setProjectMenuOpen(false); setProjectLauncherOpen(true); }}>Open or create a project…</PopItem>
+                  </Popover>
+                </div>
+              )}
+              {recovery && !recoveryOff && (
+                <RecoveryBanner
+                  recovery={recovery}
+                  onResume={(id) => {
+                    refreshConvs(id);
+                    setTab('chat');
+                    notify('info', 'Session restored. The loaded model will rebuild context when you send a message.');
+                  }}
+                  onDiscard={(id) => discardStale(id, loadedModel).then(() => {
+                    notify('info', 'Interrupted marker cleared.');
+                    getRecovery().then(setRecovery).catch(() => {});
+                    refreshConvs();
+                  }).catch((e) => notify('error', e.message))}
+                  onDismiss={() => setRecoveryOff(true)}
+                />
+              )}
+            </>
+          )}
+        </div>
+
+        {rail ? <div className="sb-rail-spacer" /> : (
+          <nav className="sb-list" aria-label={mode === 'code' ? 'Code sessions' : 'Conversations'}>
+            {pinnedConvs.length > 0 && (
+              <>
+                <div className="sb-group-label"><span className="eyebrow">Pinned</span></div>
+                {pinnedConvs.map(renderRow)}
+              </>
+            )}
+            <div className="sb-group-label"><span className="eyebrow">{mode === 'code' ? 'Tasks' : 'Chats'}</span>{modeConvs.length > 0 && <span className="readout muted" style={{ fontSize: 11.5 }}>{modeConvs.length}</span>}</div>
+            {(modeConvs.length > 8 || sessionFilter) && (
+              <div className="sb-filter">
+                <Icon name="search" size={13} />
+                <input aria-label="Filter sessions" placeholder="Filter" value={sessionFilter} onChange={(event) => setSessionFilter(event.target.value)} />
+              </div>
+            )}
+            {listConvs.map(renderRow)}
+            {modeConvs.length === 0 && <p className="sb-empty">{mode === 'code' ? 'No tasks yet. Start one to work in a project.' : 'No conversations yet. Start one above.'}</p>}
+            {modeConvs.length > 0 && listConvs.length === 0 && filterText && <p className="sb-empty">Nothing matches “{sessionFilter}”.</p>}
+          </nav>
+        )}
+
+        <nav className="sb-utility" aria-label="Manage Companion">
+          {WORKBENCH_DESTINATIONS.map(({ id, label }) => (
+            <button
+              type="button"
+              key={id}
+              className="sb-link"
+              aria-label={label}
+              aria-current={tab === id ? 'page' : undefined}
+              data-tip={rail ? label : undefined}
+              data-tip-side={rail ? 'right' : undefined}
+              onClick={() => { setTab(id); setMobileNav(false); }}
+            >
+              <Icon name={PAGE_META[id].icon} size={16} />
+              {!rail && <span>{label}</span>}
+            </button>
           ))}
         </nav>
-        {pinnedConvs.length > 0 && (
-          <div className="rail-hide">
-            <div className="sidebar-section-label">Pinned</div>
-            <nav className="convlist" aria-label="Pinned sessions">
-              {pinnedConvs.map((c) => (
-                <div key={c!.id} className={`convrow${convId === c!.id ? ' active' : ''}`}>
-                  <button className="convbtn" onClick={() => void selectConv(c!.id)} title={c!.title}>
-                    📌 {(c!.title || 'Untitled').slice(0, 24)}
-                  </button>
-                  <button className="ctx-toggle" onClick={() => togglePin(c!.id)} aria-label={`Unpin ${c!.title}`} title="Unpin">
-                    ×
-                  </button>
-                </div>
-              ))}
-            </nav>
-          </div>
-        )}
-        <div className="sidebar-section-label rail-hide">
-          {mode === 'code' ? 'Code sessions' : 'Conversations'}
-        </div>
-        <input className="session-filter rail-hide" aria-label="Filter sessions" placeholder="Filter sessions…" value={sessionFilter} onChange={(event) => setSessionFilter(event.target.value)} />
-        <nav className="convlist" aria-label={mode === 'code' ? 'Code sessions' : 'Conversations'}>
-          {visibleConvs.map((c) => {
-            const sess = sessions.find((sn) => sn.id === c.id);
-            const dot = sess?.residency === 'active' ? '● ' : sess?.residency === 'warm' ? '◐ ' : '';
-            const act = activityLabel(sess?.activity);
-            if (renaming?.id === c.id) {
-              return (
-                <div key={c.id} className="convrow">
-                  <input
-                    className="rename-input"
-                    autoFocus
-                    value={renaming.draft}
-                    onChange={(e) => setRenaming({ id: c.id, draft: e.target.value })}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') void doRename(c.id, renaming.draft);
-                      if (e.key === 'Escape') setRenaming(null);
-                    }}
-                    onBlur={() => setRenaming(null)}
-                    aria-label="Rename session"
-                  />
-                </div>
-              );
-            }
-            return (
-              <div key={c.id} className={`convrow${convId === c.id ? ' active' : ''}`}>
-                <button
-                  className={`convbtn${collapsed ? ' rail-hide' : ''}`}
-                  onClick={() => void selectConv(c.id)}
-                  title={sess ? `${act} · residency: ${sess.residency} · priority: ${sess.priority ?? 'normal'}` : ''}
-                >
-                  {dot}{c.title || 'Untitled'}
-                </button>
-                <SessionMenu
-                  pinned={pinnedIds.includes(c.id)}
-                  onRename={() => setRenaming({ id: c.id, draft: c.title || '' })}
-                  onDuplicate={() => { void selectConv(c.id); setTimeout(() => void doFork(c.id), 50); }}
-                  onTogglePin={() => togglePin(c.id)}
-                  onExport={() => void doExport(c.id)}
-                  onClose={() => void doDelete(c.id)}
-                />
-              </div>
-            );
-          })}
-          {visibleConvs.length === 0 && <div className="rail-hide" style={{ fontSize: 12, color: 'var(--text-muted)' }}>None yet — start one above.</div>}
-        </nav>
-        <nav className="utility-nav" aria-label="Manage Companion">
-          {WORKBENCH_DESTINATIONS.map(({id, label}) => <button key={id} className={tab === id ? 'active' : ''} title={label} aria-label={label} aria-current={tab === id ? 'page' : undefined} onClick={() => { setTab(id); setMobileNav(false); }}><span className="nav-glyph"><AppIcon name={id}/></span><span className="rail-hide">{label}</span></button>)}
-        </nav>
-        <div className="sidebar-footer rail-hide">
-          <span className={backendUp === false ? 'offline' : ''} />
-          {backendUp === false ? 'Runtime offline' : 'Private on this PC'}
-        </div>
+
+        <Rig
+          models={models}
+          modelId={modelId}
+          inf={inf}
+          backendUp={backendUp}
+          loadingModel={loadingModel}
+          activity={machineActivity}
+          liveTps={liveTps}
+          lastTps={lastReplyTps}
+          phaseLabel={busy ? (generationPhase === 'thinking' ? 'Thinking…' : generationPhase === 'responding' ? 'Writing…' : 'Reading your message…') : agentBusy ? 'Agent working…' : undefined}
+          collapsed={rail}
+          onSelect={chooseModel}
+          onLoad={requestLoad}
+          onUnload={requestEject}
+          onReload={requestReload}
+          onOpenModels={() => { setTab('models'); setMobileNav(false); }}
+          onOpenResources={() => { setTab('resources'); setMobileNav(false); }}
+          notify={(kind, text) => notify(kind, text)}
+        />
       </aside>
+
       {projectLauncherOpen && (
         <ProjectLauncher
           recent={workspaces}
@@ -1156,487 +1374,402 @@ export default function App() {
           notify={notify}
         />
       )}
-      <div className="center">
-        <div className="topbar">
-          <button className="mobile-menu" onClick={() => setMobileNav((v) => !v)} aria-label="Open navigation" aria-expanded={mobileNav}>☰</button>
-          <div className="topbar-title">
-            <strong>{tab !== 'chat' ? ({models:'Model library',resources:'Resources',system:'Runtime & diagnostics',tools:'Tools & plugins',settings:'Settings'})[tab] : activeConv?.title || (mode === 'code' ? 'Code workspace' : 'New conversation')}</strong>
-            <span>{tab !== 'chat' ? 'Your local environment' : mode === 'code' ? `Code / ${workspaces.find((workspace) => workspace.id === (activeConv?.workspace ?? wsId))?.name ?? 'choose a project'}` : 'Chat / Local inference'}</span>
+
+      <div className="center" ref={centerRef}>
+        <Toasts toasts={toasts} dismiss={dismissToast} />
+        <header className="head">
+          <div className="head-mobile">
+            <IconButton icon="menu" label="Open navigation" tip={false} aria-expanded={mobileNav} onClick={() => setMobileNav((v) => !v)} />
+            <Lamp state={machine.state} pulse={machine.state === 'live'} />
           </div>
-          <div className="topbar-model">
-          <ModelSelect
-            models={models}
-            modelId={modelId}
-            running={!!inf?.running}
-            busy={loadingModel}
-            onSelect={setModelId}
-            onLoad={() => void guardedSwitch('load', modelId, false)}
-            onUnload={() => void unloadSelectedModel()}
-            onReload={() => void reloadSelectedModel()}
-          />
-          <Badge tone={statusBadge.tone} title={inf?.model ? `Model: ${inf.model}` : 'Inference state'}>{statusBadge.label}</Badge>
+          <div className="head-title">
+            {tab !== 'chat' ? (
+              <h1>{PAGE_META[tab].title}</h1>
+            ) : renaming?.where === 'head' && renaming.id === convId ? (
+              <input
+                className="head-rename"
+                autoFocus
+                value={renaming.draft}
+                aria-label="Rename session"
+                onChange={(e) => setRenaming({ id: renaming.id, draft: e.target.value, where: 'head' })}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') void doRename(renaming.id, renaming.draft);
+                  if (e.key === 'Escape') setRenaming(null);
+                }}
+                onBlur={() => void doRename(renaming.id, renaming.draft)}
+              />
+            ) : (
+              <h1>
+                {activeConv
+                  ? <button type="button" onClick={() => setRenaming({ id: activeConv.id, draft: activeConv.title || '', where: 'head' })} title="Rename">{activeConv.title || 'Untitled'}</button>
+                  : mode === 'code' ? 'New task' : 'New chat'}
+              </h1>
+            )}
+            <div className="head-sub">
+              {tab !== 'chat' ? (
+                <span>{PAGE_META[tab].description}</span>
+              ) : mode === 'code' ? (
+                headWorkspace ? (
+                  <>
+                    <Icon name="folder" size={13} />
+                    <span>{headWorkspace.name}</span>
+                    <span className="head-path"><span className="sep" aria-hidden="true" /><span className="path" title={headWorkspace.path}>{headWorkspace.path}</span></span>
+                    {branch && <><span className="sep" aria-hidden="true" /><Icon name="branch" size={13} /><span>{branch}</span></>}
+                  </>
+                ) : <span>No project selected</span>
+              ) : (
+                <>
+                  <Icon name="lock" size={12} />
+                  <span>{msgs.length ? `${msgs.length} message${msgs.length === 1 ? '' : 's'} · stays on this PC` : 'Stays on this PC'}</span>
+                </>
+              )}
+            </div>
           </div>
-          <div className="topbar-actions">
-          {pill && <span className="respill">{pill}</span>}
-          <span style={{ position: 'relative' }}>
-            <Tooltip tip="Session actions">
-              <button onClick={() => setSessionMenuOpen((v) => !v)} aria-haspopup="menu" aria-expanded={sessionMenuOpen} aria-label="Session actions">
-                ⋯
-              </button>
-            </Tooltip>
-            <Popover open={sessionMenuOpen} onClose={() => setSessionMenuOpen(false)} label="Session actions">
-              <PopItem onClick={() => { setSessionMenuOpen(false); doClear(); }}>Clear session</PopItem>
-              <PopItem onClick={() => { setSessionMenuOpen(false); void doCompact(); }}>Compact context</PopItem>
-              <PopItem onClick={() => { setSessionMenuOpen(false); void doFork(); }}>Fork</PopItem>
-              <PopItem onClick={() => { setSessionMenuOpen(false); setShowShare(true); }}>Share…</PopItem>
-              <PopItem onClick={() => { setSessionMenuOpen(false); void doExport(); }}>Export</PopItem>
-              <PopItem onClick={() => {
-                setSessionMenuOpen(false);
-                if (convId) setRenaming({ id: convId, draft: activeConv?.title ?? '' });
-              }}>
-                Rename
-              </PopItem>
-              <PopItem onClick={() => { setSessionMenuOpen(false); setPermOpen(true); }}>Permissions…</PopItem>
-            </Popover>
-          </span>
-          <Tooltip tip={`Theme: ${theme} (click to change)`}>
-            <button onClick={() => setTheme(theme === 'dark' ? 'light' : theme === 'light' ? 'system' : 'dark')} aria-label={`Theme: ${theme}. Activate to change.`}>
-              {theme === 'dark' ? '☾' : theme === 'light' ? '☀' : '◐'}
-            </button>
-          </Tooltip>
-          <Tooltip tip={rightOpen ? 'Close session panel' : mode === 'code' ? 'Open session activity' : 'Open session context'}>
-            <button onClick={() => setRightOpen((v) => !v)} aria-label={rightOpen ? 'Close session panel' : 'Open session panel'} aria-expanded={rightOpen}>
-              ◫
-            </button>
-          </Tooltip>
-          </div>
-        </div>
+          {tab === 'chat' && (
+            <div className="head-actions">
+              {mode === 'code' && activeConv?.workspace && (
+                <>
+                  <ProjectActions
+                    busy={busy || agentBusy}
+                    onChanges={() => setDiffWs(activeConv.workspace!)}
+                    onCommand={(command) => { if (command === '/run ') { setInput(command); composerRef.current?.focus(); } else void send(command); }}
+                  />
+                  <span className="head-divider" aria-hidden="true" />
+                </>
+              )}
+              <span className="pop-anchor">
+                <IconButton icon="more" label="Session actions" tipSide="bottom-end" aria-haspopup="menu" aria-expanded={sessionMenuOpen} disabled={!convId} onClick={() => setSessionMenuOpen((v) => !v)} />
+                <Popover open={sessionMenuOpen} onClose={() => setSessionMenuOpen(false)} label="Session actions" side="bottom" align="end">
+                  <PopItem icon="pencil" onClick={() => { setSessionMenuOpen(false); if (convId) setRenaming({ id: convId, draft: activeConv?.title ?? '', where: 'head' }); }}>Rename</PopItem>
+                  <PopItem icon="fork" onClick={() => { setSessionMenuOpen(false); void doFork(); }}>Duplicate</PopItem>
+                  <PopItem icon="share" onClick={() => { setSessionMenuOpen(false); setShowShare(true); }}>Share context…</PopItem>
+                  <PopItem icon="download" onClick={() => { setSessionMenuOpen(false); void doExport(); }}>Export</PopItem>
+                  <PopDivider />
+                  <PopItem icon="layers" disabled={compacting} onClick={() => { setSessionMenuOpen(false); void doCompact(); }}>Compact context</PopItem>
+                  <PopItem icon="refresh" onClick={() => { setSessionMenuOpen(false); doClear(); }}>Clear session</PopItem>
+                  <PopItem icon="shield" onClick={() => { setSessionMenuOpen(false); setPermOpen(true); }}>Permissions…</PopItem>
+                  <PopDivider />
+                  <PopLabel>Scheduling priority</PopLabel>
+                  {PRIORITIES.map((priority) => (
+                    <PopItem key={priority.id} checked={currentPriority === priority.id} onClick={() => { setSessionMenuOpen(false); void setPriority(priority.id); }}>{priority.label}</PopItem>
+                  ))}
+                  <PopDivider />
+                  <PopItem icon="trash" danger onClick={() => { setSessionMenuOpen(false); if (convId) doDelete(convId); }}>Delete…</PopItem>
+                </Popover>
+              </span>
+              <IconButton icon="panelRight" label={rightOpen ? 'Hide inspector' : 'Show inspector'} pressed={rightOpen} tipSide="bottom-end" onClick={() => setRightOpen((v) => !v)} />
+            </div>
+          )}
+        </header>
+
+        {backendUp === false && (
+          <Notice tone="error" className="global-notice" title="The local runtime isn’t responding">
+            Close this window and start Companion again with <code>.\run.ps1</code>. Your conversations are safe on disk.
+          </Notice>
+        )}
+
         {permOpen && (
           <PermissionsModal
             onClose={() => setPermOpen(false)}
             onOpenSettings={() => setTab('settings')}
           />
         )}
-        <Toasts toasts={toasts} dismiss={(id) => setToasts((p) => p.filter((t) => t.id !== id))} />
-
-        {backendUp === false && (
-          <div className="card" role="alert" style={{ margin: '8px 16px 0', borderColor: 'var(--error)' }}>
-            <strong>Local runtime unavailable.</strong>{' '}
-            <span style={{ fontSize: 13 }}>
-              Close this window and start Companion again with <code>.\run.ps1</code>.
-            </span>
-          </div>
-        )}
-
-        {recovery && !recoveryOff && (
-          <RecoveryBanner
-            recovery={recovery}
-            onResume={(id) => {
-              refreshConvs(id);
-              setTab('chat');
-              notify('info', 'Session restored. The loaded model will rebuild context when you send a message.');
-            }}
-            onDiscard={(id) => discardStale(id, loadedModel).then(() => {
-              notify('info', 'Stale marker cleared.');
-              getRecovery().then(setRecovery).catch(() => {});
-              refreshConvs();
-            }).catch((e) => notify('error', e.message))}
-            onDismiss={() => setRecoveryOff(true)}
-          />
-        )}
-
-        <LoadProgress active={loadingModel} notify={notify} />
-
-        {guard && (
-          <div className="card" role="alertdialog" aria-label="Model switch requested" style={{ borderColor: 'var(--warning)', margin: '8px 16px 0' }}>
-            <div><strong>Model switch requested</strong></div>
-            <div style={{ fontSize: 13 }}>{guard.detail}</div>
-            <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
-              <button onClick={() => void guardWait()}>Wait for Current Step</button>
-              <button onClick={() => void guardStopSwitch()}>Stop Agent and Switch</button>
-              <button onClick={() => setGuard(null)}>Cancel</button>
-            </div>
-          </div>
-        )}
-
-        {tab === 'chat' && needsPrepare && activeConv && (
-          <PrepareBanner
-            convId={activeConv.id}
-            convTitle={activeConv.title}
-            lastModel={activeConv.last_model ?? ''}
-            loadedModel={loadedModel}
-            lastModelAvailable={models.some((model) => model.id === activeConv.last_model)}
-            onPrepared={() => refreshConvs(activeConv.id)}
-            onSwitchBack={() => {
-              const previous = activeConv.last_model ?? '';
-              if (!models.some((model) => model.id === previous)) {
-                notify('warning', `The previous model '${previous}' is no longer installed. Prepare this session for ${loadedModel} instead.`);
-                return;
-              }
-              void guardedSwitch('load', previous, false);
-            }}
-            notify={(k, t) => (k === 'error' ? notify('error', t) : notify(k === 'success' ? 'success' : 'info', t))}
-          />
-        )}
 
         {tab === 'chat' && (
           <>
-            {mode === 'code' && activeConv?.workspace && (
-              <CodeHeader
-                wsId={activeConv.workspace}
-                workspaces={workspaces}
-                busy={busy || agentBusy}
-                onChanges={() => setDiffWs(activeConv.workspace!)}
-                onCommand={(command) => { if (command === '/run ') { setInput(command); composerRef.current?.focus(); } else void send(command); }}
-              />
-            )}
-            <div className="contextbar">
-              {agentBusy ? inf?.running ? 'Agent working in this project…' : 'Run needs attention · model runtime unavailable' : busy ? (statusLine || 'Generating…') : mode === 'code' ? 'Ask a question, request a plan, or describe a change' : 'History stays on this computer'}
-              {usage ? ` · last turn: ${usage.prompt_tokens} prompt / ${usage.generated_tokens} generated${usage.stopped ? ' · stopped, partial kept' : ''}${usage.reasoning && usage.reasoning !== 'off' ? ` · reasoned (${usage.reasoning})` : ''}${usage.sources ? ` · ${usage.sources} sources` : ''}${usage.vision === 'unsupported' ? ' · images skipped (no vision)' : ''}${usage.tool_rounds ? ` · read ${usage.tool_rounds} file${usage.tool_rounds === 1 ? '' : 's'} in-chat` : ''}` : ''}
-              <span className="spacer" />
-              {convId && (
-                <select
-                  value={sessions.find((sn) => sn.id === convId)?.priority ?? 'normal'}
-                  onChange={(e) => void setPriority(e.target.value)}
-                  title="Scheduling priority (§138)"
-                  aria-label="Scheduling priority"
-                >
-                  <option value="background">Background</option>
-                  <option value="normal">Normal</option>
-                  <option value="high">High</option>
-                </select>
-              )}
-            </div>
-            <ContextBar ctx={ctx} onCompact={() => void doCompact()} compacting={compacting} />
             {showShare && convId && (
               <ShareDialog
-                targets={convs.filter((c) => c.id !== convId).map((c) => ({ id: c.id, label: `${c.mode === 'code' ? '💻' : '💬'} ${c.title}` }))}
+                targets={convs.filter((c) => c.id !== convId).map((c) => ({ id: c.id, label: `${c.mode === 'code' ? 'Code' : 'Chat'} · ${c.title}` }))}
                 onShare={(t, o) => void doShare(t, o)}
                 onClose={() => setShowShare(false)}
               />
             )}
-            {historyLoading ? <div className="chat history-loading" role="status">Opening conversation…</div> : msgs.length === 0 ? (
-              <div className="chat"><div className="empty welcome">
-                <div className="welcome-mark" aria-hidden="true"><AppIcon name={mode === 'code' ? 'code' : 'chat'} /></div>
-                <h1>{mode === 'code' ? 'A little idea. A working project.' : 'Room for your next idea.'}</h1>
-                <p>{mode === 'code' ? 'Explore your code, work through a plan, or give the agent a change to make. You choose how it works.' : 'Think it through, write something useful, or make sense of a file. Your model, on your machine.'}</p>
-                <div className="starter-grid">
-                  {(mode === 'code' ? [
-                    {label:'Understand this project', text:'Explore the project and explain its purpose, main components, and how to run it.', intent:'ask'},
-                    {label:'Plan a change', text:'Help me plan a change to this project. First, ask what I want to achieve.', intent:'ask'},
-                    {label:'Find a bug', text:'Inspect this project for a concrete bug. Show the evidence and suggest a fix without modifying files.', intent:'ask'},
-                  ] : [
-                    {label:'Think it through',text:'Help me think through an idea. Ask me what I am trying to achieve.',intent:'ask'},
-                    {label:'Draft something',text:'Help me write a clear first draft. Ask me about the audience and purpose.',intent:'ask'},
-                    {label:'Explain a concept',text:'Help me understand a concept step by step. Ask me which topic.',intent:'ask'},
-                  ]).map((starter) => <button key={starter.label} onClick={() => { setInput(starter.text); composerRef.current?.focus(); }}>{starter.label}<span aria-hidden="true">↗</span></button>)}
-                </div>
-                {mode === 'code' && !workspaces.some((workspace) => workspace.id === wsId) && <button className="choose-project" onClick={() => setProjectLauncherOpen(true)}>Choose a project to begin</button>}
-              </div></div>
-            ) : (
-              <div className="chat transcript" ref={transcriptRef} onScroll={(event) => { const view = event.currentTarget; followOutput.current = view.scrollHeight - view.scrollTop - view.clientHeight < 100; setShowLatest(!followOutput.current); }}>
-                {msgs.length > msgLimit && (
-                  <button className="ctx-toggle" onClick={() => setMsgLimit((l) => l + 200)}>
-                    Show {msgs.length - msgLimit} older message(s) — rendering newest {msgLimit} for speed
-                  </button>
-                )}
-                {msgs.slice(-msgLimit).filter((message) => !(agentBusy && message.id === focusRun)).map((m) => (
-                  editing && editing.mid === m.id ? (
-                    <div key={m.id} className={`msg ${m.role}`}>
-                      <textarea
-                        value={editing.draft}
-                        onChange={(e) => setEditing({ mid: m.id, draft: e.target.value })}
-                        rows={4}
-                        style={{ width: '100%' }}
-                      />
-                      <div className="msg-actions">
-                        <button onClick={() => void saveEdit()}>Save (truncates later turns)</button>
-                        <button onClick={() => setEditing(null)}>Cancel</button>
-                      </div>
-                    </div>
-                  ) : (
-                    <div key={m.id} className={`message-row ${m.role}`}>
-                      <MessageView
-                        activities={m.activities}
-                        role={m.role}
-                        text={m.text}
-                        time={m.time}
-                        streaming={busy && m.id === msgs[msgs.length - 1]?.id && m.role === 'assistant'}
-                        tps={
-                          busy && m.id === msgs[msgs.length - 1]?.id && m.role === 'assistant'
-                            ? liveTps
-                            : m.role === 'assistant'
-                              ? (perfMap[m.id]?.tps ?? null)
-                              : null
-                        }
-                        live={busy && m.id === msgs[msgs.length - 1]?.id && m.role === 'assistant'}
-                        timing={m.role === 'assistant' ? perfMap[m.id]?.timing : undefined}
-                        legacyRate={m.role === 'assistant' && perfMap[m.id]?.legacy}
-                        showMetrics={showGenerationSpeed}
-                        detailedMetrics={showDetailedMetrics}
-                        agentRunId={m.id}
-                        onOpenAgentActivity={(runId) => {
+            <div className="stage">
+              {historyLoading ? (
+                <div className="history-loading" role="status" aria-label="Opening conversation"><i /><i /><i /><i /></div>
+              ) : msgs.length === 0 ? (
+                <Welcome
+                  mode={mode}
+                  machine={machine.state}
+                  loaded={loadedMeta}
+                  selected={selectedModel}
+                  contextSize={loadedMeta ? inf?.context_size ?? null : selectedModel?.context_length ?? null}
+                  workspace={workspaces.find((workspace) => workspace.id === (activeConv?.workspace ?? wsId))}
+                  workspaces={workspaces}
+                  branch={branch}
+                  onStarter={(text) => { setInput(text); requestAnimationFrame(() => composerRef.current?.focus()); }}
+                  onLoad={() => { if (selectedModel) requestLoad(selectedModel.id); }}
+                  onChooseModel={() => setTab('models')}
+                  onChooseProject={() => setProjectLauncherOpen(true)}
+                  onPickProject={(workspace) => void changeWorkspace(workspace.id)}
+                />
+              ) : (
+                <div className="transcript" ref={transcriptRef} onScroll={(event) => { const view = event.currentTarget; followOutput.current = view.scrollHeight - view.scrollTop - view.clientHeight < 100; setShowLatest(!followOutput.current); }}>
+                  <div className="transcript-inner">
+                    {msgs.length > msgLimit && (
+                      <Button variant="ghost" size="sm" icon="history" className="older-toggle" onClick={() => setMsgLimit((l) => l + 200)}>
+                        Show {msgs.length - msgLimit} older message{msgs.length - msgLimit === 1 ? '' : 's'}
+                      </Button>
+                    )}
+                    {msgs.slice(-msgLimit).filter((message) => !(agentBusy && message.id === focusRun)).map((m) => (
+                      editing && editing.mid === m.id ? (
+                        <div key={m.id} className="message-row user">
+                          <div className="msg-edit">
+                            <textarea
+                              value={editing.draft}
+                              autoFocus
+                              onChange={(e) => setEditing({ mid: m.id, draft: e.target.value })}
+                              onKeyDown={(e) => { if (e.key === 'Escape') setEditing(null); if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) void saveEdit(); }}
+                              rows={4}
+                              aria-label="Edit message"
+                            />
+                            <div className="msg-edit-actions">
+                              <span className="help">Saving removes the replies that came after this message.</span>
+                              <Button variant="ghost" size="sm" onClick={() => setEditing(null)}>Cancel</Button>
+                              <Button size="sm" onClick={() => void saveEdit()} disabled={!editing.draft.trim()}>Save</Button>
+                            </div>
+                          </div>
+                        </div>
+                      ) : (
+                        <div key={m.id} className={`message-row ${m.role}`}>
+                          <MessageView
+                            activities={m.activities}
+                            role={m.role}
+                            text={m.text}
+                            time={m.time}
+                            streaming={busy && m.id === msgs[msgs.length - 1]?.id && m.role === 'assistant'}
+                            tps={
+                              busy && m.id === msgs[msgs.length - 1]?.id && m.role === 'assistant'
+                                ? liveTps
+                                : m.role === 'assistant'
+                                  ? (perfMap[m.id]?.tps ?? null)
+                                  : null
+                            }
+                            live={busy && m.id === msgs[msgs.length - 1]?.id && m.role === 'assistant'}
+                            timing={m.role === 'assistant' ? perfMap[m.id]?.timing : undefined}
+                            legacyRate={m.role === 'assistant' && perfMap[m.id]?.legacy}
+                            showMetrics={showGenerationSpeed}
+                            detailedMetrics={showDetailedMetrics}
+                            byline={m.role === 'assistant' ? modelName(perfMap[m.id]?.model) : undefined}
+                            agentRunId={m.id}
+                            onOpenAgentActivity={(runId) => {
+                              setFocusRun(runId);
+                              setRightTab('activity');
+                              setRightOpen(true);
+                            }}
+                            onEdit={!busy && !agentBusy && m.role === 'user' && !m.id.startsWith('tmp-') ? () => setEditing({ mid: m.id, draft: m.text }) : undefined}
+                            onRegenerate={!busy && !agentBusy && m.role === 'assistant' && m.id === lastAssistantId ? regenerate : undefined}
+                          />
+                        </div>
+                      )
+                    ))}
+                    {mode === 'code' && (
+                      <AgentChatProgress
+                        convId={convId}
+                        runtimeRunning={!!inf?.running}
+                        onContextUsage={(event, runId) => { if (conversationRef.current === convId) setCtx((context) => applyAgentContext(context, event, runId)); }}
+                        focusRun={focusRun}
+                        onOpenActivity={(runId) => {
                           setFocusRun(runId);
                           setRightTab('activity');
                           setRightOpen(true);
                         }}
+                        onFinished={() => {
+                          if (conversationRef.current !== convId) return;
+                          refreshAgentActivity.current();
+                          if (convId) void reloadMsgs(convId);
+                          void refreshConvs();
+                        }}
                       />
-                      {!busy && m.role === 'user' && !m.id.startsWith('tmp-') && (
-                        <div className="msg-actions">
-                          <button onClick={() => setEditing({ mid: m.id, draft: m.text })}>Edit</button>
-                        </div>
-                      )}
-                    </div>
-                  )
-                ))}
-                {mode === 'code' && (
-                  <AgentChatProgress
-                    convId={convId}
-                    runtimeRunning={!!inf?.running}
-                    onContextUsage={(event, runId) => { if (conversationRef.current === convId) setCtx((context) => applyAgentContext(context, event, runId)); }}
-                    focusRun={focusRun}
-                    onOpenActivity={(runId) => {
-                      setFocusRun(runId);
-                      setRightTab('activity');
-                      setRightOpen(true);
-                    }}
-                    onFinished={() => {
-                      if (conversationRef.current !== convId) return;
-                      refreshAgentActivity.current();
-                      if (convId) void reloadMsgs(convId);
-                      void refreshConvs();
-                    }}
-                  />
-                )}
-              </div>
-            )}
-            {showLatest && <button className="jump-latest" onClick={() => { followOutput.current = true; transcriptRef.current?.scrollTo({top:transcriptRef.current.scrollHeight,behavior:'smooth'}); setShowLatest(false); }}>↓ Latest response</button>}
-            <AttachChips convId={convId} tick={attachTick} notify={(k, t) => notify(k === 'error' ? 'error' : 'info', t)} />
-            <WorkStatus active={!!visibleWork} startedAt={visibleWork?.startedAt} waiting={visibleWork?.kind === 'agent' && (agentPhase === 'WAITING_PERMISSION' || !inf?.running)} label={visibleWork?.kind === 'agent'
-              ? agentPhase === 'ROUTING' ? 'Understanding your request…' : !inf?.running ? 'Model stopped · this run needs attention' : agentPhase === 'WAITING_PERMISSION' ? 'Waiting for your approval' : agentPhase === 'EXECUTING_TOOL' ? 'Working through the project…' : agentPhase === 'OBSERVING' ? 'Reviewing the results…' : 'Planning the next step…'
-              : statusLine || (generationPhase === 'thinking' ? 'Companion is thinking…' : generationPhase === 'responding' ? 'Companion is writing…' : 'Companion is processing your request…')} />
-            <div
-              className={`composer${dragOver ? ' dragover' : ''}`}
-              onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
-              onDragLeave={() => setDragOver(false)}
-              onDrop={(e) => {
-                e.preventDefault();
-                setDragOver(false);
-                const f = e.dataTransfer.files?.[0];
-                if (f) {
-                  if (!convId) notify('warning', 'Start a chat first, then drop files.');
-                  else void attach(f);
-                }
-              }}
-            >
-              <div className="composer-input-row">
-                <textarea
-                  id="composer"
-                  ref={composerRef}
-                  value={input}
-                  rows={1}
-                  onChange={(e) => {
-                    void onInput(e.target.value);
-                    const el = e.target;
-                    el.style.height = 'auto';
-                    el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
-                  }}
-                  onKeyDown={composerKey}
-                  placeholder={mode === 'code' ? 'Ask, plan, or describe a change…' : 'Ask anything, or drop a file…'}
-                  aria-label="Message composer"
-                  disabled={loadingModel || agentBusy}
-                />
-                {agentBusy ? <button className="send-button stop-button" aria-label="Stop agent" onClick={() => { void agentRuns().then(async (runs) => { await Promise.all(runs.filter((run) => run.conversation_id === convId && !['COMPLETED','FAILED','CANCELLED'].includes(run.state)).map((run) => stopAgent(run.id))); if (conversationRef.current === convId) refreshAgentActivity.current(); if (convId) void reloadMsgs(convId); }).catch((error) => notify('error', error.message)); }}><span aria-hidden="true"/></button> : busy
-                  ? <button className="send-button stop-button" onClick={() => {
-                      abort.current?.abort();
-                      void stopChat()
-                        .then((o) => {
-                          if (o.stopped) notify('info', `Stopped — partial response kept (${o.chars_kept} chars).`);
-                        })
-                        .catch(() => { /* fetch abort still applies */ });
-                    }} aria-label="Stop generation"><span aria-hidden="true" /></button>
-                  : <button className={`send-button${agentBusy ? ' agent-live' : ''}`} onClick={() => void send()} disabled={loadingModel || agentBusy || !input.trim()} title={loadingModel ? 'Model is loading' : agentBusy ? 'Agent is working' : 'Send'} aria-label="Send message">{agentBusy ? '•' : '↑'}</button>}
-              </div>
-              <div className="composer-toolbar">
-                <div className="composer-tools">
-                  <input
-                    ref={fileRef}
-                    type="file"
-                    style={{ display: 'none' }}
-                    onChange={(e) => { void attach(e.target.files?.[0]); e.target.value = ''; }}
-                  />
-                  <button disabled={!convId || busy || agentBusy} onClick={() => fileRef.current?.click()} title="Attach a file (text, image, PDF, Office)" aria-label="Attach a file">
-                    <span aria-hidden="true">＋</span> Attach
-                  </button>
-                  {mode === 'code' && (
-                    <span className={`permission-mode ${permissionMode}`} role="group" aria-label="Agent approval policy" title={`${AUTO_POLICY_DESCRIPTION} ${PROJECT_BOUNDARY_DESCRIPTION} ${SEARCH_PERMISSION_DESCRIPTION}`}>
-                      <button type="button" disabled={permissionModeBusy || busy || agentBusy} className={permissionMode === 'ask' ? 'active' : ''} aria-pressed={permissionMode === 'ask'} onClick={() => void changePermissionMode('ask')}>Ask</button>
-                      <button type="button" disabled={permissionModeBusy || busy || agentBusy} className={permissionMode === 'auto' ? 'active' : ''} aria-pressed={permissionMode === 'auto'} onClick={() => void changePermissionMode('auto')}>Auto</button>
-                    </span>
-                  )}
-                  <button
-                    className={`toggle${reasoning ? ' on' : ''}`}
-                    disabled={busy || agentBusy}
-                    title={reasoningCapable ? 'Reasoning: extended response budget. Native thinking depends on the model and runtime.' : 'Extended response budget; native reasoning capability is unverified for this model.'}
-                    aria-pressed={reasoning}
-                    onClick={() => setReasoning((v) => !v)}
-                  >
-                    <span className="toggle-dot" /> Reasoning
-                  </button>
-                  <button className={`toggle${search ? ' on' : ''}`} disabled={busy || agentBusy} aria-pressed={search} title="Search Web: explicit internet access for this message" onClick={() => setSearch((v) => !v)}>
-                    <span className="toggle-dot" /> Search
-                  </button>
-                </div>
-                <button className="composer-regenerate" disabled={busy || agentBusy || msgs.length === 0} onClick={regenerate} title="Re-send the last turn">Regenerate</button>
-              </div>
-              {cmdMenu.length > 0 && (
-                <div className="cmdmenu" role="listbox" aria-label="Commands">
-                  {cmdMenu.map((c, i) => (
-                    <div
-                      key={c.name}
-                      role="option"
-                      aria-selected={i === cmdSel}
-                      className={`item${i === cmdSel ? ' sel' : ''}`}
-                      onMouseEnter={() => setCmdSel(i)}
-                      onMouseDown={(e) => { e.preventDefault(); setInput(`/${c.name} `); setCmdMenu([]); }}
-                    >
-                      <span className="name">/{c.name}</span>
-                      <span className="desc">{c.description}</span>
-                    </div>
-                  ))}
+                    )}
+                  </div>
                 </div>
               )}
+              {showLatest && <Button className="jump-latest" size="sm" icon="arrowDown" onClick={() => { followOutput.current = true; transcriptRef.current?.scrollTo({top:transcriptRef.current.scrollHeight,behavior:'smooth'}); setShowLatest(false); }}>Latest</Button>}
             </div>
-            {search && <div className="privacy-note">🌐 Web access enabled for this message — queries go to the configured search provider.</div>}
+
+            <div className="dock" ref={dockRef}>
+              <div className="dock-inner">
+                {needsPrepare && activeConv && !prepareDismissed[activeConv.id] && (
+                  <PrepareBanner
+                    convId={activeConv.id}
+                    convTitle={activeConv.title}
+                    lastModel={modelName(activeConv.last_model) ?? ''}
+                    loadedModel={loadedModel}
+                    loadedName={modelName(loadedModel)}
+                    lastModelAvailable={models.some((model) => model.id === activeConv.last_model)}
+                    onPrepared={() => refreshConvs(activeConv.id)}
+                    onDismiss={() => setPrepareDismissed((items) => ({ ...items, [activeConv.id]: true }))}
+                    onSwitchBack={() => {
+                      const previous = activeConv.last_model ?? '';
+                      if (!models.some((model) => model.id === previous)) {
+                        notify('warning', `The previous model '${previous}' is no longer installed. Prepare this session for ${loadedModel} instead.`);
+                        return;
+                      }
+                      requestLoad(previous);
+                    }}
+                    notify={(k, t) => (k === 'error' ? notify('error', t) : notify(k === 'success' ? 'success' : 'info', t))}
+                  />
+                )}
+                <WorkStatus active={!!visibleWork} startedAt={visibleWork?.startedAt} waiting={visibleWork?.kind === 'agent' && (agentPhase === 'WAITING_PERMISSION' || !inf?.running)} label={workLabel} />
+                {!visibleWork && receipt.length > 0 && (
+                  <div className="dock-receipt">
+                    {receipt.map((item) => <span key={item.text} className={item.warn ? 'warn' : ''}>{item.icon && <Icon name={item.icon} size={13} />}{item.text}</span>)}
+                  </div>
+                )}
+                <AttachChips convId={convId} tick={attachTick} notify={(k, t) => notify(k === 'error' ? 'error' : 'info', t)} />
+                <div
+                  className={`composer${dragOver ? ' dragover' : ''}${machineActivity === 'waiting' && agentBusy ? ' waiting' : busy || agentBusy ? ' live' : ''}`}
+                  onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+                  onDragLeave={() => setDragOver(false)}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    setDragOver(false);
+                    const f = e.dataTransfer.files?.[0];
+                    if (f) {
+                      if (!convId) notify('warning', 'Start a chat first, then drop files.');
+                      else void attach(f);
+                    }
+                  }}
+                >
+                  <textarea
+                    id="composer"
+                    ref={composerRef}
+                    value={input}
+                    rows={1}
+                    onChange={(e) => {
+                      void onInput(e.target.value);
+                      const el = e.target;
+                      el.style.height = 'auto';
+                      el.style.height = `${Math.min(el.scrollHeight, 240)}px`;
+                    }}
+                    onKeyDown={composerKey}
+                    placeholder={dragOver ? 'Drop to attach' : mode === 'code' ? 'Ask, plan, or describe a change…' : 'Ask anything, or drop a file…'}
+                    aria-label="Message composer"
+                    disabled={loadingModel || agentBusy}
+                  />
+                  <div className="composer-bar">
+                    <div className="composer-tools">
+                      <input
+                        ref={fileRef}
+                        type="file"
+                        hidden
+                        onChange={(e) => { void attach(e.target.files?.[0]); e.target.value = ''; }}
+                      />
+                      <IconButton icon="paperclip" label={convId ? 'Attach a file' : 'Send a first message to attach files'} tipSide="top" disabled={!convId || busy || agentBusy} onClick={() => fileRef.current?.click()} />
+                      {mode === 'code' && (
+                        <span className={`permission-mode ${permissionMode}`} role="group" aria-label="Agent approval policy" title={`${AUTO_POLICY_DESCRIPTION} ${PROJECT_BOUNDARY_DESCRIPTION} ${SEARCH_PERMISSION_DESCRIPTION}`}>
+                          <button type="button" disabled={permissionModeBusy || busy || agentBusy} className={permissionMode === 'ask' ? 'active' : ''} aria-pressed={permissionMode === 'ask'} onClick={() => void changePermissionMode('ask')}>Ask</button>
+                          <button type="button" disabled={permissionModeBusy || busy || agentBusy} className={permissionMode === 'auto' ? 'active' : ''} aria-pressed={permissionMode === 'auto'} onClick={() => void changePermissionMode('auto')}>Auto</button>
+                        </span>
+                      )}
+                      <Toggle
+                        on={reasoning}
+                        icon="sparkle"
+                        disabled={busy || agentBusy}
+                        title={reasoningCapable ? 'Reasoning: extended response budget. Native thinking depends on the model and runtime.' : 'Extended response budget; native reasoning capability is unverified for this model.'}
+                        onClick={() => setReasoning((v) => !v)}
+                      >
+                        Reasoning
+                      </Toggle>
+                      <Toggle on={search} icon="globe" tone="caution" disabled={busy || agentBusy} title="Web search: explicit internet access for this message" onClick={() => setSearch((v) => !v)}>
+                        Web
+                      </Toggle>
+                    </div>
+                    <div className="composer-end">
+                      {/* Status only. Loading or switching models never happens from the composer. */}
+                      {!loadedMeta && !loadingModel && backendUp !== false && !busy && !agentBusy && (
+                        <span className="composer-hint" title="Load a model from the panel at the bottom left">
+                          <Lamp state="off" />
+                          No model loaded
+                        </span>
+                      )}
+                      {loadingModel && <span className="composer-hint"><Lamp state="caution" pulse />Loading model…</span>}
+                      <ContextGauge ctx={ctx} onCompact={() => void doCompact()} compacting={compacting} />
+                      {agentBusy ? (
+                        <button type="button" className={`send-btn stop${machineActivity === 'waiting' ? ' paused' : ''}`} aria-label="Stop agent" data-tip="Stop agent" data-tip-side="top" onClick={stopAgentRuns}><Icon name="stop" size={16} /></button>
+                      ) : busy ? (
+                        <button type="button" className="send-btn stop" aria-label="Stop generation" data-tip="Stop" data-tip-side="top" onClick={stopGeneration}><Icon name="stop" size={16} /></button>
+                      ) : (
+                        <button
+                          type="button"
+                          className={`send-btn${modelReady || input.trim().startsWith('/') ? '' : ' idle'}`}
+                          onClick={() => void send()}
+                          disabled={loadingModel || !input.trim()}
+                          aria-label="Send message"
+                          data-tip={loadingModel ? 'Model is loading' : modelReady ? 'Send (Enter)' : 'Load a model to send'}
+                          data-tip-side="top"
+                        >
+                          <Icon name="arrowUp" size={17} strokeWidth={2.2} />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  {cmdMenu.length > 0 && (
+                    <div className="cmdmenu" role="listbox" aria-label="Commands">
+                      {cmdMenu.map((c, i) => (
+                        <div
+                          key={c.name}
+                          role="option"
+                          aria-selected={i === cmdSel}
+                          className={`item${i === cmdSel ? ' sel' : ''}`}
+                          onMouseEnter={() => setCmdSel(i)}
+                          onMouseDown={(e) => { e.preventDefault(); setInput(`/${c.name} `); setCmdMenu([]); }}
+                        >
+                          <span className="name">/{c.name}</span>
+                          <span className="desc">{c.description}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
           </>
         )}
 
         {tab === 'models' && (
-          <div className="chat model-library">
-            <div className="page-heading"><div><h1>Your local intelligence.</h1><p>Choose the right model, inspect its capabilities, and tune it for your machine.</p></div><Badge>{models.length} installed</Badge></div>
-            <SetupWizard notify={notify} />
-            <div className="card">
-              <button onClick={() => scanModels().then((r) => {
-                notify('success', `Scan: ${r.registered} registered, ${r.warnings.length} warnings.`);
-                return refreshModels();
-              }).catch((e) => notify('error', e.message))}>
-                Scan models/ directory
-              </button>
-              <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 6 }}>
-                Finds GGUF files in your models folder and its subfolders. Model metadata is optional.
-              </div>
-            </div>
-            <div className="card">
-              <strong>Download a model</strong>
-              <div style={{ display: 'flex', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
-                <input value={dlId} onChange={(e) => setDlId(e.target.value)} placeholder="id (e.g. qwen-14b)" style={{ flex: 1 }} />
-                <input value={dlUrl} onChange={(e) => setDlUrl(e.target.value)} placeholder="https://…/model.gguf" style={{ flex: 2 }} />
-                <input value={dlSha} onChange={(e) => setDlSha(e.target.value)} placeholder="sha256 (optional)" style={{ flex: 2 }} />
-                <button onClick={() => startDownload(dlId.trim(), dlUrl.trim(), dlSha.trim() || undefined)
-                  .then(() => { notify('success', `Download '${dlId.trim()}' started.`); setDlId(''); setDlUrl(''); setDlSha(''); refreshDownloads(); })
-                  .catch((e) => notify('error', e.message))}>
-                  Download
-                </button>
-              </div>
-              <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 6 }}>
-                Paste a direct GGUF link (e.g. a HuggingFace resolve URL). Resumes from `.part` after interruption.
-              </div>
-            </div>
-            {downloads.length > 0 && (
-              <div className="card">
-                <strong>Downloads</strong>
-                {downloads.map((d) => (
-                  <div key={d.id} style={{ marginTop: 8 }}>
-                    <div>{d.id} · {d.status}{d.total_bytes ? ` · ${(d.downloaded_bytes / 1048576).toFixed(1)}/${(d.total_bytes / 1048576).toFixed(1)} MB` : ` · ${(d.downloaded_bytes / 1048576).toFixed(1)} MB`}</div>
-                    <progress value={d.downloaded_bytes} max={d.total_bytes ?? (d.downloaded_bytes || 1)} style={{ width: '100%' }} />
-                    {d.error && <div className="approval">{d.error}</div>}
-                    <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
-                      {d.status === 'downloading' && <button onClick={() => downloadAction(d.id, 'pause').then(refreshDownloads).catch((e) => notify('error', e.message))}>Pause</button>}
-                      {(d.status === 'paused' || d.status === 'failed' || d.status === 'cancelled') && <button onClick={() => downloadAction(d.id, 'resume').then(refreshDownloads).catch((e) => notify('error', e.message))}>Resume</button>}
-                      {(d.status === 'downloading' || d.status === 'paused') && <button onClick={() => downloadAction(d.id, 'cancel').then(refreshDownloads).catch((e) => notify('error', e.message))}>Cancel</button>}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-            {models.length === 0 && <div className="card">No models registered yet.</div>}
-            {models.map((m) => (
-              <ModelLibraryItem key={m.id} model={m} loadingModel={loadingModel} notify={notify}
-                onLoad={() => { setModelId(m.id); void guardedSwitch('load', m.id, false); }}
-                onDelete={() => { if (confirm(`Delete model '${m.id}'? This removes the GGUF permanently.`)) deleteModel(m.id).then(() => { notify('success', `Deleted ${m.id}.`); refreshModels(); }).catch((e) => notify('error', e.message)); }}
-              />
-            ))}
-          </div>
+          <ModelsPage
+            models={models}
+            loadingModel={loadingModel}
+            downloads={downloads}
+            notify={notify}
+            onLoad={requestLoad}
+            onDelete={confirmDeleteModel}
+            refreshModels={refreshModels}
+            refreshDownloads={refreshDownloads}
+          />
         )}
 
         {tab === 'resources' && <ResourcesPanel notify={notify} />}
 
         {tab === 'system' && (
-          <div className="chat">
-            <div className="page-heading"><div><h1>Under the hood.</h1><p>Check the runtime, diagnose problems, and measure your model’s performance.</p></div></div>
-            <div className="card">
-              <div><strong>Inference:</strong> {inf ? `${inf.engine}${inf.running ? ` · running ${inf.base_url ?? ''}` : ' · idle'}` : 'backend offline'}</div>
-              {inf && <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
-                Model: {inf.model ?? '—'} · ctx {inf.context_size} · binary: {inf.binary_found ? 'found' : 'missing'}
-              </div>}
-              {inf?.last_error && <div className="approval">{inf.last_error}</div>}
-              <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
-                <button disabled={!modelId} onClick={() => void guardedSwitch('start', modelId, false)}>
-                  Start inference
-                </button>
-                <button onClick={() => inferenceStop().then(() => inferenceStatus().then(setInf)).catch((e) => notify('error', e.message))}>
-                  Stop
-                </button>
-                <button onClick={() => { inferenceStatus().then(setInf); systemInfo().then(setSys); }}>
-                  Refresh
-                </button>
-              </div>
-              {!inf?.binary_found && <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 6 }}>
-                No llama-server binary. Download a llama.cpp release, put llama-server(.exe) on PATH or models/bin/, or set COMPANION_LLAMA_SERVER_BIN.
-              </div>}
-            </div>
-            <details className="card"><summary>Hardware and runtime details</summary><pre>{JSON.stringify(sys ?? { hint: 'backend offline' }, null, 2)}</pre></details>
-            <DoctorCard notify={notify} />
-            <BenchmarkCard notify={notify} />
-          </div>
+          <RuntimePage
+            inf={inf}
+            sys={sys}
+            modelId={modelId}
+            modelName={selectedModel?.name}
+            backendUp={backendUp}
+            notify={notify}
+            onStart={() => void guardedSwitch('start', modelId, false)}
+            setInf={setInf}
+            setSys={setSys}
+          />
         )}
 
-        {tab === 'tools' && (
-          <div className="chat">
-            <div className="page-heading"><div><h1>What Companion can do.</h1><p>Inspect available actions and extensions. Tool execution follows your approval policy.</p></div></div>
-            <div className="card">
-              <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                <strong>Tool registry</strong>
-                <span style={{ flex: 1 }} />
-                <button className="ctx-toggle" onClick={() => void refreshRegistry()}>Refresh</button>
-              </div>
-              <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 4 }}>
-                Same permission gate as the agent — tools never bypass approvals.
-              </div>
-              {registry.map((t) => (
-                <div key={t.name} style={{ display: 'flex', gap: 8, marginTop: 6, fontSize: 13, alignItems: 'baseline' }}>
-                  <code style={{ minWidth: 140 }}>{t.name}</code>
-                  <Badge tone={t.risk.toLowerCase().startsWith('danger') ? 'err' : t.risk.toLowerCase().startsWith('moderate') ? 'warn' : 'ok'}>
-                    {t.risk}
-                  </Badge>
-                  <span style={{ color: 'var(--text-secondary)', fontSize: 12 }}>{t.description}</span>
-                </div>
-              ))}
-              {registry.length === 0 && <div style={{ fontSize: 13 }}>No tools reported — is the backend running?</div>}
-            </div>
-            <PluginsCard wsId={wsId} notify={notify} />
-          </div>
-        )}
+        {tab === 'tools' && <ToolsPage registry={registry} wsId={wsId} notify={notify} onRefresh={() => void refreshRegistry()} />}
 
         {tab === 'settings' && <SettingsPanel setToasts={setToasts} />}
+
         {diffWs && <DiffModal wsId={diffWs} onClose={() => setDiffWs(null)} />}
       </div>
+
       {rightOpen && tab === 'chat' && (
         <RightPanel mode={mode} tab={rightTab} onTab={setRightTab} onClose={() => setRightOpen(false)}>
           <RightPanelTabs
             tab={rightTab}
             convId={convId}
-            wsId={activeConv?.workspace ?? ''}
+            wsId={activeConv?.workspace ?? (mode === 'code' ? wsId : '')}
             wsPath={workspaces.find((w) => w.id === (activeConv?.workspace ?? wsId))?.path ?? ''}
             mode={mode}
             modelId={modelId}
@@ -1656,6 +1789,36 @@ export default function App() {
             onAgentActiveChange={(active) => { if (active && !agentBusy && conversationRef.current === convId) refreshAgentActivity.current(); }}
           />
         </RightPanel>
+      )}
+
+      {guard && (
+        <Dialog
+          role="alertdialog"
+          icon="alert"
+          title="Switch models while the agent is working?"
+          description={guard.detail}
+          onClose={() => setGuard(null)}
+          footer={<>
+            <Button variant="ghost" onClick={() => setGuard(null)}>Cancel</Button>
+            <Button onClick={() => void guardWait()}>Wait for the current step</Button>
+            <Button variant="danger" icon="stop" onClick={() => void guardStopSwitch()}>Stop agent and switch</Button>
+          </>}
+        />
+      )}
+
+      {confirmState && (
+        <Dialog
+          size="sm"
+          role="alertdialog"
+          icon={confirmState.icon}
+          title={confirmState.title}
+          description={confirmState.body}
+          onClose={() => setConfirmState(null)}
+          footer={<>
+            <Button variant="ghost" onClick={() => setConfirmState(null)}>Cancel</Button>
+            <Button variant="primary" onClick={() => { const run = confirmState.onConfirm; setConfirmState(null); run(); }}>{confirmState.action}</Button>
+          </>}
+        />
       )}
     </div>
   );

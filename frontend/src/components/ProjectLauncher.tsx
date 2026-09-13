@@ -1,5 +1,7 @@
 import { useState } from 'react';
 import { createWorkspace, pickProjectFolder, type Workspace } from '../services/api';
+import { Button, Dialog } from '../ui/primitives';
+import { Icon } from '../ui/Icon';
 
 function folderName(path: string) {
   return path.split(/[\\/]/).filter(Boolean).pop() ?? 'Project';
@@ -57,51 +59,43 @@ export default function ProjectLauncher({
   }
 
   return (
-    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
-      <section className="project-launcher" role="dialog" aria-modal="true" aria-label="Open a project" onMouseDown={(event) => event.stopPropagation()}>
-        <header>
-          <div>
-            <h2>Open a project</h2>
-            <p>Choose an existing folder or start with a clean one.</p>
-          </div>
-          <button className="icon-button" onClick={onClose} aria-label="Close project picker">×</button>
-        </header>
-
-        <div className="project-actions">
-          <button className="project-action primary" disabled={busy} onClick={() => void addExisting()}>
-            <span aria-hidden="true">⌁</span>
-            <strong>Open existing folder</strong>
-            <small>Browse your computer</small>
-          </button>
-          <div className="project-create">
-            <label htmlFor="new-project-name">Create a new project</label>
-            <div>
-              <input id="new-project-name" value={name} onChange={(event) => setName(event.target.value)} placeholder="Project name" />
-              <button disabled={busy || !name.trim()} onClick={() => void createNew()}>Choose location</button>
-            </div>
-          </div>
+    <Dialog title="Open a project" description="The agent can only read and change files inside the project you choose." icon="folder" size="lg" onClose={onClose}>
+      <div className="launch-grid">
+        <button type="button" className="launch-card" disabled={busy} onClick={() => void addExisting()}>
+          <Icon name="folder" size={20} />
+          <strong>Open an existing folder</strong>
+          <small>Browse your computer for a project you already have.</small>
+        </button>
+        <div className="launch-card">
+          <Icon name="folderPlus" size={20} />
+          <strong>Create a new project</strong>
+          <small>Name it, then choose where the folder should go.</small>
+          <form className="inline-form" onSubmit={(event) => { event.preventDefault(); void createNew(); }}>
+            <input value={name} onChange={(event) => setName(event.target.value)} placeholder="Project name" aria-label="New project name" />
+            <Button type="submit" disabled={busy || !name.trim()} style={{ height: 34 }}>Choose location</Button>
+          </form>
         </div>
+      </div>
 
-        {recent.length > 0 && (
-          <div className="recent-projects">
-            <h3>Recent projects</h3>
-            {recent.slice(0, 6).map((workspace) => (
-              <button key={workspace.id} onClick={() => { onChoose(workspace); onClose(); }}>
-                <span className="recent-project-mark" aria-hidden="true" />
-                <span><strong>{workspace.name}</strong><small>{workspace.path}</small></span>
-              </button>
-            ))}
-          </div>
-        )}
+      {recent.length > 0 && (
+        <div className="recent-list">
+          <span className="eyebrow">Recent projects</span>
+          {recent.slice(0, 6).map((workspace) => (
+            <button type="button" key={workspace.id} onClick={() => { onChoose(workspace); onClose(); }}>
+              <Icon name="folder" size={16} />
+              <span><strong>{workspace.name}</strong><small>{workspace.path}</small></span>
+            </button>
+          ))}
+        </div>
+      )}
 
-        <details className="advanced-path">
-          <summary>Enter a path manually</summary>
-          <div>
-            <input value={manualPath} onChange={(event) => setManualPath(event.target.value)} placeholder="C:\Projects\my-app" />
-            <button disabled={busy || !manualPath.trim()} onClick={() => void addExisting(manualPath.trim())}>Open</button>
-          </div>
-        </details>
-      </section>
-    </div>
+      <details className="manual-path">
+        <summary><Icon name="chevronRight" size={13} /> Enter a path instead</summary>
+        <form className="inline-form" onSubmit={(event) => { event.preventDefault(); if (manualPath.trim()) void addExisting(manualPath.trim()); }}>
+          <input value={manualPath} onChange={(event) => setManualPath(event.target.value)} placeholder="C:\Projects\my-app" aria-label="Project folder path" />
+          <Button type="submit" disabled={busy || !manualPath.trim()} style={{ height: 34 }}>Open</Button>
+        </form>
+      </details>
+    </Dialog>
   );
 }

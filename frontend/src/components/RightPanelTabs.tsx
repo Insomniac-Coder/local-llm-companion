@@ -8,11 +8,14 @@ import KnowledgeCard from './KnowledgeCard';
 import GitCard from './GitCard';
 import RecommendCard from './RecommendCard';
 import SessionActivity from './SessionActivity';
-import { Badge, Button } from '../ui/primitives';
+import { Badge, IconButton, Section } from '../ui/primitives';
+import { Icon } from '../ui/Icon';
 import {
   listToolExecutions,
   type ContextInfo, type ToolDescriptor, type ToolExecution, type Workspace,
 } from '../services/api';
+
+const riskTone = (risk: string) => risk.toLowerCase().startsWith('danger') ? 'err' : risk.toLowerCase().startsWith('moderate') ? 'warn' : 'neutral';
 
 export default function RightPanelTabs({
   tab,
@@ -47,48 +50,22 @@ export default function RightPanelTabs({
   onAgentFinished: () => void;
   onAgentActiveChange: (active: boolean) => void;
 }) {
-  const [showMemory, setShowMemory] = useState(false);
   const [execs, setExecs] = useState<ToolExecution[]>([]);
+  const [execsTick, setExecsTick] = useState(0);
   const ws = workspaces.find((workspace) => workspace.id === wsId);
 
   useEffect(() => {
     if (tab === 'tools' && convId) {
       listToolExecutions(convId, 20).then(setExecs).catch(() => setExecs([]));
     }
-  }, [tab, convId]);
+  }, [tab, convId, execsTick]);
 
-  if (tab === 'activity') {
+  if (tab === 'activity' && mode === 'code') {
     return <SessionActivity convId={convId} focusRun={focusRun} notify={notify} onFinished={onAgentFinished} onActiveChange={onAgentActiveChange} />;
   }
 
-  if (tab === 'context') {
-    return (
-      <>
-        {mode === 'code' && ws && (
-          <div className="project-context"><span>Active project</span><strong>{ws.name}</strong><code>{ws.path}</code></div>
-        )}
-        <div className="card">
-          <div className="panel-title-row">
-            <strong>Context</strong>
-            {ctx?.health && <Badge tone={ctx.health === 'healthy' ? 'ok' : ctx.health === 'moderate' ? 'info' : ctx.health === 'high' ? 'warn' : 'err'}>{ctx.health}</Badge>}
-          </div>
-          <ContextBar ctx={ctx} onCompact={onCompact} compacting={compacting} />
-          {modelId && <RecommendCard modelId={modelId} notify={notify} />}
-        </div>
-        <InstructionsCard wsId={wsId} />
-        {convId && (
-          <>
-            <Button variant="ghost" size="sm" onClick={() => setShowMemory((visible) => !visible)}>{showMemory ? '▾' : '▸'} Memories</Button>
-            {showMemory && <MemoryPanel convId={convId} workspaceId={wsId} notify={notify} />}
-          </>
-        )}
-        {!convId && <div className="activity-empty"><strong>No session open</strong><span>Open a session to inspect its context.</span></div>}
-      </>
-    );
-  }
-
   if (tab === 'files') {
-    if (!convId) return <div className="activity-empty"><strong>No files yet</strong><span>Open a session to see attachments and artifacts.</span></div>;
+    if (!convId) return <div className="empty-state"><Icon name="file" size={28} /><strong>No files yet</strong><p>Open a session to see its attachments and generated files.</p></div>;
     return (
       <>
         <AttachmentsPanel convId={convId} notify={(kind, text) => notify(kind === 'error' ? 'error' : 'info', text)} />
@@ -98,24 +75,47 @@ export default function RightPanelTabs({
     );
   }
 
+  if (tab === 'tools' && mode === 'code') {
+    return (
+      <>
+        <Section title="Available tools" meta={`${registry.length}`} icon="wrench">
+          <p className="help">Every tool passes the same approval policy as this session.</p>
+          <div className="list-rows">
+            {registry.map((tool) => (
+              <div className="list-row" key={tool.name} title={tool.description}>
+                <code className="grow">{tool.name}</code>
+                <Badge tone={riskTone(tool.risk)}>{tool.risk.toLowerCase().startsWith('safe') ? 'Read-only' : tool.risk}</Badge>
+              </div>
+            ))}
+          </div>
+        </Section>
+        {wsId && <GitCard wsId={wsId} wsPath={wsPath} convId={convId} notify={notify} />}
+        <Section title="Recent executions" meta={execs.length ? `${execs.length}` : undefined} icon="history" actions={<IconButton icon="refresh" label="Refresh executions" size="sm" tipSide="bottom-end" onClick={() => setExecsTick((value) => value + 1)} />}>
+          {execs.length === 0 && <p className="help">Nothing has run in this session yet.</p>}
+          <div>
+            {execs.map((execution) => (
+              <details key={execution.id} className="tool-execution">
+                <summary><Icon name="chevronRight" size={13} /><code>{execution.tool.replace(/^chat:/, '')}</code><small className="readout">{execution.approved ? 'approved' : 'automatic'}</small></summary>
+                <pre className="pre-block">{execution.result.slice(0, 1500)}</pre>
+              </details>
+            ))}
+          </div>
+        </Section>
+      </>
+    );
+  }
+
   return (
     <>
-      <div className="card">
-        <strong>Available tools</strong>
-        <p className="panel-caption">{registry.length} local tools share the same approval boundary as this session.</p>
-        {registry.slice(0, 8).map((tool) => <div className="tool-line" key={tool.name}><code>{tool.name}</code><span>{tool.risk}</span></div>)}
-      </div>
-      {mode === 'code' && wsId && <GitCard wsId={wsId} wsPath={wsPath} convId={convId} notify={notify} />}
-      <div className="card">
-        <strong>Recent executions</strong>
-        {execs.length === 0 && <p className="panel-caption">Nothing has run in this session yet.</p>}
-        {execs.map((execution) => (
-          <details key={execution.id} className="tool-execution">
-            <summary><code>{execution.tool.replace(/^chat:/, '')}</code><span>{execution.approved ? 'approved' : 'automatic'}</span></summary>
-            <pre className="diff-stat">{execution.result.slice(0, 1500)}</pre>
-          </details>
-        ))}
-      </div>
+      {mode === 'code' && ws && (
+        <div className="insp-project"><Icon name="folder" size={18} /><div><strong>{ws.name}</strong><code>{ws.path}</code></div></div>
+      )}
+      <Section title="Context" icon="gauge" actions={ctx?.health ? <Badge tone={ctx.health === 'healthy' ? 'ok' : ctx.health === 'moderate' ? 'info' : ctx.health === 'high' ? 'warn' : 'err'}>{ctx.health}</Badge> : undefined}>
+        {convId ? <ContextBar ctx={ctx} onCompact={onCompact} compacting={compacting} /> : <p className="help">Open a session to inspect its context.</p>}
+      </Section>
+      {modelId && <RecommendCard modelId={modelId} notify={notify} />}
+      <InstructionsCard wsId={wsId} />
+      {convId && <MemoryPanel convId={convId} workspaceId={wsId} notify={notify} />}
     </>
   );
 }

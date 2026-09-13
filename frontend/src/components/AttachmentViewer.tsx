@@ -1,8 +1,7 @@
 import { useState } from 'react';
-import { artifactInfo } from '../services/api';
-import { useEscape } from '../ui/primitives';
+import { Button, Dialog } from '../ui/primitives';
 
-// Stage 28 attachment viewer (§74): zoom-ish preview + metadata + OCR text.
+// Attachment viewer: image preview with zoom, or the extracted text.
 export default function AttachmentViewer({
   convId,
   att,
@@ -16,32 +15,25 @@ export default function AttachmentViewer({
 }) {
   const [zoom, setZoom] = useState(false);
   const isImage = att.kind === 'image';
-  void artifactInfo;
-  useEscape(onClose);
   return (
-    <div className="modal-backdrop" onClick={onClose} role="presentation">
-      <div className="modal wide" role="dialog" aria-modal="true" aria-label={`Attachment ${att.filename}`} onClick={(e) => e.stopPropagation()}>
-        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-          <strong>{att.filename}</strong>
-          <span style={{ flex: 1 }} />
-          {isImage && <button onClick={() => setZoom((v) => !v)}>{zoom ? 'Fit' : 'Zoom'}</button>}
-          <button onClick={onClose}>Close</button>
-        </div>
-        <div style={{ fontSize: 12, color: 'var(--text-secondary)', margin: '4px 0' }}>
-          {att.mime} · {(att.size_bytes / 1024).toFixed(1)} KB · {att.kind}
-          {att.status && att.status !== 'ready' ? ` · ${att.status}` : ''}
-        </div>
-        {isImage ? (
-          <img
-            src={`/api/conversations/${convId}/attachments/${att.id}/file`}
-            alt={att.filename}
-            style={zoom ? { width: '100%' } : { maxWidth: '100%', maxHeight: '60vh', objectFit: 'contain' }}
-            onError={() => notify('error', 'Preview unavailable — the file is still on disk.')}
-          />
-        ) : (
-          <pre className="diff-body">{att.text_excerpt || '(no extracted text)'}</pre>
-        )}
-      </div>
-    </div>
+    <Dialog
+      title={att.filename}
+      icon={isImage ? 'image' : 'fileText'}
+      size="xl"
+      onClose={onClose}
+      footer={<>{isImage && <Button variant="ghost" icon={zoom ? 'panelLeft' : 'search'} onClick={() => setZoom((v) => !v)}>{zoom ? 'Fit to window' : 'Actual size'}</Button>}<span className="spacer" /><Button onClick={onClose}>Close</Button></>}
+    >
+      <p className="viewer-meta">{att.mime} · {(att.size_bytes / 1024).toFixed(1)} KB · {att.kind}{att.status && att.status !== 'ready' ? ` · ${att.status}` : ''}</p>
+      {isImage ? (
+        <img
+          className={`viewer-image${zoom ? ' zoom' : ''}`}
+          src={`/api/conversations/${convId}/attachments/${att.id}/file`}
+          alt={att.filename}
+          onError={() => notify('error', 'Preview unavailable — the file is still on disk.')}
+        />
+      ) : (
+        <pre className="pre-block" style={{ maxHeight: '62dvh' }}>{att.text_excerpt || '(no extracted text)'}</pre>
+      )}
+    </Dialog>
   );
 }

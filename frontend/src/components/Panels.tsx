@@ -12,9 +12,15 @@ import {
   type AttachmentInfo,
 } from '../services/api';
 import AttachmentViewer from './AttachmentViewer';
-import { useEscape } from '../ui/primitives';
+import { Button, Dialog, IconButton, Section } from '../ui/primitives';
+import { Icon, type IconName } from '../ui/Icon';
 
-const STATUS_ICON: Record<string, string> = { ready: '✓', partial: '⚠', processing: '●', unsupported: '✕' };
+const kb = (bytes: number) => bytes >= 1_048_576 ? `${(bytes / 1_048_576).toFixed(1)} MB` : `${(bytes / 1024).toFixed(1)} KB`;
+
+function attachmentIcon(item: AttachmentInfo): IconName {
+  if (item.status === 'unsupported' || item.status === 'partial') return 'alert';
+  return item.kind === 'image' ? 'image' : 'fileText';
+}
 
 export function AttachmentsPanel({
   convId,
@@ -37,40 +43,29 @@ export function AttachmentsPanel({
     load();
     ocrStatus()
       .then((o) => {
-        if (!o.available) setOcr('OCR engine not installed — images use the vision model or a text fallback.');
+        if (!o.available) setOcr('No OCR engine is installed, so images use the vision model or a text fallback.');
       })
       .catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [convId]);
 
-  if (items.length === 0) return null;
-
   return (
-    <div className="card" style={{ margin: '0 16px' }}>
-      <strong>Attachments ({items.length})</strong>
-      {items.map((a) => (
-        <div key={a.id} style={{ display: 'flex', gap: 8, fontSize: 13, marginTop: 4, alignItems: 'center' }}>
-          <span title={a.status ?? 'ready'}>{a.kind === 'image' ? '🖼' : '📄'}</span>
-          <button className="ctx-toggle" style={{ flex: 1, textAlign: 'left' }} onClick={() => setViewing(a)} title="Open viewer">
-            {a.filename} · {(a.size_bytes / 1024).toFixed(1)} KB
-          </button>
-          <span style={{ color: 'var(--text-muted)', fontSize: 12 }} title={`extraction: ${a.status ?? 'ready'}`}>
-            {STATUS_ICON[a.status ?? 'ready'] ?? ''}
-          </span>
-          <button
-            onClick={() => deleteAttachment(convId, a.id).then(load).catch((e) => notify('error', e.message))}
-            title="Remove attachment"
-          >
-            ×
-          </button>
+    <Section title="Attachments" meta={items.length ? `${items.length}` : undefined} icon="paperclip">
+      {items.length === 0 && <p className="help">Nothing attached. Drop a file on the composer or use the paperclip.</p>}
+      {items.length > 0 && (
+        <div className="list-rows">
+          {items.map((a) => (
+            <div key={a.id} className="list-row">
+              <Icon name={attachmentIcon(a)} size={15} />
+              <button type="button" className="link grow" onClick={() => setViewing(a)} title={`Open ${a.filename}`}>{a.filename}</button>
+              <small>{kb(a.size_bytes)}{a.status && a.status !== 'ready' ? ` · ${a.status}` : ''}</small>
+              <IconButton icon="x" label={`Remove ${a.filename}`} size="sm" tipSide="left" onClick={() => deleteAttachment(convId, a.id).then(load).catch((e) => notify('error', e.message))} />
+            </div>
+          ))}
         </div>
-      ))}
-      {budget?.warnings.map((w, i) => (
-        <div key={i} className="approval" style={{ marginTop: 4, fontSize: 12 }}>
-          {w}
-        </div>
-      ))}
-      {ocr && <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>{ocr}</div>}
+      )}
+      {budget?.warnings.map((w, i) => <p key={i} className="help" style={{ color: 'var(--caution-ink)' }}>{w}</p>)}
+      {ocr && items.some((item) => item.kind === 'image') && <p className="help">{ocr}</p>}
       {viewing && (
         <AttachmentViewer
           convId={convId}
@@ -79,7 +74,7 @@ export function AttachmentsPanel({
           notify={(k, t) => notify(k === 'error' ? 'error' : 'info', t)}
         />
       )}
-    </div>
+    </Section>
   );
 }
 
@@ -118,48 +113,31 @@ export function ArtifactsPanel({ convId, generating }: { convId: string; generat
   if (items.length === 0 && !generating) return null;
 
   return (
-    <div className="card" style={{ margin: '0 16px' }}>
-      <strong>
-        Generated {items.length} artifact{items.length === 1 ? '' : 's'}
-      </strong>
-      {generating && <div style={{ fontSize: 12 }}>● Generating…</div>}
-      {items.map((a) => (
-        <div key={a.id} style={{ display: 'flex', gap: 8, fontSize: 13, marginTop: 4, alignItems: 'center', flexWrap: 'wrap' }}>
-          <span>📦</span>
-          <span style={{ flex: 1 }}>{a.filename} · {(a.size_bytes / 1024).toFixed(1)} KB</span>
-          <button onClick={() => setPreview({ name: a.filename, url: artifactUrl(a.id) })}>Open</button>
-          <a href={artifactUrl(a.id)} download={a.filename}>
-            <button>Save As</button>
-          </a>
-          <button onClick={() => reveal(a.id)} title="Show file location (copies path)">
-            Reveal
-          </button>
-        </div>
-      ))}
-      {Object.entries(paths).map(([id, p]) => (
-        <div key={id} style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 2 }}>
-          {p} (copied)
-        </div>
-      ))}
-      {preview && (
-        <PreviewModal name={preview.name} url={preview.url} onClose={() => setPreview(null)} />
-      )}
-    </div>
+    <Section title="Generated files" meta={`${items.length}`} icon="box">
+      {generating && <p className="help">Generating…</p>}
+      <div className="list-rows">
+        {items.map((a) => (
+          <div key={a.id}>
+            <div className="list-row">
+              <Icon name="box" size={15} />
+              <button type="button" className="link grow" onClick={() => setPreview({ name: a.filename, url: artifactUrl(a.id) })} title={`Preview ${a.filename}`}>{a.filename}</button>
+              <small>{kb(a.size_bytes)}</small>
+              <a className="icon-btn sm" href={artifactUrl(a.id)} download={a.filename} aria-label={`Save ${a.filename}`} data-tip="Save as" data-tip-side="left"><Icon name="download" size={14} /></a>
+              <IconButton icon="folder" label="Copy file location" size="sm" tipSide="left" onClick={() => reveal(a.id)} />
+            </div>
+            {paths[a.id] && <p className="help mono">{paths[a.id]} — copied</p>}
+          </div>
+        ))}
+      </div>
+      {preview && <PreviewModal name={preview.name} url={preview.url} onClose={() => setPreview(null)} />}
+    </Section>
   );
 }
 
 function PreviewModal({ name, url, onClose }: { name: string; url: string; onClose: () => void }) {
-  useEscape(onClose);
   return (
-    <div className="modal-backdrop" onClick={onClose} role="presentation">
-      <div className="modal wide" role="dialog" aria-modal="true" aria-label={name} onClick={(e) => e.stopPropagation()}>
-        <div style={{ display: 'flex', gap: 8 }}>
-          <strong>{name}</strong>
-          <span style={{ flex: 1 }} />
-          <button onClick={onClose}>Close</button>
-        </div>
-        <iframe src={url} title={name} style={{ width: '100%', height: '60vh', marginTop: 8 }} />
-      </div>
-    </div>
+    <Dialog title={name} icon="box" size="xl" onClose={onClose} footer={<><a className="btn secondary" href={url} download={name}><Icon name="download" size={16} /><span className="btn-label">Save as</span></a><Button variant="ghost" onClick={onClose}>Close</Button></>}>
+      <iframe className="viewer-frame" src={url} title={name} />
+    </Dialog>
   );
 }
