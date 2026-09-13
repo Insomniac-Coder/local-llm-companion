@@ -62,9 +62,12 @@ export function RuntimeSummary({ policy, dirty }: { policy: RuntimePolicy; dirty
     <div><dt>Context window</dt><dd>{value.effective_context.toLocaleString()} tokens</dd></div>
     <div><dt>CPU threads</dt><dd>{value.threads === 0 ? 'Runtime managed' : value.threads}</dd></div>
     <div><dt>GPU layers</dt><dd>{value.gpu_layers === -1 ? 'Runtime chooses' : value.gpu_layers}</dd></div>
-    <div><dt>Prompt batch</dt><dd>{value.batch_size}</dd></div>
+    <div><dt>Prompt batch</dt><dd>{value.batch_size === 0 ? 'Runtime default' : value.batch_size}</dd></div>
     <div><dt>Flash attention</dt><dd>{value.flash_attention}</dd></div>
     <div><dt>Cache placement</dt><dd>{value.kv_offload}</dd></div>
+    {value.placement && value.placement !== 'unknown' && <div><dt>Planned placement</dt><dd>{value.placement === 'gpu' ? 'Whole model on the GPU' : value.placement === 'hybrid' ? 'Split between GPU and system RAM (slower)' : value.placement === 'oversubscribed' ? 'Does not fit GPU + RAM (may fail or page)' : value.placement === 'cpu' ? 'CPU only' : value.placement}</dd></div>}
+    <div><dt>Speculative decoding</dt><dd>{value.speculative && value.speculative !== 'none' ? `${value.speculative} (drafts from context, lossless)` : 'off'}</dd></div>
+    <div><dt>Cache chunk reuse</dt><dd>{value.cache_reuse ? `${value.cache_reuse.toLocaleString()}-token minimum` : 'off'}</dd></div>
   </dl>;
   return <details className="settings-runtime-details">
     <summary>View runtime configuration</summary>
@@ -259,7 +262,11 @@ export default function SettingsPanel({ setToasts }: { setToasts: React.Dispatch
 
           <section className="settings-section settings-performance" data-settings-title="Performance">
             <h2><Icon name="gauge" size={16} />Performance</h2><p className="settings-section-intro">Let Companion choose compatible runtime settings when you load a model.</p>
-            <div className="settings-fields"><SettingField label="Manage hardware automatically" description="Chooses processor usage, GPU placement, prompt batching and cache defaults. Changes apply after Save and the next model load."><input type="checkbox" className="switch" checked={s.runtime_auto !== false} onChange={(event) => set(['runtime_auto'], event.target.checked)} /></SettingField></div>
+            <div className="settings-fields">
+              <SettingField label="Manage hardware automatically" description="Chooses processor usage, GPU placement, prompt batching and cache defaults. Changes apply after Save and the next model load."><input type="checkbox" className="switch" checked={s.runtime_auto !== false} onChange={(event) => set(['runtime_auto'], event.target.checked)} /></SettingField>
+              <SettingField label="Speculative decoding" description="Auto drafts tokens that already appear in the context and verifies them in one step. Output is identical; replies that repeat context (code edits, file rewrites, tool calls) finish several times faster. Applies on the next model load."><select value={s.runtime?.speculative ?? 'auto'} onChange={(event) => set(['runtime', 'speculative'], event.target.value)}><option value="auto">Auto (draft from context)</option><option value="off">Off</option></select></SettingField>
+              <SettingField label="KV cache precision" description="f16 is the compatibility default. q8_0 halves cache memory, which allows a larger context on the same GPU, at a small speed cost on this runtime. Applies on the next model load."><select value={s.runtime?.kv_cache ?? 'f16'} onChange={(event) => set(['runtime', 'kv_cache'], event.target.value)}><option value="f16">f16 (default)</option><option value="q8_0">q8_0 (half the cache memory)</option></select></SettingField>
+            </div>
             <HardwareOverrides settings={s} set={set} />
             <div className="settings-runtime-summary"><strong>A fresh cache for each model load</strong><p>The runtime handles cache layout for the model architecture. Loading a model starts a fresh runtime cache; your saved conversations remain on disk.</p></div>
             {policyLoading && <p className="settings-capability-note" role="status">Checking runtime configuration…</p>}

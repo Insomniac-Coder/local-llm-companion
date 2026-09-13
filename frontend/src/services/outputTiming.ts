@@ -4,12 +4,22 @@ export interface OutputTiming {
   basis: 'visible_output_v1';
   output_tps: number | null;
   estimated: boolean;
-  token_basis: 'tokenizer' | 'character_estimate' | 'mixed';
+  token_basis: 'tokenizer' | 'character_estimate' | 'mixed' | 'engine';
   output_tokens: number;
   first_visible_ms: number | null;
   output_ms: number;
   thinking_ms: number | null;
   total_ms: number;
+  /** Decode rate measured by the model runtime itself (all generated tokens). */
+  engine_output_tps?: number | null;
+  /** Prefill rate measured by the runtime for the non-cached prompt tokens. */
+  engine_prompt_tps?: number | null;
+  /** Prompt tokens served from the KV cache instead of being recomputed. */
+  cached_tokens?: number | null;
+  predicted_tokens?: number | null;
+  /** Speculative decoding: drafted tokens and how many were accepted. */
+  draft_tokens?: number | null;
+  draft_accepted?: number | null;
 }
 
 /** Approximate live display only; final rates come from backend timing. */

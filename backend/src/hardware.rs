@@ -1,7 +1,13 @@
 //! Hardware detection (§11) + resource monitoring (§47–§48).
+//!
+//! Static facts (CPU model, core counts, RAM size, OS) are read once; the
+//! dynamic readings come from a memory-only refresh. The previous version
+//! built a full `System::new_all()` (every process on the machine, with
+//! command lines) on each call, and several request handlers call this.
 
 use serde::{Deserialize, Serialize};
-use sysinfo::System;
+use std::sync::OnceLock;
+use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CpuInfo {
@@ -47,57 +53,87 @@ pub struct ResourceSnapshot {
     pub tokens_per_sec: f32,
 }
 
+struct StaticInfo {
+    cpu: CpuInfo,
+    total_gb: f64,
+    os: String,
+}
+
+fn static_info() -> &'static StaticInfo {
+    static INFO: OnceLock<StaticInfo> = OnceLock::new();
+    INFO.get_or_init(|| {
+        let sys = System::new_with_specifics(
+            RefreshKind::new()
+                .with_cpu(CpuRefreshKind::new())
+                .with_memory(MemoryRefreshKind::new().with_ram()),
+        );
+        let cpu_model = sys
+            .cpus()
+            .first()
+            .map(|c| c.brand().trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Unknown CPU".into());
+        let logical = sys.cpus().len();
+        let physical = sys.physical_core_count().unwrap_or(logical);
+        StaticInfo {
+            cpu: CpuInfo {
+                model: cpu_model,
+                physical_cores: physical,
+                logical_cores: logical,
+            },
+            total_gb: (sys.total_memory() as f64 / 1_073_741_824.0 * 10.0).round() / 10.0,
+            os: std::env::consts::OS.into(),
+        }
+    })
+}
+
+fn available_ram_gb() -> f64 {
+    let sys = System::new_with_specifics(
+        RefreshKind::new().with_memory(MemoryRefreshKind::new().with_ram()),
+    );
+    (sys.available_memory() as f64 / 1_073_741_824.0 * 10.0).round() / 10.0
+}
+
 pub fn detect() -> HardwareReport {
-    let mut sys = System::new_all();
-    sys.refresh_all();
-    let cpu_model = sys
-        .cpus()
-        .first()
-        .map(|c| c.brand().trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "Unknown CPU".into());
-    let logical = sys.cpus().len();
-    let physical = sys.physical_core_count().unwrap_or(logical);
-    let total_gb = sys.total_memory() as f64 / 1_073_741_824.0;
-    let avail_gb = sys.available_memory() as f64 / 1_073_741_824.0;
+    let info = static_info();
     HardwareReport {
-        cpu: CpuInfo {
-            model: cpu_model,
-            physical_cores: physical,
-            logical_cores: logical,
-        },
+        cpu: info.cpu.clone(),
         ram: RamInfo {
-            total_gb: (total_gb * 10.0).round() / 10.0,
-            available_gb: (avail_gb * 10.0).round() / 10.0,
+            total_gb: info.total_gb,
+            available_gb: available_ram_gb(),
         },
-        // GPU enumeration needs platform APIs (NVML/ADL/IOKit); Stage 11 wires it.
-        // Until then report a CPU fallback so auto-config degrades gracefully (§4).
+        // GPU enumeration needs platform APIs (NVML/ADL/IOKit); the resource
+        // sampler supplies measured VRAM where a driver reports it, and the
+        // model runtime's own device list decides placement at load.
         gpus: vec![GpuInfo {
             vendor: "unknown".into(),
-            model: "no GPU enumerated yet (Stage 11)".into(),
+            model: "not enumerated (runtime device list decides placement)".into(),
             vram_gb: 0.0,
             available_vram_gb: 0.0,
             backend: "cpu".into(),
         }],
-        os: std::env::consts::OS.into(),
+        os: info.os.clone(),
     }
 }
 
-pub fn snapshot(context_used: u32, context_limit: u32, tps: f32) -> ResourceSnapshot {
-    let mut sys = System::new_all();
-    sys.refresh_memory();
-    sys.refresh_cpu();
-    let total_gb = sys.total_memory() as f64 / 1_073_741_824.0;
-    let avail = sys.available_memory() as f64 / 1_073_741_824.0;
-    // sysinfo 0.30 CPU usage needs a refresh interval; first call may be 0.
-    let cpu = sys.global_cpu_info().cpu_usage();
+/// Point-in-time readings. CPU and GPU utilisation come from the background
+/// sampler's latest sample (a one-shot CPU reading is meaningless without a
+/// prior interval); memory is read fresh.
+pub fn snapshot(
+    latest: Option<&crate::metrics::Sample>,
+    context_used: u32,
+    context_limit: u32,
+    tps: f32,
+) -> ResourceSnapshot {
+    let info = static_info();
+    let avail = available_ram_gb();
     ResourceSnapshot {
-        cpu_percent: cpu,
-        ram_used_gb: ((total_gb - avail) * 10.0).round() / 10.0,
-        ram_total_gb: (total_gb * 10.0).round() / 10.0,
-        vram_used_gb: 0.0,
-        vram_total_gb: 0.0,
-        gpu_percent: 0.0,
+        cpu_percent: latest.map(|s| s.cpu_pct).unwrap_or(0.0),
+        ram_used_gb: ((info.total_gb - avail).max(0.0) * 10.0).round() / 10.0,
+        ram_total_gb: info.total_gb,
+        vram_used_gb: latest.and_then(|s| s.vram_used_gb).unwrap_or(0.0),
+        vram_total_gb: latest.and_then(|s| s.vram_total_gb).unwrap_or(0.0),
+        gpu_percent: latest.and_then(|s| s.gpu_pct).unwrap_or(0.0),
         context_used,
         context_limit,
         tokens_per_sec: tps,
@@ -113,6 +149,7 @@ mod tests {
         let h = detect();
         assert!(h.ram.total_gb > 0.0);
         assert!(!h.cpu.model.is_empty());
+        assert!(h.cpu.logical_cores > 0);
     }
 
     #[test]
@@ -124,11 +161,28 @@ mod tests {
             "implausible RAM total: {} (unit bug?)",
             h.ram.total_gb
         );
-        let s = snapshot(0, 0, 0.0);
+        let s = snapshot(None, 0, 0, 0.0);
         assert!(
             (0.5..=8192.0).contains(&s.ram_total_gb),
             "implausible snapshot RAM: {}",
             s.ram_total_gb
+        );
+        assert!(s.ram_used_gb <= s.ram_total_gb);
+    }
+
+    #[test]
+    fn repeated_detection_is_cheap_and_stable() {
+        let first = detect();
+        let start = std::time::Instant::now();
+        for _ in 0..50 {
+            let again = detect();
+            assert_eq!(again.cpu.model, first.cpu.model);
+            assert_eq!(again.ram.total_gb, first.ram.total_gb);
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "50 detections took {:?}; static facts must be cached",
+            start.elapsed()
         );
     }
 }

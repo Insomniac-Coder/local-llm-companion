@@ -47,6 +47,7 @@ export default function SessionActivity({
   const [runs, setRuns] = useState<AgentRunSummary[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(focusRun ?? null);
   const [events, setEvents] = useState<AgentEvent[]>([]);
+  const [liveText, setLiveText] = useState('');
   const [permissionResolved, setPermissionResolved] = useState(false);
   const [stopping, setStopping] = useState(false);
   const abort = useRef<AbortController | null>(null);
@@ -78,12 +79,18 @@ export default function SessionActivity({
   useEffect(() => {
     abort.current?.abort();
     setEvents([]);
+    setLiveText('');
     setPermissionResolved(false);
     setStopping(false);
     if (!selectedId) return;
     const controller = new AbortController();
     abort.current = controller;
     void streamAgentEvents(selectedId, (event) => {
+      if (event.kind === 'thought_delta') {
+        setLiveText((text) => text + event.message);
+        return;
+      }
+      setLiveText('');
       setEvents((previous) => mergeEvent(previous, event));
       if (event.state === 'WAITING_PERMISSION') setPermissionResolved(false);
       if (TERMINAL.includes(event.state)) {
@@ -162,6 +169,12 @@ export default function SessionActivity({
       )}
 
       <ToolTimeline events={events} />
+      {active && liveText.trim() && (
+        <div className="live-thought-block" aria-live="off">
+          <span className="eyebrow">Writing now</span>
+          <pre>{liveText}</pre>
+        </div>
+      )}
 
       {runs.length > 1 && (
         <details className="run-history">

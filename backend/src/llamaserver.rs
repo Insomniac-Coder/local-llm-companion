@@ -20,7 +20,10 @@ use std::time::Duration;
 use tokio::process::{Child, Command};
 
 pub const DEFAULT_SIDECAR_PORT: u16 = 3888;
-const HEALTH_TIMEOUT_SECS: u64 = 90;
+/// A cold 9 GB model on a laptop drive can take several minutes to page in;
+/// a dead worker still fails immediately because the child exit is checked
+/// on every poll.
+const HEALTH_TIMEOUT_SECS: u64 = 300;
 
 /// Where the `llama-server` binary lives.
 #[derive(Debug, Clone)]
@@ -142,8 +145,6 @@ pub fn server_args(cfg: &InferenceConfig, port: u16) -> Vec<String> {
         cfg.model_path.display().to_string(),
         "--ctx-size".into(),
         cfg.n_ctx.to_string(),
-        "--batch-size".into(),
-        cfg.n_batch.to_string(),
         "--n-gpu-layers".into(),
         if cfg.n_gpu_layers < 0 {
             "auto".into()
@@ -164,6 +165,20 @@ pub fn server_args(cfg: &InferenceConfig, port: u16) -> Vec<String> {
         }
         .into(),
     ];
+    // Zero leaves the runtime's own default (2048 logical / 512 physical);
+    // forcing a smaller logical batch only adds decode calls during prefill.
+    if cfg.n_batch > 0 {
+        a.push("--batch-size".into());
+        a.push(cfg.n_batch.to_string());
+    }
+    if cfg.cache_reuse > 0 {
+        a.push("--cache-reuse".into());
+        a.push(cfg.cache_reuse.to_string());
+    }
+    if !cfg.speculative.is_empty() && cfg.speculative != "none" {
+        a.push("--spec-type".into());
+        a.push(cfg.speculative.clone());
+    }
     if cfg.n_threads > 0 {
         a.push("--threads".into());
         a.push(cfg.n_threads.to_string());
@@ -407,6 +422,25 @@ async fn wait_for_health(
     }
 }
 
+/// One connection pool for every request to the sidecar. A fresh client per
+/// request (the previous design) meant a new TCP connection per turn and,
+/// worse, a 600 s whole-request timeout that killed any long generation.
+/// Here only the connect and idle-read timeouts are bounded: a healthy stream
+/// never goes 20 minutes without a byte, while a slow CPU prefill of a large
+/// context still completes.
+fn shared_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .read_timeout(Duration::from_secs(1200))
+            .pool_max_idle_per_host(4)
+            .tcp_nodelay(true)
+            .build()
+            .expect("sidecar http client")
+    })
+}
+
 /// Thin OpenAI-compatible client over the sidecar.
 #[derive(Debug, Clone)]
 pub struct SidecarClient {
@@ -424,6 +458,10 @@ pub struct AgentCompletion {
     pub reasoning_present: bool,
     pub reasoning_tokens: Option<u32>,
     pub native_tool_calls_present: bool,
+    /// The host stopped reading because a complete action had already
+    /// arrived; the runtime was released without generating the remainder.
+    #[serde(default)]
+    pub early_stopped: bool,
 }
 
 impl AgentCompletion {
@@ -463,6 +501,18 @@ fn turn_json(t: &ChatTurn) -> serde_json::Value {
     serde_json::json!({"role": t.role, "content": parts})
 }
 
+/// Per-request knobs on top of the loaded model's sampling configuration.
+#[derive(Debug, Clone, Default)]
+pub struct RequestOptions {
+    /// `Some(false)` asks the chat template to skip native thinking (Qwen 3,
+    /// Gemma 4 and similar); `None` leaves the template default untouched.
+    pub thinking: Option<bool>,
+    /// Runtime-enforced JSON schema (`response_format`) when set.
+    pub response_format: Option<serde_json::Value>,
+    /// Greedy decoding for machine-readable decisions.
+    pub deterministic: bool,
+}
+
 fn sampling_body(
     turns: &[ChatTurn],
     max_tokens: u32,
@@ -477,7 +527,22 @@ fn sampling_body(
         "top_k": cfg.top_k,
         "repeat_penalty": cfg.repeat_penalty,
         "stream": stream,
+        // Explicit: the slot keeps the longest common prefix of the previous
+        // prompt in its KV cache, so a growing transcript only prefills its tail.
+        "cache_prompt": true,
     })
+}
+
+fn apply_options(body: &mut serde_json::Value, options: &RequestOptions) {
+    if let Some(thinking) = options.thinking {
+        body["chat_template_kwargs"] = serde_json::json!({"enable_thinking": thinking});
+    }
+    if let Some(format) = &options.response_format {
+        body["response_format"] = format.clone();
+    }
+    if options.deterministic {
+        body["temperature"] = serde_json::json!(0);
+    }
 }
 
 /// Observed delivery timing, not an estimate of hidden model compute. Only
@@ -537,13 +602,117 @@ impl VisibleOutputClock {
     }
 }
 
+/// Callbacks for one streamed completion. Every handler is optional; the
+/// defaults do nothing, never cancel and never stop early.
+pub struct StreamHandlers {
+    pub on_token: Box<dyn FnMut(&str) + Send>,
+    pub on_reasoning: Box<dyn FnMut(&str) + Send>,
+    pub on_phase: Box<dyn FnMut(&'static str) + Send>,
+    pub is_cancelled: Box<dyn Fn() -> bool + Send + Sync>,
+    /// Inspects the visible text so far; `true` stops reading. The runtime
+    /// drops the slot as soon as the connection closes, so tokens after a
+    /// complete action are never generated at all.
+    pub should_stop: Box<dyn Fn(&str) -> bool + Send + Sync>,
+}
+
+impl Default for StreamHandlers {
+    fn default() -> Self {
+        Self {
+            on_token: Box::new(|_| {}),
+            on_reasoning: Box::new(|_| {}),
+            on_phase: Box::new(|_| {}),
+            is_cancelled: Box::new(|| false),
+            should_stop: Box::new(|_| false),
+        }
+    }
+}
+
+/// Everything one streamed completion produced, with the runtime's own
+/// accounting where it reported it.
+#[derive(Debug, Clone, Default)]
+pub struct StreamOutcome {
+    pub text: String,
+    pub metrics: Metrics,
+    pub finish_reason: Option<String>,
+    pub reasoning_present: bool,
+    pub native_tool_calls_present: bool,
+    pub early_stopped: bool,
+    pub cancelled: bool,
+}
+
+impl StreamOutcome {
+    pub fn into_completion(self) -> AgentCompletion {
+        AgentCompletion {
+            text: self.text,
+            finish_reason: if self.early_stopped {
+                Some("stop".into())
+            } else {
+                self.finish_reason
+            },
+            reasoning_present: self.reasoning_present,
+            reasoning_tokens: None,
+            native_tool_calls_present: self.native_tool_calls_present,
+            early_stopped: self.early_stopped,
+            metrics: self.metrics,
+        }
+    }
+}
+
+/// Incremental SSE frame splitter: frames end at a blank line (LF or CRLF).
+/// Scanning resumes where the previous pass stopped instead of rescanning the
+/// whole buffer for every network chunk.
+struct SseFrames {
+    buf: Vec<u8>,
+    scan_from: usize,
+}
+
+impl SseFrames {
+    fn new() -> Self {
+        Self {
+            buf: Vec::with_capacity(4096),
+            scan_from: 0,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+    }
+
+    fn next_frame(&mut self) -> Option<Vec<u8>> {
+        let start = self.scan_from.saturating_sub(3);
+        let mut end = None;
+        let mut index = start;
+        while index < self.buf.len() {
+            if self.buf[index] == b'\n' {
+                if self.buf.get(index + 1) == Some(&b'\n') {
+                    end = Some((index, 2));
+                    break;
+                }
+                if self.buf.get(index + 1) == Some(&b'\r') && self.buf.get(index + 2) == Some(&b'\n')
+                {
+                    end = Some((index, 3));
+                    break;
+                }
+            }
+            index += 1;
+        }
+        let (at, separator) = end?;
+        let frame: Vec<u8> = self.buf.drain(..at + separator).collect();
+        self.scan_from = 0;
+        Some(frame)
+    }
+
+    fn mark_scanned(&mut self) {
+        self.scan_from = self.buf.len();
+    }
+}
+
 impl SidecarClient {
     pub fn new(base_url: String) -> Result<Self, InferenceError> {
-        let inner = reqwest::Client::builder()
-            .timeout(Duration::from_secs(600))
-            .build()
-            .map_err(|e| InferenceError::Generation(format!("http client failed: {e}")))?;
-        Ok(Self { base_url, inner })
+        Ok(Self {
+            base_url,
+            inner: shared_client().clone(),
+        })
     }
 
     /// Non-streaming chat completion. Returns text + usage-derived metrics.
@@ -573,13 +742,35 @@ impl SidecarClient {
         cfg: &InferenceConfig,
     ) -> Result<AgentCompletion, InferenceError> {
         let mut body = sampling_body(turns, 192, cfg, false);
-        body["temperature"] = serde_json::json!(0);
-        body["chat_template_kwargs"] = serde_json::json!({"enable_thinking": false});
-        body["response_format"] = serde_json::json!({"type":"json_object", "schema": {
-            "type":"object", "properties":{"activity":{"type":"string","minLength":1,"maxLength":500},"intent":{"type":"string","enum":["ask","plan","agent"]}},
-            "required":["activity","intent"], "additionalProperties":false
-        }});
+        apply_options(
+            &mut body,
+            &RequestOptions {
+                thinking: Some(false),
+                deterministic: true,
+                response_format: Some(serde_json::json!({"type":"json_object", "schema": {
+                    "type":"object", "properties":{"activity":{"type":"string","minLength":1,"maxLength":500},"intent":{"type":"string","enum":["ask","plan","agent"]}},
+                    "required":["activity","intent"], "additionalProperties":false
+                }})),
+            },
+        );
         self.complete_detailed(body, cfg).await
+    }
+
+    fn structured_action_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "json_object",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["tool", "final"]},
+                    "name": {"type": "string"},
+                    "args": {"type": "object", "additionalProperties": true},
+                    "answer": {"type": "string"}
+                },
+                "required": ["kind", "name", "args", "answer"],
+                "additionalProperties": false
+            }
+        })
     }
 
     /// Only agent execution opts into this override. A caller may make one
@@ -594,28 +785,40 @@ impl SidecarClient {
         structured: bool,
     ) -> Result<AgentCompletion, InferenceError> {
         let mut body = sampling_body(turns, max_tokens, cfg, false);
-        if disable_native_thinking {
-            body["chat_template_kwargs"] = serde_json::json!({"enable_thinking": false});
-        }
-        if structured {
-            body["response_format"] = serde_json::json!({
-                "type": "json_object",
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "kind": {"type": "string", "enum": ["tool", "final"]},
-                        "name": {"type": "string"},
-                        "args": {"type": "object", "additionalProperties": true},
-                        "answer": {"type": "string"}
-                    },
-                    "required": ["kind", "name", "args", "answer"],
-                    "additionalProperties": false
-                }
-            });
-            // The caller adds the format instruction before estimating its
-            // request context. Never append invisible/unaccounted turns here.
-        }
+        apply_options(
+            &mut body,
+            &RequestOptions {
+                thinking: disable_native_thinking.then_some(false),
+                // The caller adds the format instruction before estimating its
+                // request context. Never append invisible/unaccounted turns here.
+                response_format: structured.then(Self::structured_action_schema),
+                deterministic: false,
+            },
+        );
         self.complete_detailed(body, cfg).await
+    }
+
+    /// Streaming variant of `agent_chat_turns`: visible deltas reach the
+    /// handlers as they arrive, and `should_stop` can end the request the
+    /// moment a complete action has been received.
+    pub async fn agent_chat_turns_stream(
+        &self,
+        turns: &[ChatTurn],
+        max_tokens: u32,
+        cfg: &InferenceConfig,
+        disable_native_thinking: bool,
+        structured: bool,
+        handlers: StreamHandlers,
+    ) -> Result<AgentCompletion, InferenceError> {
+        let options = RequestOptions {
+            thinking: disable_native_thinking.then_some(false),
+            response_format: structured.then(Self::structured_action_schema),
+            deterministic: false,
+        };
+        let outcome = self
+            .stream(turns, max_tokens, cfg, &options, handlers)
+            .await?;
+        Ok(outcome.into_completion())
     }
 
     /// Host-side completion checks need a short machine-readable decision, not
@@ -628,7 +831,13 @@ impl SidecarClient {
         cfg: &InferenceConfig,
     ) -> Result<(String, Metrics), InferenceError> {
         let mut body = sampling_body(turns, max_tokens, cfg, false);
-        body["chat_template_kwargs"] = serde_json::json!({"enable_thinking": false});
+        apply_options(
+            &mut body,
+            &RequestOptions {
+                thinking: Some(false),
+                ..RequestOptions::default()
+            },
+        );
         self.complete(body, cfg).await
     }
 
@@ -696,22 +905,35 @@ impl SidecarClient {
                 finish_reason.as_deref(),
                 Some("tool_calls" | "function_call")
             );
+        let engine = crate::inference::EngineTimings::from_json(&v["timings"]);
         Ok(AgentCompletion {
             text,
             metrics: Metrics {
-                tokens_per_sec: 0.0, // filled by /metrics or timing in Stage 11
-                prompt_speed_tps: 0.0,
-                time_to_first_token_ms: 0,
+                tokens_per_sec: engine
+                    .as_ref()
+                    .and_then(|e| e.predicted_tps)
+                    .unwrap_or(0.0) as f32,
+                prompt_speed_tps: engine
+                    .as_ref()
+                    .and_then(|e| e.prompt_tps)
+                    .unwrap_or(0.0) as f32,
+                time_to_first_token_ms: engine
+                    .as_ref()
+                    .map(|e| e.prompt_ms.max(0.0) as u64)
+                    .unwrap_or(0),
                 prompt_tokens: usage["prompt_tokens"].as_u64().unwrap_or(0) as u32,
                 generated_tokens: usage["completion_tokens"].as_u64().unwrap_or(0) as u32,
                 kv_cache_used: 0,
                 kv_cache_limit: cfg.n_ctx,
                 timing: None,
+                engine,
+                finish_reason: finish_reason.clone(),
             },
             finish_reason,
             reasoning_present,
             reasoning_tokens,
             native_tool_calls_present,
+            early_stopped: false,
         })
     }
 
@@ -754,14 +976,41 @@ impl SidecarClient {
         max_tokens: u32,
         cfg: &InferenceConfig,
         mut on_token: impl FnMut(String) + Send + 'static,
-        mut on_phase: impl FnMut(&'static str) + Send + 'static,
+        on_phase: impl FnMut(&'static str) + Send + 'static,
         is_cancelled: impl Fn() -> bool + Send + Sync + 'static,
     ) -> Result<Metrics, InferenceError> {
+        let handlers = StreamHandlers {
+            on_token: Box::new(move |delta| on_token(delta.to_string())),
+            on_phase: Box::new(on_phase),
+            is_cancelled: Box::new(is_cancelled),
+            ..StreamHandlers::default()
+        };
+        self.stream(turns, max_tokens, cfg, &RequestOptions::default(), handlers)
+            .await
+            .map(|outcome| outcome.metrics)
+    }
+
+    /// The streaming core. Visible content and native reasoning are routed to
+    /// separate handlers; the runtime's final `timings`/`usage` frame supplies
+    /// engine-measured numbers; `should_stop` can release the slot early.
+    pub async fn stream(
+        &self,
+        turns: &[ChatTurn],
+        max_tokens: u32,
+        cfg: &InferenceConfig,
+        options: &RequestOptions,
+        mut handlers: StreamHandlers,
+    ) -> Result<StreamOutcome, InferenceError> {
         use futures::StreamExt;
         let request_started = std::time::Instant::now();
         let mut body = sampling_body(turns, max_tokens, cfg, true);
         body["stream_options"] = serde_json::json!({"include_usage": true});
-        on_phase("processing");
+        // Every chunk carries the engine's timings, so a stream that is closed
+        // early (a complete action arrived) still reports prompt processing,
+        // cache hits and the tokens decoded so far.
+        body["timings_per_token"] = serde_json::json!(true);
+        apply_options(&mut body, options);
+        (handlers.on_phase)("processing");
         let mut phase = "processing";
         let r = self
             .inner
@@ -777,113 +1026,161 @@ impl SidecarClient {
                 "llama-server returned {code}: {text}"
             )));
         }
-        let mut m = Metrics {
-            kv_cache_limit: cfg.n_ctx,
-            ..Metrics::default()
+        let mut outcome = StreamOutcome {
+            metrics: Metrics {
+                kv_cache_limit: cfg.n_ctx,
+                ..Metrics::default()
+            },
+            ..StreamOutcome::default()
         };
-        let mut buf = Vec::<u8>::new();
-        let mut visible_text = String::new();
+        let mut frames = SseFrames::new();
         let mut clock = VisibleOutputClock::default();
         let mut usage_seen = false;
         let mut byte_stream = r.bytes_stream();
-        while let Some(chunk) = byte_stream.next().await {
-            if is_cancelled() {
+        'read: while let Some(chunk) = byte_stream.next().await {
+            if (handlers.is_cancelled)() {
+                outcome.cancelled = true;
                 break;
             }
             let bytes = chunk
                 .map_err(|e| InferenceError::Generation(format!("stream read failed: {e}")))?;
             // Decode only complete SSE frames, preserving UTF-8 characters
             // when the transport splits a code point between network chunks.
-            buf.extend_from_slice(&bytes);
-            loop {
-                let lf = buf
-                    .windows(2)
-                    .position(|part| part == b"\n\n")
-                    .map(|index| (index, 2));
-                let crlf = buf
-                    .windows(4)
-                    .position(|part| part == b"\r\n\r\n")
-                    .map(|index| (index, 4));
-                let Some((idx, separator)) = [lf, crlf]
-                    .into_iter()
-                    .flatten()
-                    .min_by_key(|(index, _)| *index)
-                else {
-                    break;
-                };
-                let frame_bytes: Vec<u8> = buf.drain(..idx + separator).collect();
+            frames.push(&bytes);
+            while let Some(frame_bytes) = frames.next_frame() {
                 let frame = String::from_utf8_lossy(&frame_bytes);
                 for line in frame.lines() {
                     let line = line.strip_prefix("data:").map(str::trim).unwrap_or("");
                     if line.is_empty() || line == "[DONE]" {
                         continue;
                     }
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                        let now = request_started.elapsed().as_millis() as u64;
-                        if v.pointer("/choices/0/delta/reasoning_content")
-                            .and_then(|value| value.as_str())
-                            .is_some_and(|value| !value.is_empty())
-                        {
-                            clock.reasoning(now);
-                            if phase != "thinking" {
-                                phase = "thinking";
-                                on_phase(phase);
-                            }
+                    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                        continue;
+                    };
+                    let now = request_started.elapsed().as_millis() as u64;
+                    let choice = &v["choices"][0];
+                    if let Some(reasoning) = choice
+                        .pointer("/delta/reasoning_content")
+                        .and_then(|value| value.as_str())
+                        .filter(|value| !value.is_empty())
+                    {
+                        outcome.reasoning_present = true;
+                        clock.reasoning(now);
+                        if phase != "thinking" {
+                            phase = "thinking";
+                            (handlers.on_phase)(phase);
                         }
-                        if let Some(delta) = v
-                            .pointer("/choices/0/delta/content")
-                            .and_then(|c| c.as_str())
-                            .filter(|delta| !delta.is_empty())
-                        {
-                            clock.visible(now);
-                            if phase != "responding" {
-                                phase = "responding";
-                                on_phase(phase);
-                            }
-                            visible_text.push_str(delta);
-                            on_token(delta.to_string());
+                        (handlers.on_reasoning)(reasoning);
+                    }
+                    if choice
+                        .pointer("/delta/tool_calls")
+                        .and_then(|calls| calls.as_array())
+                        .is_some_and(|calls| !calls.is_empty())
+                    {
+                        outcome.native_tool_calls_present = true;
+                    }
+                    if let Some(delta) = choice
+                        .pointer("/delta/content")
+                        .and_then(|c| c.as_str())
+                        .filter(|delta| !delta.is_empty())
+                    {
+                        clock.visible(now);
+                        if phase != "responding" {
+                            phase = "responding";
+                            (handlers.on_phase)(phase);
                         }
-                        if let Some(u) = v.get("usage").filter(|usage| usage.is_object()) {
-                            m.prompt_tokens = u["prompt_tokens"].as_u64().unwrap_or(0) as u32;
-                            if let Some(tokens) = u["completion_tokens"].as_u64() {
-                                m.generated_tokens = tokens.min(u32::MAX as u64) as u32;
-                                usage_seen = true;
-                            }
+                        outcome.text.push_str(delta);
+                        (handlers.on_token)(delta);
+                        if (handlers.should_stop)(&outcome.text) {
+                            outcome.early_stopped = true;
+                            break 'read;
                         }
+                    }
+                    if let Some(reason) = choice.get("finish_reason").and_then(|r| r.as_str()) {
+                        outcome.finish_reason = Some(reason.to_owned());
+                        if matches!(reason, "tool_calls" | "function_call") {
+                            outcome.native_tool_calls_present = true;
+                        }
+                    }
+                    if let Some(u) = v.get("usage").filter(|usage| usage.is_object()) {
+                        outcome.metrics.prompt_tokens =
+                            u["prompt_tokens"].as_u64().unwrap_or(0) as u32;
+                        if let Some(tokens) = u["completion_tokens"].as_u64() {
+                            outcome.metrics.generated_tokens = tokens.min(u32::MAX as u64) as u32;
+                            usage_seen = true;
+                        }
+                    }
+                    if let Some(engine) = crate::inference::EngineTimings::from_json(&v["timings"])
+                    {
+                        outcome.metrics.engine = Some(engine);
                     }
                 }
             }
+            frames.mark_scanned();
         }
+        // Dropping the response stream closes the connection: llama-server
+        // aborts the slot instead of finishing tokens nobody will read.
+        drop(byte_stream);
         let mut timing = clock.finish(request_started.elapsed().as_millis() as u64);
-        if !visible_text.is_empty() {
-            let exact = if visible_text.len() <= 4_000_000 {
-                self.visible_token_count(&visible_text).await
-            } else {
-                None
+        if let Some(engine) = &outcome.metrics.engine {
+            timing.add_engine(engine);
+        }
+        if !outcome.text.is_empty() {
+            // The engine's own count is exact for the visible text when no
+            // hidden reasoning shared the budget; otherwise count only the
+            // delivered text, and never let hidden tokens inflate the rate.
+            let engine_count = outcome
+                .metrics
+                .engine
+                .as_ref()
+                .filter(|_| !outcome.reasoning_present && !outcome.early_stopped)
+                .map(|e| e.predicted_tokens)
+                .filter(|count| *count > 0);
+            let exact = match engine_count {
+                Some(count) => Some((count, "engine")),
+                None if outcome.text.len() <= 4_000_000 => self
+                    .visible_token_count(&outcome.text)
+                    .await
+                    .map(|count| (count, "tokenizer")),
+                None => None,
             };
-            timing.output_tokens = exact.unwrap_or_else(|| {
-                visible_text
+            timing.output_tokens = exact.map(|(count, _)| count).unwrap_or_else(|| {
+                outcome
+                    .text
                     .chars()
                     .count()
                     .div_ceil(4)
                     .min(u32::MAX as usize) as u32
             });
             timing.estimated = exact.is_none();
-            timing.token_basis = if exact.is_some() {
-                "tokenizer"
-            } else {
-                "character_estimate"
-            }
-            .into();
+            timing.token_basis = exact
+                .map(|(_, basis)| basis)
+                .unwrap_or("character_estimate")
+                .into();
         }
         timing.update_rate();
         if !usage_seen {
-            m.generated_tokens = timing.output_tokens;
+            // The final usage frame never arrived (early stop or cancel): the
+            // engine's own counters are exact for what was processed.
+            outcome.metrics.generated_tokens = outcome
+                .metrics
+                .engine
+                .as_ref()
+                .map(|e| e.predicted_tokens)
+                .unwrap_or(timing.output_tokens);
+            if let Some(engine) = &outcome.metrics.engine {
+                outcome.metrics.prompt_tokens = engine.prompt_tokens.saturating_add(engine.cached_tokens);
+            }
         }
-        m.time_to_first_token_ms = timing.first_visible_ms.unwrap_or(0);
-        m.tokens_per_sec = timing.output_tps.unwrap_or(0.0) as f32;
-        m.timing = Some(timing);
-        Ok(m)
+        outcome.metrics.time_to_first_token_ms = timing.first_visible_ms.unwrap_or(0);
+        outcome.metrics.tokens_per_sec = timing
+            .engine_output_tps
+            .or(timing.output_tps)
+            .unwrap_or(0.0) as f32;
+        outcome.metrics.prompt_speed_tps = timing.engine_prompt_tps.unwrap_or(0.0) as f32;
+        outcome.metrics.finish_reason = outcome.finish_reason.clone();
+        outcome.metrics.timing = Some(timing);
+        Ok(outcome)
     }
 
     /// A bounded local tokenizer request counts only content delivered to the
@@ -1091,9 +1388,15 @@ mod tests {
         assert!(has("--flash-attn", "auto"));
         assert!(has("--n-gpu-layers", "auto"));
         assert!(has("--parallel", "1"));
+        assert!(has("--cache-reuse", "256"));
+        assert!(has("--spec-type", "ngram-simple"));
         assert!(
             !args.contains(&"--threads".into()),
             "automatic threads use the native default, not a literal zero"
+        );
+        assert!(
+            !args.contains(&"--batch-size".into()),
+            "automatic mode keeps the runtime's default batch sizes"
         );
         assert!(!args
             .iter()
@@ -1101,11 +1404,35 @@ mod tests {
         cfg.flash_attn_auto = false;
         cfg.flash_attn = false;
         cfg.kv_cache_gpu = false;
+        cfg.n_batch = 1024;
+        cfg.speculative = "none".into();
+        cfg.cache_reuse = 0;
         let manual = server_args(&cfg, 3888);
         assert!(manual
             .windows(2)
             .any(|pair| pair[0] == "--flash-attn" && pair[1] == "off"));
         assert!(manual.contains(&"--no-kv-offload".into()));
+        assert!(manual
+            .windows(2)
+            .any(|pair| pair[0] == "--batch-size" && pair[1] == "1024"));
+        assert!(!manual.contains(&"--spec-type".into()));
+        assert!(!manual.contains(&"--cache-reuse".into()));
+    }
+
+    #[test]
+    fn sse_frame_splitter_handles_lf_crlf_and_partial_frames() {
+        let mut frames = SseFrames::new();
+        frames.push(b"data: a\n\ndata: b\r\n\r\ndata: ");
+        assert_eq!(frames.next_frame().unwrap(), b"data: a\n\n");
+        assert_eq!(frames.next_frame().unwrap(), b"data: b\r\n\r\n");
+        assert!(frames.next_frame().is_none());
+        frames.mark_scanned();
+        frames.push(b"c\n");
+        assert!(frames.next_frame().is_none());
+        frames.mark_scanned();
+        frames.push(b"\n");
+        assert_eq!(frames.next_frame().unwrap(), b"data: c\n\n");
+        assert!(frames.buf.is_empty());
     }
 
     #[tokio::test]

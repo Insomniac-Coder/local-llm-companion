@@ -6,7 +6,7 @@
 //! the loop (§26); Stop cancels it and aborts any in-flight sidecar request.
 
 use crate::agent::{AgentEvent, AgentLimits, AgentMode, AgentState, CancelToken, PendingTool};
-use crate::llamaserver::{ChatTurn, SidecarClient};
+use crate::llamaserver::{ChatTurn, SidecarClient, StreamHandlers};
 use crate::permissions::{PermissionDecision, RiskLevel};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -14,8 +14,11 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
 
-const TRANSCRIPT_TURNS: usize = 24;
+/// Soft cap on transcript turns; the size-aware pruning below is the real
+/// bound. Prefix caching makes a long unchanged transcript nearly free.
+const TRANSCRIPT_TURNS: usize = 60;
 const TOOL_OUTPUT_CHARS: usize = 16_000;
+const RELEASED_MARKER: &str = "[Released:";
 
 #[derive(Default)]
 struct ActionResponsePolicy {
@@ -26,21 +29,29 @@ struct ActionResponsePolicy {
 }
 
 impl ActionResponsePolicy {
-    fn output_budget(&self, context: u32, estimated_input: u32) -> u32 {
-        let cap = if self.disable_native_thinking {
-            4096
+    /// Enough for a complete file write in one action. A complete action ends
+    /// the stream early, so a large allowance costs nothing on short replies.
+    fn output_cap(&self) -> u32 {
+        if self.disable_native_thinking {
+            8192
         } else {
-            2048
-        };
-        cap.min(context.saturating_sub(estimated_input.saturating_add(256)))
+            4096
+        }
     }
 
-    /// One changed-strategy recovery, never unlimited rephrasing of a failure.
+    fn output_budget(&self, context: u32, estimated_input: u32) -> u32 {
+        self.output_cap()
+            .min(context.saturating_sub(estimated_input.saturating_add(256)))
+    }
+
+    /// Two changed-strategy recoveries, never unlimited rephrasing of a
+    /// failure: first a native retry with the format reminder and thinking
+    /// off, then the schema-constrained envelope.
     fn recover_invalid(&mut self) -> bool {
         self.invalid_since_progress += 1;
         self.disable_native_thinking = true;
-        self.structured_fallback = true;
-        self.invalid_since_progress == 1
+        self.structured_fallback = self.invalid_since_progress >= 2;
+        self.invalid_since_progress <= 2
     }
 
     fn begin_continuation(&mut self) -> bool {
@@ -79,11 +90,10 @@ fn action_response_invalid_reason(
             }
             .into(),
         )
-    } else if parsed_call.is_none()
-        && (completion.text.contains("```tool") || completion.text.contains("<|tool_call>"))
-    {
+    } else if parsed_call.is_none() && looks_like_action_attempt(&completion.text) {
         Some("The model returned an incomplete or unreadable action.".into())
-    } else if completion.text.trim_start().starts_with('{')
+    } else if parsed_call.is_none()
+        && completion.text.trim_start().starts_with('{')
         && parse_structured_reply(&completion.text).is_none()
     {
         Some("The model returned an invalid structured action or final answer.".into())
@@ -140,8 +150,65 @@ struct StructuredReply {
     answer: String,
 }
 
+/// Escape raw control characters inside JSON string literals. Small models
+/// routinely write a multi-line `old`/`content` value with real newlines,
+/// which strict JSON forbids; the intent is unambiguous, so repair it. Text
+/// outside strings is untouched and structurally broken JSON still fails.
+fn repair_json_strings(body: &str) -> std::borrow::Cow<'_, str> {
+    if !body.contains(['\n', '\r', '\t']) {
+        return std::borrow::Cow::Borrowed(body);
+    }
+    let mut out = String::with_capacity(body.len() + 16);
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut changed = false;
+    for ch in body.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                out.push(ch);
+                continue;
+            }
+            match ch {
+                '\\' => {
+                    escaped = true;
+                    out.push(ch);
+                }
+                '"' => {
+                    in_string = false;
+                    out.push(ch);
+                }
+                '\n' => {
+                    changed = true;
+                    out.push_str("\\n");
+                }
+                '\r' => {
+                    changed = true;
+                    out.push_str("\\r");
+                }
+                '\t' => {
+                    changed = true;
+                    out.push_str("\\t");
+                }
+                _ => out.push(ch),
+            }
+        } else {
+            if ch == '"' {
+                in_string = true;
+            }
+            out.push(ch);
+        }
+    }
+    if changed {
+        std::borrow::Cow::Owned(out)
+    } else {
+        std::borrow::Cow::Borrowed(body)
+    }
+}
+
 fn parse_structured_reply(text: &str) -> Option<StructuredReply> {
-    let reply: StructuredReply = serde_json::from_str(text).ok()?;
+    let repaired = repair_json_strings(text);
+    let reply: StructuredReply = serde_json::from_str(&repaired).ok()?;
     if !reply.args.is_object() {
         return None;
     }
@@ -154,65 +221,199 @@ fn parse_structured_reply(text: &str) -> Option<StructuredReply> {
     }
 }
 
-const STRUCTURED_ACTION_INSTRUCTION: &str = "For this response use the enforced JSON envelope, not Markdown or native tool-call notation. Return exactly one object with all four fields: kind, name, args, answer. For an action use kind=tool, the registered tool name, its argument object, and an empty answer string. For a final response use kind=final, an empty name string, an empty args object, and your nonempty final answer string. No extra fields or text. This format changes no task scope, tool permissions, or verification requirements.";
+const STRUCTURED_ACTION_INSTRUCTION: &str = "For this response use the enforced JSON envelope, not Markdown or native tool-call notation. Return exactly one object with all four fields: kind, name, args, answer. For an action use kind=tool, the registered tool name, its complete argument object (every required argument, for example path for file tools), and an empty answer string. For a final response use kind=final, an empty name string, an empty args object, and your nonempty final answer string. No extra fields or text. This format changes no task scope, tool permissions, or verification requirements.";
 
-/// Accept one complete, standalone action fence, optionally preceded by a
-/// progress note. Multiple, nested, quoted or unfinished fences are ambiguous:
-/// never select one action while silently dropping a prerequisite action.
-pub fn parse_tool_block(text: &str) -> Option<ToolCall> {
-    let mut offset = 0;
-    let mut opening = None;
-    for line in text.split_inclusive('\n') {
-        let plain = line.trim_end();
-        let indent = plain.bytes().take_while(|byte| *byte == b' ').count();
-        if indent <= 3 && &plain[indent..] == "```tool" {
-            opening = Some((offset, offset + line.len()));
-            break;
+/// One action found in a model reply: the call, the byte span it occupies,
+/// and the closing marker to append when the model ended its turn before
+/// writing one (so the transcript copy stays well-formed for later turns).
+struct LocatedAction {
+    call: ToolCall,
+    span: std::ops::Range<usize>,
+    missing_close: Option<&'static str>,
+}
+
+/// A line that opens a fence: `Some(true)` for the fences a model may wrap an
+/// action in (the documented `tool` label, plus the `json` and bare fences
+/// smaller models substitute freely), `Some(false)` for ordinary code.
+fn fence_opener(line: &str) -> Option<bool> {
+    let plain = line.trim_end();
+    let indent = plain.bytes().take_while(|byte| *byte == b' ').count();
+    if indent > 3 {
+        return None;
+    }
+    let label = plain[indent..].strip_prefix("```")?.trim();
+    Some(matches!(
+        label.to_ascii_lowercase().as_str(),
+        "tool" | "json" | ""
+    ))
+}
+
+fn known_tool(name: &str) -> bool {
+    crate::tools::registry().iter().any(|tool| tool.name == name)
+}
+
+/// The first JSON object in `body` read as an action: `name` (or `tool`) plus
+/// object `args` (`arguments`/`parameters` accepted; absent or null means
+/// `{}`, and the tool's own validation then reports exactly what it needs).
+/// Returns the call, the bytes consumed and whether the object carried a
+/// `kind` envelope. A `kind: final` envelope is an answer, never a call.
+fn parse_action_object(body: &str) -> Option<(ToolCall, usize, bool)> {
+    let mut values =
+        serde_json::Deserializer::from_str(body).into_iter::<serde_json::Value>();
+    let value = values.next()?.ok()?;
+    let consumed = values.byte_offset();
+    let object = value.as_object()?;
+    let enveloped = object.contains_key("kind");
+    if object.get("kind").and_then(|kind| kind.as_str()) == Some("final") {
+        return None;
+    }
+    let name = object
+        .get("name")
+        .or_else(|| object.get("tool"))
+        .and_then(|name| name.as_str())?
+        .trim();
+    if name.is_empty() {
+        return None;
+    }
+    let args = object
+        .get("args")
+        .or_else(|| object.get("arguments"))
+        .or_else(|| object.get("parameters"))
+        .cloned()
+        .filter(|args| !args.is_null())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !args.is_object() {
+        return None;
+    }
+    Some((
+        ToolCall {
+            name: name.to_owned(),
+            args,
+        },
+        consumed,
+        enveloped,
+    ))
+}
+
+fn has_action_marker(text: &str) -> bool {
+    text.contains("```") || text.contains("<tool_call>") || text.contains("<|tool_call>")
+}
+
+/// What may follow a complete action object: nothing (the model ended its
+/// turn), or its closing marker and then plain prose. Returns the byte length
+/// of the accepted closing, or `None` when the marker is missing. A further
+/// fence or tool marker after it means more than one action, which is
+/// ambiguous and rejected. A closing fence must stand on its own line.
+fn action_closing(tail: &str, marker: &str) -> Result<Option<usize>, ()> {
+    let Some(start) = tail.find(|ch: char| !ch.is_whitespace()) else {
+        return Ok(None);
+    };
+    let rest = &tail[start..];
+    let Some(after) = rest.strip_prefix(marker) else {
+        return Err(());
+    };
+    if marker == "```" {
+        if !tail[..start].contains('\n') {
+            return Err(());
         }
-        offset += line.len();
+        let line_rest = after.split_inclusive('\n').next().unwrap_or("");
+        if !line_rest.trim().is_empty() {
+            return Err(());
+        }
     }
-    let (start, body_start) = opening?;
-    if text[..start].contains("```") {
-        return None;
+    if has_action_marker(after) {
+        return Err(());
     }
+    Ok(Some(start + marker.len()))
+}
 
-    // Decode JSON before finding the closing fence: a legitimate write_file
-    // payload may itself contain Markdown backticks inside a JSON string.
-    let body = &text[body_start..];
-    let mut values = serde_json::Deserializer::from_str(body).into_iter::<ToolCall>();
-    let call = values.next()?.ok()?;
-    if call.name.trim().is_empty() || !call.args.is_object() {
+/// Accept one complete action fence, optionally surrounded by a progress note
+/// and ordinary code blocks. Only a `tool`-labelled fence may name an unknown
+/// tool (the runner then lists the known ones); `json` and bare fences count
+/// as actions only when they name a registered tool, so an illustrative JSON
+/// snippet in an answer is never executed. Two actions are ambiguous: never
+/// select one while silently dropping another.
+fn locate_fenced_action(text: &str) -> Option<LocatedAction> {
+    let mut offset = 0;
+    let mut lines = text.split_inclusive('\n');
+    while let Some(line) = lines.next() {
+        let line_start = offset;
+        offset += line.len();
+        let Some(action_label) = fence_opener(line) else {
+            continue;
+        };
+        let labelled_tool = line.trim().eq_ignore_ascii_case("```tool");
+        let body_start = offset;
+        let candidate = if action_label {
+            let body = repair_json_strings(&text[body_start..]);
+            parse_action_object(&body)
+                .filter(|(call, _, enveloped)| labelled_tool || *enveloped || known_tool(&call.name))
+                .map(|(call, consumed, _)| (call, consumed, body.into_owned()))
+        } else {
+            None
+        };
+        let Some((call, consumed, body)) = candidate else {
+            // An ordinary block: skip to its closing fence and keep scanning.
+            if labelled_tool {
+                return None;
+            }
+            for inner in lines.by_ref() {
+                offset += inner.len();
+                if inner.trim() == "```" {
+                    break;
+                }
+            }
+            continue;
+        };
+        return match action_closing(&body[consumed..], "```") {
+            Ok(Some(closing_len)) => Some(LocatedAction {
+                call,
+                span: line_start..body_start + consumed + closing_len,
+                missing_close: None,
+            }),
+            Ok(None) => Some(LocatedAction {
+                call,
+                span: line_start..body_start + consumed,
+                missing_close: Some("\n```"),
+            }),
+            Err(()) => None,
+        };
+    }
+    None
+}
+
+/// The `<tool_call>{...}</tool_call>` envelope Qwen- and Hermes-family models
+/// were trained on; they fall back to it under pressure even when the prompt
+/// documents the fenced form.
+fn locate_tagged_action(text: &str) -> Option<LocatedAction> {
+    const OPEN: &str = "<tool_call>";
+    const CLOSE: &str = "</tool_call>";
+    let start = text.find(OPEN)?;
+    if text[..start].contains("<|tool_call>") {
         return None;
     }
-    let tail = &body[values.byte_offset()..];
-    let closing_start = tail.find(|ch: char| !ch.is_whitespace())?;
-    // Closing fences must occupy their own line, not appear in JSON/prose.
-    if !tail[..closing_start].contains('\n') {
-        return None;
+    let body_start = start + OPEN.len();
+    let body = repair_json_strings(&text[body_start..]);
+    let (call, consumed, _) = parse_action_object(&body)?;
+    match action_closing(&body[consumed..], CLOSE) {
+        Ok(Some(closing_len)) => Some(LocatedAction {
+            call,
+            span: start..body_start + consumed + closing_len,
+            missing_close: None,
+        }),
+        Ok(None) => Some(LocatedAction {
+            call,
+            span: start..body_start + consumed,
+            missing_close: Some(CLOSE),
+        }),
+        Err(()) => None,
     }
-    let closing = &tail[closing_start..];
-    let closing_line = closing.split_inclusive('\n').next()?;
-    if closing_line.trim_end() != "```" || !closing[closing_line.len()..].trim().is_empty() {
-        return None;
-    }
-    Some(call)
 }
 
 /// Normalize the native text envelope observed from the installed Gemma model.
 /// It must be one entire call, with JSON object arguments and no trailing text.
-/// This only parses: registry, mode, permission and argument checks still follow.
-fn parse_action_response(text: &str) -> Option<ToolCall> {
+fn locate_gemma_action(text: &str) -> Option<LocatedAction> {
     let trimmed = text.trim();
-    if trimmed.starts_with('{') {
-        let reply = parse_structured_reply(trimmed)?;
-        return (reply.kind == "tool").then_some(ToolCall {
-            name: reply.name,
-            args: reply.args,
-        });
-    }
-    if !trimmed.starts_with("<|tool_call>") {
-        return parse_tool_block(text);
-    }
     let body = trimmed.strip_prefix("<|tool_call>call:")?;
     let (name, body) = body.split_once("{args:")?;
     if name.is_empty()
@@ -222,38 +423,186 @@ fn parse_action_response(text: &str) -> Option<ToolCall> {
     {
         return None;
     }
+    let body = repair_json_strings(body);
+    let body: &str = &body;
     let mut values = serde_json::Deserializer::from_str(body).into_iter::<serde_json::Value>();
     let args = values.next()?.ok()?;
     if !args.is_object() || body[values.byte_offset()..].trim() != "}<tool_call|>" {
         return None;
     }
-    Some(ToolCall {
-        name: name.to_owned(),
-        args,
+    Some(LocatedAction {
+        call: ToolCall {
+            name: name.to_owned(),
+            args,
+        },
+        span: 0..text.len(),
+        missing_close: None,
     })
 }
 
-/// Return the model's user-visible progress note without its machine-readable
-/// tool fence. This is deliberately a concise activity summary, not hidden
-/// chain-of-thought.
-pub fn visible_progress(text: &str) -> String {
-    if text.trim_start().starts_with("<|tool_call>") || parse_structured_reply(text).is_some() {
-        return String::new();
+/// One action in any of the shapes a local model produces: a structured
+/// envelope or bare tool object, the Gemma envelope, the `<tool_call>` tag,
+/// or a fenced block. This only parses: registry, mode, permission and
+/// argument checks still follow.
+fn locate_action(text: &str) -> Option<LocatedAction> {
+    let trimmed = text.trim();
+    if trimmed.starts_with('{') {
+        let body = repair_json_strings(trimmed);
+        let (call, consumed, enveloped) = parse_action_object(&body)?;
+        if !enveloped && !known_tool(&call.name) {
+            return None;
+        }
+        if !body[consumed..].trim().is_empty() {
+            return None;
+        }
+        return Some(LocatedAction {
+            call,
+            span: 0..text.len(),
+            missing_close: None,
+        });
     }
-    let mut out = String::new();
-    let mut rest = text;
-    while let Some(start) = rest.find("```tool") {
-        out.push_str(&rest[..start]);
-        let fenced = &rest[start + "```tool".len()..];
-        if let Some(end) = fenced.find("```") {
-            rest = &fenced[end + 3..];
-        } else {
-            rest = "";
-            break;
+    if trimmed.starts_with("<|tool_call>") {
+        return locate_gemma_action(text);
+    }
+    if text.contains("<tool_call>") {
+        return locate_tagged_action(text);
+    }
+    locate_fenced_action(text)
+}
+
+/// Fenced-action entry point kept for the chat inspection path.
+pub fn parse_tool_block(text: &str) -> Option<ToolCall> {
+    locate_action(text).map(|located| located.call)
+}
+
+fn parse_action_response(text: &str) -> Option<ToolCall> {
+    parse_tool_block(text)
+}
+
+/// True once the streamed text holds one complete action: the runtime can be
+/// released immediately instead of generating a closing fence and prose after
+/// it. Checked per token, so it must stay cheap on text without an action.
+pub fn action_complete(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    if trimmed.starts_with("<|tool_call>") {
+        return text.trim_end().ends_with("<tool_call|>") && locate_gemma_action(text).is_some();
+    }
+    (trimmed.starts_with('{') || has_action_marker(text)) && locate_action(text).is_some()
+}
+
+/// Did the model try to produce an action, even if none could be read? Such
+/// a reply is retried as unreadable rather than reviewed as a final answer.
+fn looks_like_action_attempt(text: &str) -> bool {
+    if text.contains("```tool") || text.contains("<tool_call>") || text.contains("<|tool_call>") {
+        return true;
+    }
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        offset += line.len();
+        if fence_opener(line) == Some(true) {
+            let body = text[offset..].trim_start();
+            if body.starts_with('{') && body.contains("\"name\"") {
+                return true;
+            }
         }
     }
-    out.push_str(rest);
+    false
+}
+
+/// The reply as it should appear in the transcript: an unterminated action
+/// gets its closing marker so later turns imitate a well-formed example.
+fn transcript_reply(reply: &str) -> String {
+    match locate_action(reply) {
+        Some(LocatedAction {
+            span,
+            missing_close: Some(close),
+            ..
+        }) => {
+            let mut fixed = String::with_capacity(reply.len() + close.len());
+            fixed.push_str(&reply[..span.end]);
+            fixed.push_str(close);
+            fixed.push_str(&reply[span.end..]);
+            fixed
+        }
+        _ => reply.to_owned(),
+    }
+}
+
+/// Return the model's user-visible progress note without its machine-readable
+/// action payload. This is deliberately a concise activity summary, not hidden
+/// chain-of-thought.
+pub fn visible_progress(text: &str) -> String {
+    let mut out = String::new();
+    match locate_action(text) {
+        Some(located) => {
+            out.push_str(&text[..located.span.start]);
+            out.push_str(&text[located.span.end..]);
+        }
+        None => out.push_str(text),
+    }
     out.trim().chars().take(1200).collect()
+}
+
+/// Keep the next request inside the context window. Old tool results are the
+/// bulk of an agent transcript, so their bodies are released first (the call
+/// line and a note remain; the journal keeps the full text). Only then are
+/// whole turns dropped, oldest first: saved history before the task, then the
+/// oldest exchanges after it. The system prompt, the task and the latest
+/// exchange are never touched. Returns the number of turns condensed or removed.
+fn prune_transcript(
+    transcript: &mut Vec<ChatTurn>,
+    task_turn_index: &mut usize,
+    n_ctx: u32,
+    output_reserve: u32,
+) -> u32 {
+    let budget = n_ctx.saturating_sub(output_reserve).saturating_sub(512);
+    let estimate = |turns: &[ChatTurn]| {
+        crate::agent::AgentContextUsage::for_turns(turns, n_ctx, 0, 0).estimated_tokens
+    };
+    let mut pruned = 0;
+    let mut index = *task_turn_index + 1;
+    while estimate(transcript) > budget && index + 2 < transcript.len() {
+        let turn = &mut transcript[index];
+        if turn.role == "user"
+            && turn.content.starts_with("Result of ")
+            && !turn.content.contains(RELEASED_MARKER)
+            && turn.content.len() > 400
+        {
+            let head = turn
+                .content
+                .lines()
+                .next()
+                .unwrap_or("Result of tool:")
+                .to_string();
+            let chars = turn.content.chars().count();
+            turn.content = format!(
+                "{head}\n{RELEASED_MARKER} {chars} characters were released from working context to stay within the model's window. The full output is in the activity journal; run the tool again if you need it.]"
+            );
+            pruned += 1;
+        }
+        index += 1;
+    }
+    while estimate(transcript) > budget && *task_turn_index > 1 {
+        transcript.remove(1);
+        *task_turn_index -= 1;
+        pruned += 1;
+    }
+    while estimate(transcript) > budget && transcript.len() > *task_turn_index + 3 {
+        transcript.remove(*task_turn_index + 1);
+        pruned += 1;
+    }
+    while transcript.len() > TRANSCRIPT_TURNS + 2 {
+        if *task_turn_index > 1 {
+            transcript.remove(1);
+            *task_turn_index -= 1;
+        } else if transcript.len() > *task_turn_index + 3 {
+            transcript.remove(*task_turn_index + 1);
+        } else {
+            break;
+        }
+        pruned += 1;
+    }
+    pruned
 }
 
 /// Controlled system prompt (§22): capabilities, tool rules, cwd, OS.
@@ -274,7 +623,7 @@ pub fn system_prompt(
             "delete_file" | "open_path" => r#"{"path":"relative/path"}"#,
             "write_file" => r#"{"path":"relative/file","content":"full file text"}"#,
             "edit_file" => {
-                r#"{"path":"relative/file","patch":"--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old line\n+new line\n"}"#
+                r#"{"path":"relative/file","old":"  return a + b; // BUG","new":"  return a - b;"} (old = exact existing lines without the line-number labels, unique in the file; new = their replacement)"#
             }
             "search_text" => r#"{"query":"regex pattern","path":"."}"#,
             "execute_command" => r#"{"command":"command text","cwd":".","timeout_secs":60}"#,
@@ -283,7 +632,16 @@ pub fn system_prompt(
             "system_info" | "list_processes" => "{}",
             _ => "see tool description",
         };
-        tool_docs.push_str(&format!("  args: {args}\n"));
+        // Keep the JSON example clean; explanations go on their own line so a
+        // model never copies prose into its argument object.
+        let (json, note) = match args.split_once(" (") {
+            Some((json, note)) => (json, Some(note.trim_end_matches(')'))),
+            None => (args, None),
+        };
+        tool_docs.push_str(&format!("  args: {json}\n"));
+        if let Some(note) = note {
+            tool_docs.push_str(&format!("  note: {note}\n"));
+        }
     }
     format!(
         "You are a local coding assistant operating inside one workspace.\n\
@@ -297,7 +655,7 @@ pub fn system_prompt(
          {{\"name\":\"read_file\",\"args\":{{\"path\":\"README.md\"}}}}\n\
          ```\n\
          Substitute the actual tool and its arguments. Fence markers must be on separate lines. Never escape JSON object delimiters or repeat fence markers.\n\
-         3. Prefer search_text before reading; read before editing; small unified-diff patches via edit_file.\n\
+         3. Prefer search_text before reading; read before editing; change files with edit_file by giving the exact existing lines as old and their replacement as new (small, targeted edits; write_file only for new files).\n\
          4. For requested implementation work, run relevant builds/tests with execute_command and iterate on failures. Do not claim that reading a file is a passing test.\n\
          5. Never invent file contents you have not read; never redo a failed identical call.\n\
          6. For build, fix, or change requests, use the tools and complete the work; do not stop at a plan or paste code for the user to apply.\n\
@@ -410,6 +768,8 @@ pub struct AgentSpec {
     /// Stage 11: Search-toggle consent for this run (§117). web_search is
     /// only offered to the model when true.
     pub search_enabled: bool,
+    /// Native thinking allowed for this run's action requests.
+    pub reasoning: bool,
 }
 
 #[derive(Debug)]
@@ -437,6 +797,13 @@ impl LiveRun {
     pub fn emit(&self, ev: AgentEvent) {
         let _ = self.activity_tx.send(ev.clone());
         self.events.lock().expect("lock").push(ev.clone());
+        let _ = self.broadcaster.send(ev);
+    }
+
+    /// Transient progress for live subscribers only: streamed partial model
+    /// text. Never journaled and never replayed; the completed thought is
+    /// journaled as one event when the response is validated.
+    pub fn emit_live(&self, ev: AgentEvent) {
         let _ = self.broadcaster.send(ev);
     }
 
@@ -625,7 +992,12 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
         let attachments = st
             .attachments_for(&spec.conversation_id)
             .unwrap_or_default();
-        transcript.extend(crate::api::build_turns(&history, &attachments));
+        let budget = crate::api::history_char_budget(cfg.n_ctx, transcript[0].content.len());
+        transcript.extend(crate::api::build_turns_budgeted(
+            &history,
+            &attachments,
+            budget,
+        ));
     }
     transcript.push(ChatTurn::text(
             "user",
@@ -635,8 +1007,16 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
             ),
         ));
     let mut task_turn_index = transcript.len() - 1;
-    let mut progress_guard = crate::agent_progress::ProgressGuard::new(4);
-    let mut response_policy = ActionResponsePolicy::default();
+    // Six consecutive non-successful steps end the run. Each failure carries a
+    // specific correction (received args, closest matching text), and a model
+    // often needs two or three of them to converge; identical loops and the
+    // iteration limit are bounded separately.
+    let mut progress_guard = crate::agent_progress::ProgressGuard::new(6);
+    let mut last_file: Option<String> = None;
+    let mut response_policy = ActionResponsePolicy {
+        disable_native_thinking: !spec.reasoning,
+        ..ActionResponsePolicy::default()
+    };
     let mut pending_continuation: Option<String> = None;
     let mut completion_reviews = 0u32;
     let mut verification = VerificationState::default();
@@ -653,27 +1033,22 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
             ));
             return S::Cancelled;
         }
-        // Keep the transcript bounded so small contexts survive long runs (§21).
-        if transcript.len() > TRANSCRIPT_TURNS + 2 {
-            while transcript.len() > TRANSCRIPT_TURNS + 2 {
-                pruned_turns += 1;
-                // Keep the system prompt and current task, not an arbitrary
-                // older history row. Prefer dropping old context first.
-                if task_turn_index > 1 {
-                    transcript.remove(1);
-                    task_turn_index -= 1;
-                } else {
-                    transcript.remove(2);
-                }
-            }
-        }
+        // Keep the transcript inside the context window (§21): release old
+        // tool-result bodies first, drop whole turns only when that is not
+        // enough. The full outputs stay in the journal.
+        pruned_turns += prune_transcript(
+            &mut transcript,
+            &mut task_turn_index,
+            cfg.n_ctx,
+            response_policy.output_cap(),
+        );
         if !state.llama.write().await.is_running() {
             run.emit(AgentEvent::activity("error", S::Failed,
                 "The model runtime stopped. Completed actions and existing file changes were kept. Load a model before continuing.".into(), it));
             return S::Failed;
         }
         if !progress_guard.begin_attempt() {
-            let message = format!("Stopped after {} attempts without new successful tool results. The model was repeating unsuccessful responses rather than advancing the task. Existing files and recorded actions were kept; review the last error before retrying.", progress_guard.attempts_without_progress());
+            let message = format!("Stopped after {} consecutive steps that produced no successful action (failed tools, unreadable or denied actions, or completion claims the check rejected). Existing files and recorded actions were kept; review the last error before retrying.", progress_guard.attempts_without_progress());
             persist_final(&state, &run, &message).await;
             run.emit(AgentEvent::activity("error", S::Failed, message, it - 1));
             return S::Failed;
@@ -716,13 +1091,34 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
             pruned_turns,
         );
         run.emit(AgentEvent::context(S::Planning, it, input_context.clone()));
+        // Stream the action: partial text reaches live subscribers as it is
+        // produced, and a complete action releases the runtime immediately.
+        // A suffix continuation cannot be parsed on its own, and a schema-
+        // constrained reply ends itself, so neither stops early.
+        let stop_on_action = pending_continuation.is_none() && !use_structured;
+        let live_run = run.clone();
+        let live_cancel = run.cancel.clone();
+        let handlers = StreamHandlers {
+            on_token: Box::new(move |delta| {
+                live_run.emit_live(AgentEvent::activity(
+                    "thought_delta",
+                    S::Planning,
+                    delta.to_string(),
+                    it,
+                ));
+            }),
+            is_cancelled: Box::new(move || live_cancel.is_cancelled()),
+            should_stop: Box::new(move |text| stop_on_action && action_complete(text)),
+            ..StreamHandlers::default()
+        };
         let mut completion = match client
-            .agent_chat_turns(
+            .agent_chat_turns_stream(
                 &request_turns,
                 output_budget,
                 &cfg,
                 response_policy.disable_native_thinking,
                 use_structured,
+                handlers,
             )
             .await
         {
@@ -788,14 +1184,23 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
                 continue;
             }
             if !response_policy.recover_invalid() {
-                let message = format!("{reason} The controlled retry also failed, so I stopped instead of repeating it. No partial or unreadable action was executed. Existing work was kept.");
+                let message = format!("{reason} Both controlled retries also failed, so I stopped instead of repeating them. No partial or unreadable action was executed. Existing work was kept.");
                 persist_final(&state, &run, &message).await;
                 run.emit(AgentEvent::activity("error", S::Failed, message, it));
                 return S::Failed;
             }
             let retry_budget = response_policy.output_budget(cfg.n_ctx, estimated_input);
+            let strategy = if response_policy.structured_fallback {
+                "Retrying with the schema-constrained JSON envelope"
+            } else {
+                "Retrying with a format reminder and native thinking disabled for this run"
+            };
+            // Journal what could not be read so the failure is diagnosable
+            // from the activity view, not only from a debugger.
+            let excerpt: String = reply.trim().chars().take(900).collect();
             run.emit(AgentEvent::activity("status", S::Planning,
-                format!("{reason} Retrying once with native thinking disabled for this run and up to {retry_budget} output tokens. Incomplete actions are discarded."), it));
+                format!("{reason} {strategy}, with up to {retry_budget} output tokens. Incomplete actions are discarded.{}",
+                    if excerpt.is_empty() { String::new() } else { format!("\n\nUnreadable response (excerpt):\n{excerpt}") }), it));
             transcript.push(ChatTurn::text(
                 "user",
                 "Your previous response was empty, cut off, or invalid; no action from it was executed. Return exactly one complete tool envelope as shown in the system example, with a name and object args and its closing fence. Keep file contents short: create one small file or make one small edit per turn. Escape quotes and newlines INSIDE JSON string values only; outer JSON keys must use ordinary quotes. If finished, return a brief final answer instead. Do not repeat an unfinished payload or output multiple actions.",
@@ -803,13 +1208,20 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
             continue;
         }
         // Failed/truncated payloads never pollute the subsequent transcript.
-        transcript.push(ChatTurn::text("assistant", reply.clone()));
+        transcript.push(ChatTurn::text("assistant", transcript_reply(&reply)));
 
         let Some(call) = parsed_call else {
             let reply = parse_structured_reply(&reply)
                 .filter(|envelope| envelope.kind == "final")
                 .map(|envelope| envelope.answer)
                 .unwrap_or(reply);
+            // Journal the claim itself: when the check below rejects it, the
+            // activity view must show what the model said, not only that it
+            // was sent back to work.
+            let claim: String = reply.trim().chars().take(1200).collect();
+            if !claim.is_empty() {
+                run.emit(AgentEvent::activity("thought", S::Planning, claim, it));
+            }
             // Read-only runs deliver findings/plans, not implemented code.
             // A second model critic cannot verify an implementation here and
             // can trap small local models in repeated format-correction loops.
@@ -832,7 +1244,7 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
             let review = if verification.needs_evidence() {
                 CompletionReview::Continue(verification.remaining())
             } else {
-                review_completion(&client, &cfg, &objective, &reply, &tool_evidence).await
+                review_completion(&client, &cfg, &transcript, &objective, &tool_evidence).await
             };
 
             match review {
@@ -1054,13 +1466,46 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
                 }
             }
         } else {
-            execute_local_tool(&state, &run, &ws, &call, approved).await
+            let mut output = execute_local_tool(&state, &run, &ws, &call, approved).await;
+            // A missing path is the most common argument slip; the file the
+            // model was just working on is almost always the one it meant.
+            if output.starts_with("(tool error")
+                && output.contains("requires {\"path\"")
+                && arg_str(&call, "path").is_none()
+            {
+                if let Some(file) = &last_file {
+                    output.push_str(&format!(
+                        "\nHint: you did not send a path. The file you last worked on was {file}."
+                    ));
+                }
+            }
+            output
         };
+        if let Some(path) = arg_str(&call, "path").filter(|path| !path.trim().is_empty()) {
+            if matches!(
+                call.name.as_str(),
+                "read_file" | "edit_file" | "write_file" | "search_text"
+            ) {
+                last_file = Some(path.to_string());
+            }
+        }
         let shown: String = output.chars().take(TOOL_OUTPUT_CHARS).collect();
         let tool_failed = tool_output_failed(&output);
-        if progress_guard.observe_tool_result(&call.name, &call.args, &output, !tool_failed) {
+        let observation =
+            progress_guard.observe_tool_result(&call.name, &call.args, &output, !tool_failed);
+        if observation.is_progress() {
             response_policy.useful_progress();
             completion_reviews = 0;
+        }
+        // A schema-constrained request that produced an invalid action (for
+        // example empty args) is not helping; return to the native format.
+        if tool_failed
+            && use_structured
+            && output.contains("Invalid tool arguments")
+        {
+            response_policy.structured_fallback = false;
+            run.emit(AgentEvent::activity("status", S::Planning,
+                "The constrained JSON action format produced invalid arguments; switching back to the native action format for the next step.".into(), it));
         }
         verification.observe(&ws, &call, &output, tool_failed);
         let repeated_failure = failed_calls.observe(&call, tool_failed);
@@ -1108,6 +1553,20 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
                 it,
             ));
         }
+        if let crate::agent_progress::Observation::Repeated { warn, stop } = observation {
+            if stop {
+                let message = format!("I stopped because the same {} action returned the identical result {} times in a row; the run was looping rather than progressing. Completed changes were kept. Review the recorded actions and give a more specific next step.", call.name, progress_guard.identical_repeats() + 1);
+                persist_final(&state, &run, &message).await;
+                run.emit(AgentEvent::activity("error", S::Failed, message, it));
+                return S::Failed;
+            }
+            if warn {
+                transcript.push(ChatTurn::text(
+                    "user",
+                    format!("[Host note: this {} result is identical to the one you already received. Do not repeat it; use the evidence you have, take a different action, or finish with a summary.]", call.name),
+                ));
+            }
+        }
     }
     let final_message = format!(
         "I checked the partial work, but the agent reached its {}-step safety limit before the task was complete. The existing changes have been kept.",
@@ -1129,11 +1588,15 @@ enum CompletionReview {
     Unavailable(String),
 }
 
+/// The review rides on the run's own transcript (which already ends with the
+/// candidate answer) plus one instruction turn, so the cached KV prefix serves
+/// everything but the instruction. A separate prompt would evict the
+/// transcript from the single slot and force a full re-prefill next iteration.
 async fn review_completion(
     client: &SidecarClient,
     cfg: &crate::inference::InferenceConfig,
+    transcript: &[ChatTurn],
     task: &str,
-    candidate: &str,
     evidence: &[String],
 ) -> CompletionReview {
     let evidence = if evidence.is_empty() {
@@ -1141,10 +1604,11 @@ async fn review_completion(
     } else {
         evidence.join("\n")
     };
-    let prompt = format!(
-        "You are a strict completion checker for a coding agent. Compare the original task with the candidate final answer and the recorded tool evidence. Do not assume files exist unless the evidence shows them. For change requests, require all requested deliverables plus a post-change inspection, test, build, or other relevant validation. If the task is fully complete or genuinely impossible with an honest explanation, reply exactly COMPLETE. Otherwise reply CONTINUE: followed by one concise description of the missing work.\n\nOriginal task:\n{task}\n\nCandidate final answer:\n{candidate}\n\nTool evidence:\n{evidence}"
+    let instruction = format!(
+        "Stop and act as a strict completion checker for your own work above. Compare the original task with your candidate final answer and the recorded tool evidence. Do not assume files exist unless the evidence shows them. For change requests, require all requested deliverables plus a post-change inspection, test, build, or other relevant validation. If the task is fully complete or genuinely impossible with an honest explanation, reply exactly COMPLETE. Otherwise reply CONTINUE: followed by one concise description of the missing work. Reply with that decision only.\n\nOriginal task:\n{task}\n\nTool evidence:\n{evidence}"
     );
-    let turns = [ChatTurn::text("user", prompt)];
+    let mut turns = transcript.to_vec();
+    turns.push(ChatTurn::text("user", instruction));
     match client.chat_turns_without_reasoning(&turns, 220, cfg).await {
         Ok((answer, _)) => parse_completion_review(&answer),
         Err(error) => CompletionReview::Unavailable(error.to_string()),
@@ -1437,7 +1901,21 @@ async fn execute_local_tool(
         args: call.args.clone(),
         approved,
     };
-    let output = match crate::tools::execute(&tool_req, ws, true) {
+    // Commands can run for minutes and searches walk whole trees: blocking
+    // work belongs on the blocking pool, not on an async worker that also
+    // serves other sessions' streams.
+    let blocking_ws = ws.clone();
+    let blocking_req = tool_req.clone();
+    let executed = tokio::task::spawn_blocking(move || {
+        crate::tools::execute(&blocking_req, &blocking_ws, true)
+    })
+    .await
+    .unwrap_or_else(|error| {
+        Err(crate::tools::ToolError::InvalidArgs(format!(
+            "tool task failed: {error}"
+        )))
+    });
+    let output = match executed {
         Ok(r) => {
             let mut text = r.output;
             if !r.ok {
@@ -1445,7 +1923,18 @@ async fn execute_local_tool(
             }
             text
         }
-        Err(e) => format!("(tool error, do not retry identically)\n{e}"),
+        Err(e) => match e {
+            crate::tools::ToolError::InvalidArgs(_) | crate::tools::ToolError::Workspace(_) => {
+                // Say exactly what was received: a model that sent
+                // {"file":"x"} instead of {"path":"x"} can correct itself only
+                // if it sees the difference.
+                format!(
+                    "(tool error, do not retry identically)\n{e}\nYou sent args: {}",
+                    short_args(&call.args)
+                )
+            }
+            _ => format!("(tool error, do not retry identically)\n{e}"),
+        },
     };
     audit_tool(state, run, call, &output).await;
     output
@@ -1694,6 +2183,7 @@ mod tests {
                 mode: AgentMode::Agent,
                 conversation_id: String::new(),
                 search_enabled: false,
+                reasoning: false,
             },
             cancel: CancelToken::new(),
             events: Mutex::new(vec![]),
@@ -1826,16 +2316,22 @@ mod tests {
     fn action_response_policy_allows_only_one_recovery_without_useful_progress() {
         let mut policy = ActionResponsePolicy::default();
         assert!(!policy.disable_native_thinking);
-        assert_eq!(policy.output_budget(32768, 1000), 2048);
-        assert!(
-            policy.recover_invalid(),
-            "the first invalid response gets one changed-strategy attempt"
-        );
-        assert!(policy.disable_native_thinking);
         assert_eq!(policy.output_budget(32768, 1000), 4096);
         assert!(
+            policy.recover_invalid(),
+            "the first invalid response gets a native retry with the format reminder"
+        );
+        assert!(policy.disable_native_thinking);
+        assert!(!policy.structured_fallback);
+        assert_eq!(policy.output_budget(32768, 1000), 8192);
+        assert!(
+            policy.recover_invalid(),
+            "the second invalid response gets the schema-constrained envelope"
+        );
+        assert!(policy.structured_fallback);
+        assert!(
             !policy.recover_invalid(),
-            "changing from empty to malformed does not earn another retry"
+            "changing from empty to malformed does not earn a third retry"
         );
         assert!(
             !policy.recover_invalid(),
@@ -1860,7 +2356,67 @@ mod tests {
             1840,
             "recovery cannot override context capacity"
         );
-        assert_eq!(policy.output_budget(8192, 1000), 4096);
+        assert_eq!(policy.output_budget(8192, 1000), 6936);
+        assert_eq!(policy.output_budget(65536, 1000), 8192);
+    }
+
+    #[test]
+    fn transcript_pruning_releases_old_results_before_dropping_turns() {
+        let mut transcript = vec![
+            ChatTurn::text("system", "instructions"),
+            ChatTurn::text("user", "older history"),
+            ChatTurn::text("assistant", "older answer"),
+            ChatTurn::text("user", "Task: do the thing"),
+            ChatTurn::text("assistant", "```tool\n{\"name\":\"read_file\",\"args\":{\"path\":\"a\"}}\n```"),
+            ChatTurn::text("user", format!("Result of read_file:\n{}", "a".repeat(6000))),
+            ChatTurn::text("assistant", "```tool\n{\"name\":\"read_file\",\"args\":{\"path\":\"b\"}}\n```"),
+            ChatTurn::text("user", format!("Result of read_file:\n{}", "b".repeat(6000))),
+            ChatTurn::text("assistant", "```tool\n{\"name\":\"read_file\",\"args\":{\"path\":\"c\"}}\n```"),
+            ChatTurn::text("user", format!("Result of read_file:\n{}", "c".repeat(200))),
+        ];
+        let mut task_index = 3;
+        let before = transcript.clone();
+        // Plenty of room: nothing changes.
+        assert_eq!(prune_transcript(&mut transcript, &mut task_index, 32768, 4096), 0);
+        assert_eq!(
+            serde_json::to_value(&transcript).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+        // ~3.2K tokens of results against a 4K window: release the oldest
+        // result body first; the latest exchange and the task stay intact.
+        let pruned = prune_transcript(&mut transcript, &mut task_index, 4096, 1024);
+        assert!(pruned >= 1, "{pruned}");
+        assert!(transcript[5].content.contains(RELEASED_MARKER));
+        assert!(transcript[5].content.starts_with("Result of read_file:"));
+        assert_eq!(transcript[task_index].content, "Task: do the thing");
+        assert!(transcript.last().unwrap().content.contains(&"c".repeat(200)));
+        assert_eq!(transcript[0].content, "instructions");
+        // A window too small even for the released transcript drops the
+        // saved history before the task, never the task itself.
+        let mut tiny = transcript.clone();
+        let mut tiny_task = task_index;
+        prune_transcript(&mut tiny, &mut tiny_task, 1500, 256);
+        assert_eq!(tiny[0].content, "instructions");
+        assert_eq!(tiny[tiny_task].content, "Task: do the thing");
+        assert!(tiny.len() >= tiny_task + 3, "latest exchange is protected");
+    }
+
+    #[test]
+    fn complete_actions_stop_the_stream_but_partial_ones_do_not() {
+        assert!(!action_complete("I will read the file first.\n```tool\n{\"name\":\"read_file\""));
+        assert!(!action_complete("```tool\n{\"name\":\"read_file\",\"args\":{\"path\":\"x\"}"));
+        // The object is complete: stop here rather than generate the closing
+        // fence and whatever prose would follow it.
+        assert!(action_complete("```tool\n{\"name\":\"read_file\",\"args\":{\"path\":\"x\"}}\n"));
+        assert!(action_complete(
+            "I will read it.\n```tool\n{\"name\":\"read_file\",\"args\":{\"path\":\"x\"}}\n```"
+        ));
+        assert!(action_complete(
+            "```tool\n{\"name\":\"read_file\",\"args\":{\"path\":\"x\"}}\n```\n"
+        ));
+        assert!(!action_complete("<|tool_call>call:read_file{args:{\"path\":\"x\"}}"));
+        assert!(action_complete("<|tool_call>call:read_file{args:{\"path\":\"x\"}}<tool_call|>"));
+        assert!(!action_complete("Plain final answer without any action."));
     }
 
     #[test]
@@ -1871,18 +2427,19 @@ mod tests {
         assert!(progress.begin_attempt());
         assert!(policy.recover_invalid());
         assert!(progress.begin_attempt());
-        assert!(progress.observe_tool_result("read_file", &args, "actual fixture text", true));
+        assert!(progress.observe_tool_result("read_file", &args, "actual fixture text", true).is_progress());
         policy.useful_progress();
         assert_eq!(progress.attempts_without_progress(), 0);
         assert!(
             policy.disable_native_thinking,
             "a successful action must not reactivate the strategy that exhausted its budget"
         );
-        assert_eq!(policy.output_budget(32768, 1000), 4096);
+        assert_eq!(policy.output_budget(32768, 1000), 8192);
         assert!(
             policy.recover_invalid(),
             "new host-confirmed evidence starts a new bounded recovery window"
         );
+        assert!(policy.recover_invalid());
         assert!(!policy.recover_invalid());
         assert!(
             !ActionResponsePolicy::default().disable_native_thinking,
@@ -1891,26 +2448,40 @@ mod tests {
     }
 
     #[test]
-    fn action_response_policy_failed_or_duplicate_tool_does_not_renew_retry() {
-        for succeeded in [false, true] {
-            let mut policy = ActionResponsePolicy::default();
-            let mut progress = crate::agent_progress::ProgressGuard::new(4);
-            let args = serde_json::json!({"path":"README.md"});
-            if succeeded {
-                assert!(progress.observe_tool_result("read_file", &args, "same text", true));
-            }
-            assert!(progress.begin_attempt());
-            assert!(policy.recover_invalid());
-            assert!(progress.begin_attempt());
-            if progress.observe_tool_result("read_file", &args, "same text", succeeded) {
-                policy.useful_progress();
-            }
-            assert_eq!(progress.attempts_without_progress(), 2);
-            assert!(
-                !policy.recover_invalid(),
-                "failed or duplicate tool results are not grounds for another invalid-output retry"
-            );
-        }
+    fn action_response_policy_failed_tool_does_not_renew_retry_but_execution_does() {
+        // A failed tool leaves the failure budget consumed and the recovery
+        // allowance spent.
+        let mut policy = ActionResponsePolicy::default();
+        let mut progress = crate::agent_progress::ProgressGuard::new(4);
+        let args = serde_json::json!({"path":"README.md"});
+        assert!(progress.begin_attempt());
+        assert!(policy.recover_invalid());
+        assert!(progress.begin_attempt());
+        assert!(!progress
+            .observe_tool_result("read_file", &args, "not found", false)
+            .is_progress());
+        assert_eq!(progress.attempts_without_progress(), 2);
+        assert!(policy.recover_invalid(), "the second strategy is still available");
+        assert!(
+            !policy.recover_invalid(),
+            "a failed tool result is not grounds for another invalid-output retry"
+        );
+        // A successfully executed action, even a repeated read, is progress:
+        // the failure budget resets and one more recovery is allowed. Looping
+        // on identical results is bounded separately by the repeat guard.
+        let mut policy = ActionResponsePolicy::default();
+        let mut progress = crate::agent_progress::ProgressGuard::new(4);
+        assert!(progress
+            .observe_tool_result("read_file", &args, "same text", true)
+            .is_progress());
+        assert!(progress.begin_attempt());
+        assert!(policy.recover_invalid());
+        assert!(progress.begin_attempt());
+        let repeated = progress.observe_tool_result("read_file", &args, "same text", true);
+        assert!(repeated.is_progress());
+        policy.useful_progress();
+        assert_eq!(progress.attempts_without_progress(), 0);
+        assert!(policy.recover_invalid());
     }
 
     fn action_response_fixture(
@@ -1924,6 +2495,7 @@ mod tests {
             reasoning_present: false,
             reasoning_tokens: None,
             native_tool_calls_present: false,
+            early_stopped: false,
         }
     }
 
@@ -1998,12 +2570,16 @@ mod tests {
         );
         assert!(
             policy.recover_invalid(),
-            "a failed continuation permits one clean small-action fallback"
+            "a failed continuation permits a clean small-action fallback"
         );
         assert!(progress.begin_attempt());
         assert!(
+            policy.recover_invalid(),
+            "then the schema-constrained envelope"
+        );
+        assert!(
             !policy.recover_invalid(),
-            "a failed clean fallback must stop"
+            "a failed constrained fallback must stop"
         );
         assert!(
             !policy.begin_continuation(),
@@ -2052,7 +2628,7 @@ mod tests {
             .unwrap()
             .contains("unsupported action format"));
         for text in [
-            "```tool\n{\"name\":\"read_file\",\"args\":{\"path\":\"README.md\"}}",
+            "```tool\n{\"name\":\"read_file\",\"args\":{\"path\":\"README.md\"",
             "```tool\nnot json\n```",
             "```tool\n{\"name\":\"read_file\",\"args\":{}}\n```\n```tool\n{\"name\":\"write_file\",\"args\":{}}\n```",
         ] {
@@ -2077,11 +2653,12 @@ mod tests {
     }
 
     #[test]
-    fn action_response_validation_alternating_empty_and_malformed_still_stops_after_one_retry() {
+    fn action_response_validation_alternating_empty_and_malformed_still_stops_after_two_retries() {
         let mut policy = ActionResponsePolicy::default();
         let responses = [
             action_response_fixture("", "length"),
             action_response_fixture("```tool\n{\"name\":\"read_file\"", "stop"),
+            action_response_fixture("```tool\nnot json\n```", "stop"),
         ];
         let mut retries = 0;
         for response in &responses {
@@ -2093,8 +2670,8 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(retries, 1);
-        assert_eq!(policy.invalid_since_progress, 2);
+        assert_eq!(retries, 2);
+        assert_eq!(policy.invalid_since_progress, 3);
     }
 
     #[test]
@@ -2192,7 +2769,14 @@ mod tests {
             "suffix continuation cannot be constrained as a whole JSON document"
         );
         assert!(policy.recover_invalid());
-        assert!(policy.structured_fallback);
+        assert!(
+            !policy.structured_fallback,
+            "the first recovery is a native retry with the format reminder"
+        );
+        assert!(policy.disable_native_thinking);
+        assert!(policy.recover_invalid());
+        assert!(policy.structured_fallback, "the second recovery constrains the envelope");
+        assert!(!policy.recover_invalid(), "a third invalid reply ends the run");
         policy.useful_progress();
         assert!(policy.structured_fallback);
         let base = vec![ChatTurn::text("user", "Test")];
@@ -2311,7 +2895,7 @@ mod tests {
             format!("{read}\n{edit}"),
             format!("{read}\nThen edit:\n{edit}"),
             format!("{read}\n```tool\n{{\"name\":\"write_file\""),
-            "```tool\n{\"name\":\"read_file\",\"args\":{}}".into(),
+            "```tool\n{\"name\":\"read_file\",\"args\":{".into(),
             "```tool\n{\"name\":\"read_file\",\"args\":{}}\n``".into(),
         ] {
             assert!(
@@ -2330,10 +2914,26 @@ mod tests {
             " \t```tool\n{\"name\":\"read_file\",\"args\":{}}\n```",
             "Example: ```tool\n{\"name\":\"read_file\",\"args\":{}}\n```",
             "```tool\n{\"name\":\"read_file\",\"args\":{}} ```",
-            "```tool\n{\"name\":\"read_file\",\"args\":{}}\n```\nThis was an example, not an action.",
         ] {
             assert!(parse_tool_block(text).is_none(), "accepted quoted/example markup: {text}");
         }
+    }
+
+    #[test]
+    fn raw_newlines_inside_json_strings_are_repaired_not_rejected() {
+        // What a 14B coder actually emitted: a multi-line `old` with real
+        // newlines inside the JSON string.
+        let text = "```tool\n{\"name\":\"edit_file\",\"args\":{\"path\":\"calculator.js\",\"old\":\"function subtract(a, b) {\n  return a + b;\n}\",\"new\":\"function subtract(a, b) {\n  return a - b;\n}\"}}\n```";
+        let call = parse_tool_block(text).expect("repaired JSON parses");
+        assert_eq!(call.name, "edit_file");
+        assert_eq!(call.args["old"], "function subtract(a, b) {\n  return a + b;\n}");
+        assert_eq!(call.args["new"], "function subtract(a, b) {\n  return a - b;\n}");
+        // Properly escaped JSON is untouched, and JSON that is broken in other
+        // ways is still rejected.
+        assert_eq!(repair_json_strings("{\"a\":\"x\\ny\"}"), "{\"a\":\"x\\ny\"}");
+        assert!(parse_tool_block("```tool\n{\"name\":\"read_file\",\"args\":{\"path\":\n```").is_none());
+        let native = "<|tool_call>call:write_file{args:{\"path\":\"a.txt\",\"content\":\"line one\nline two\"}}<tool_call|>";
+        assert_eq!(parse_action_response(native).unwrap().args["content"], "line one\nline two");
     }
 
     #[test]
@@ -2351,19 +2951,75 @@ mod tests {
     fn tool_parser_requires_named_action_and_object_arguments() {
         for payload in [
             r#"{"name":"","args":{}}"#,
-            r#"{"name":"read_file"}"#,
-            r#"{"name":"read_file","args":null}"#,
             r#"{"name":"read_file","args":[]}"#,
+            r#"{"name":"read_file","args":"x"}"#,
             r#"{"name":"read_file","args":{}} {"name":"write_file","args":{}}"#,
         ] {
-            assert!(parse_tool_block(&format!("```tool\n{payload}\n```")).is_none());
+            assert!(parse_tool_block(&format!("```tool\n{payload}\n```")).is_none(), "{payload}");
+        }
+        // Absent or null arguments are an empty object: the tool's own
+        // validation then tells the model exactly which argument it needs.
+        for payload in [r#"{"name":"read_file"}"#, r#"{"name":"read_file","args":null}"#] {
+            let call = parse_tool_block(&format!("```tool\n{payload}\n```")).unwrap();
+            assert_eq!(call.args, serde_json::json!({}));
         }
     }
 
     #[test]
     fn no_block_means_final_answer() {
         assert!(parse_tool_block("All done. Summary here.").is_none());
+        // A JSON snippet naming no registered tool is an illustration.
         assert!(parse_tool_block("```json\n{\"name\": \"x\"}\n```").is_none());
+        assert!(parse_tool_block("```json\n{\"name\": \"my-app\",\"args\":{}}\n```").is_none());
+        assert!(parse_tool_block("{\"name\": \"my-app\",\"args\":{}}").is_none());
+        assert!(!looks_like_action_attempt("Done.\n```js\nconst name = 1;\n```"));
+    }
+
+    #[test]
+    fn action_shapes_small_models_actually_produce_are_all_accepted() {
+        // Fence never closed: the model ended its turn after the object.
+        let open = "Fixing it.\n```tool\n{\"name\":\"edit_file\",\"args\":{\"path\":\"a.js\",\"old\":\"x\",\"new\":\"y\"}}";
+        assert_eq!(parse_tool_block(open).unwrap().name, "edit_file");
+        assert!(action_complete(open));
+        assert_eq!(visible_progress(open), "Fixing it.");
+        assert_eq!(transcript_reply(open), format!("{open}\n```"));
+        // A closed fence keeps the transcript copy untouched.
+        let closed = format!("{open}\n```\n");
+        assert_eq!(transcript_reply(&closed), closed);
+        // Prose after the closing fence is a plan note, not a second action.
+        let trailing = format!("{open}\n```\nThen I will run the tests.");
+        assert_eq!(parse_tool_block(&trailing).unwrap().name, "edit_file");
+        assert_eq!(visible_progress(&trailing), "Fixing it.\n\nThen I will run the tests.");
+        // Two actions stay ambiguous.
+        let twice = format!("{open}\n```\n{}", &open["Fixing it.\n".len()..]);
+        assert!(parse_tool_block(&twice).is_none());
+        assert!(looks_like_action_attempt(&twice));
+        // An illustrative code block before the action is fine.
+        let with_code = "Here is the fix:\n```js\nreturn a - b;\n```\n```tool\n{\"name\":\"read_file\",\"args\":{\"path\":\"a.js\"}}\n```";
+        assert_eq!(parse_tool_block(with_code).unwrap().name, "read_file");
+        assert_eq!(visible_progress(with_code), "Here is the fix:\n```js\nreturn a - b;\n```");
+        // json and bare fences count when they name a registered tool;
+        // `arguments` is accepted for `args`.
+        let json_fence = "```json\n{\"name\":\"read_file\",\"arguments\":{\"path\":\"a.js\"}}\n```";
+        assert_eq!(parse_tool_block(json_fence).unwrap().args["path"], "a.js");
+        let bare_fence = "```\n{\"tool\":\"list_directory\",\"args\":{\"path\":\".\"}}\n```";
+        assert_eq!(parse_tool_block(bare_fence).unwrap().name, "list_directory");
+        // A bare object without any fence.
+        let bare = "{\"name\":\"read_file\",\"args\":{\"path\":\"a.js\"}}";
+        assert_eq!(parse_action_response(bare).unwrap().name, "read_file");
+        assert!(action_complete(bare));
+        // The <tool_call> tag Qwen and Hermes models were trained on,
+        // terminated or not.
+        let tagged = "I'll read it.\n<tool_call>\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"a.js\"}}\n</tool_call>";
+        assert_eq!(parse_action_response(tagged).unwrap().args["path"], "a.js");
+        assert_eq!(visible_progress(tagged), "I'll read it.");
+        let tagged_open = "<tool_call>{\"name\":\"read_file\",\"args\":{\"path\":\"a.js\"}}";
+        assert!(action_complete(tagged_open));
+        assert_eq!(transcript_reply(tagged_open), format!("{tagged_open}</tool_call>"));
+        assert!(looks_like_action_attempt("<tool_call>\n{\"name\": \"read_file\""));
+        // A labelled tool fence that never parses is an attempt, not an answer.
+        assert!(parse_tool_block("```tool\n{\"name\":\"read_file\",\"args\":{\"path\":\n```").is_none());
+        assert!(looks_like_action_attempt("```json\n{\"name\":\"read_file\",\"args\":{\"path\":"));
     }
 
     #[test]

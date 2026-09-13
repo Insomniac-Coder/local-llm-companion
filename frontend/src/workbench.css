@@ -1641,3 +1641,18 @@ button.launch-card:hover:not(:disabled) { border-color: var(--line-3); backgroun
   .sb-row .sb-row-menu { opacity: 1; }
   [data-tip]::after { display: none; }
 }
+
+/* Native reasoning streamed for a reply (session-only; never persisted). */
+.thinking-block { margin: 0 0 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--raised); }
+.thinking-block > summary { display: flex; align-items: center; gap: 8px; padding: 8px 12px; cursor: pointer; color: var(--text-3); font-size: 12.5px; font-weight: 500; list-style: none; user-select: none; }
+.thinking-block > summary::-webkit-details-marker { display: none; }
+.thinking-block > summary::before { content: ''; width: 5px; height: 5px; border-radius: 50%; background: var(--line-3); flex: none; }
+.thinking-block[open] > summary::before { background: var(--tally); box-shadow: 0 0 8px color-mix(in srgb, var(--tally) 60%, transparent); }
+.thinking-block > summary:hover { color: var(--text); }
+.thinking-block > pre { margin: 0; padding: 4px 12px 12px; border-top: 1px solid var(--line); max-height: 260px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text-3); font: 12.5px/1.55 var(--font-mono, ui-monospace, monospace); }
+
+/* Partial agent text while a step is being written. */
+.live-thought { margin: 0; padding: 0 14px 12px 34px; color: var(--text-3); font-size: 12.5px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; font-style: italic; }
+.live-thought-block { margin: 8px 0 0; padding: 10px 12px; border: 1px dashed var(--line-3); border-radius: 10px; background: var(--raised); }
+.live-thought-block .eyebrow { display: block; margin-bottom: 6px; color: var(--tally-ink); }
+.live-thought-block pre { margin: 0; max-height: 200px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text-2); font: 12.5px/1.55 var(--font-mono, ui-monospace, monospace); }

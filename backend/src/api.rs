@@ -135,8 +135,12 @@ impl AppState {
             )),
             metrics: std::sync::Arc::new(std::sync::Mutex::new(crate::metrics::MetricsLog::new())),
             agent_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            // Downloads and web search only. No whole-request timeout: a
+            // multi-gigabyte model download legitimately runs for hours;
+            // a stalled connection is caught by the idle read timeout.
             http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(600))
+                .connect_timeout(std::time::Duration::from_secs(30))
+                .read_timeout(std::time::Duration::from_secs(120))
                 .build()
                 .expect("http client"),
             permissions: Arc::new(tokio::sync::RwLock::new(permissions)),
@@ -167,7 +171,7 @@ struct ErrorBody {
 }
 
 #[derive(Debug)]
-struct ApiError {
+pub(crate) struct ApiError {
     status: StatusCode,
     message: String,
     hint: String,
@@ -785,10 +789,6 @@ async fn start_sidecar(
         seed: None,
         ..InferenceConfig::default()
     };
-    let policy =
-        crate::inference::resolve_runtime_policy(model.as_ref(), &cfg, settings.runtime_auto);
-    policy.apply_to(&mut cfg);
-
     let binary = match SidecarBinary::detect(&s.models_dir) {
         Ok(b) => b,
         Err(e) => {
@@ -801,6 +801,26 @@ async fn start_sidecar(
     s.llama.write().await.stop().await;
     s.models.write().await.unload_all();
     s.inference.write().await.unload();
+    // Measure GPU memory only after the previous worker has released its
+    // share, so the fit sees what this model can actually use.
+    let vram = if settings.runtime_auto {
+        tokio::task::spawn_blocking(current_vram_state)
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    let ram_available = (hardware::detect().ram.available_gb * 1_073_741_824.0) as u64;
+    let policy = crate::inference::resolve_runtime_policy_for_machine(
+        model.as_ref(),
+        &cfg,
+        settings.runtime_auto,
+        &settings.runtime,
+        vram,
+        Some(ram_available),
+    );
+    policy.apply_to(&mut cfg);
     let devices = if settings.runtime_auto {
         binary.devices().await
     } else {
@@ -879,6 +899,29 @@ fn measured_vram_gb(hw: &hardware::HardwareReport) -> f64 {
         .unwrap_or_else(|| hw.gpus.iter().map(|g| g.vram_gb).fold(0.0, f64::max))
 }
 
+/// Fresh GPU memory reading for load-time fitting (one `nvidia-smi` call).
+fn current_vram_state() -> Option<crate::inference::VramState> {
+    let (used_gb, total_gb) = crate::metrics::vram_info()?;
+    let to_bytes = |gb: f64| (gb.max(0.0) * 1_073_741_824.0) as u64;
+    (total_gb > 0.0).then(|| crate::inference::VramState {
+        total_bytes: to_bytes(total_gb),
+        used_bytes: to_bytes(used_gb),
+    })
+}
+
+/// VRAM total from the background sampler when it has one (no extra
+/// `nvidia-smi` process per request), else a direct probe.
+fn sampled_vram_gb(s: &AppState, hw: &hardware::HardwareReport) -> f64 {
+    let sampled = s
+        .metrics
+        .lock()
+        .ok()
+        .and_then(|log| log.latest())
+        .and_then(|sample| sample.vram_total_gb)
+        .filter(|total| *total > 0.0);
+    sampled.unwrap_or_else(|| measured_vram_gb(hw))
+}
+
 /// Stage 16: context recommendation (§§154–169).
 #[derive(Deserialize, Default)]
 struct RecommendQuery {
@@ -905,7 +948,7 @@ async fn model_recommend(
         )
     })?;
     let hw = hardware::detect();
-    let vram = measured_vram_gb(&hw);
+    let vram = sampled_vram_gb(&s, &hw);
     let workload = if q.workload.is_empty() {
         Workload::Chat
     } else {
@@ -958,7 +1001,7 @@ async fn model_detail(
     };
     drop(mm);
     let hw = hardware::detect();
-    let vram = measured_vram_gb(&hw);
+    let vram = sampled_vram_gb(&s, &hw);
     let mut effective_meta = meta.clone();
     effective_meta.context_length = s
         .settings
@@ -1124,6 +1167,163 @@ struct ClassifyReq {
     message: String,
 }
 
+/// Everything every model request for one conversation shares: the identity
+/// prompt (project snapshot + saved memory), the bounded history as turns,
+/// and the resolved code workspace. Chat, routing and the agent all start from
+/// this same prefix so llama-server's prompt cache serves the unchanged part.
+/// A different prefix per request type would force a full re-prefill of the
+/// whole conversation on every message, which on a CPU-only machine costs
+/// minutes, not milliseconds.
+pub(crate) struct RequestContext {
+    pub sys_prompt: String,
+    pub sys_mode: String,
+    pub model_name: String,
+    /// History (+ attachment excerpts on the latest user turn, images applied).
+    pub turns: Vec<ChatTurn>,
+    pub images_skipped: usize,
+    pub chat_workspace: Option<(String, String, std::path::PathBuf)>,
+    pub reasoning_default: bool,
+    pub search_default: bool,
+}
+
+/// Bounded history in characters for a given context window: leave room for
+/// the system prompt, the reply and a safety margin, then convert with a
+/// conservative 3 chars/token. Never below a small floor so the latest turn
+/// always travels.
+pub(crate) fn history_char_budget(n_ctx: u32, system_chars: usize) -> usize {
+    let system_tokens = system_chars / 3;
+    let available = (n_ctx as usize)
+        .saturating_sub(system_tokens)
+        .saturating_sub(1536);
+    (available * 3).clamp(4_000, HISTORY_CHARS)
+}
+
+/// Assemble the shared prefix. `pending_message` is a user turn that has not
+/// been persisted yet (routing runs before persistence); it is laid out
+/// exactly as the persisted turn will be, so the two requests share bytes.
+pub(crate) async fn assemble_request_context(
+    s: &AppState,
+    conv_id: Option<&str>,
+    pending_message: Option<&str>,
+    n_ctx: u32,
+) -> Result<RequestContext, ApiError> {
+    let model_name = s
+        .models
+        .read()
+        .await
+        .current()
+        .map(|m| m.name.clone())
+        .unwrap_or_else(|| "local model".into());
+    let vision_ok = s
+        .models
+        .read()
+        .await
+        .current()
+        .map(|m| m.vision)
+        .unwrap_or(false);
+    let Some(cid) = conv_id else {
+        let turns = pending_message
+            .map(|message| vec![ChatTurn::text("user", message)])
+            .unwrap_or_default();
+        return Ok(RequestContext {
+            sys_prompt: build_system_prompt("chat", "", &model_name),
+            sys_mode: "chat".into(),
+            model_name,
+            turns,
+            images_skipped: 0,
+            chat_workspace: None,
+            reasoning_default: false,
+            search_default: false,
+        });
+    };
+    let st = s.storage.lock().await;
+    let conv = st
+        .get_conversation(cid)
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .ok_or_else(|| ApiError::not_found("conversation not found"))?;
+    let mut history = st
+        .context_messages_for(cid)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    if let Some(message) = pending_message {
+        history.push(Message {
+            id: "pending".into(),
+            conversation_id: cid.into(),
+            role: "user".into(),
+            content: message.into(),
+            created_at: String::new(),
+        });
+    }
+    let attachments = st.attachments_for(cid).unwrap_or_default();
+    // Resolve the subject once for this request. The snapshot, retrieval and
+    // file tools must all use the same root, including conversational follow-ups.
+    let chat_workspace = if conv.mode == "code" {
+        let linked = linked_code_workspace(&st, &conv)?;
+        let references = history
+            .iter()
+            .filter(|message| message.role == "user")
+            .map(|message| message.content.clone())
+            .collect::<Vec<_>>();
+        let root = crate::agent_runner::focused_workspace_root(
+            std::path::Path::new(&linked.path),
+            &references,
+        );
+        let name = root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&linked.name)
+            .to_owned();
+        Some((linked.id, name, root))
+    } else {
+        None
+    };
+    let snapshot = chat_workspace
+        .as_ref()
+        .map(|(_, name, root)| workspace_snapshot(&root.to_string_lossy(), name))
+        .unwrap_or_default();
+    let mut sys_prompt = build_system_prompt(&conv.mode, &snapshot, &model_name);
+    sys_prompt.push_str(
+        &st.memory_context(cid, &conv.workspace)
+            .map_err(|error| ApiError::internal(format!("Could not read saved memory: {error}")))?
+            .text,
+    );
+    let budget = history_char_budget(n_ctx, sys_prompt.len());
+    let mut turns = build_turns_budgeted(&history, &attachments, budget);
+    let mut images_skipped = 0usize;
+    if vision_ok {
+        let mut urls = vec![];
+        for a in attachments.iter().filter(|a| a.kind == "image").take(4) {
+            let p = s.attachments_dir.join(cid).join(&a.filename);
+            match std::fs::read(&p)
+                .map_err(|e| e.to_string())
+                .and_then(|b| crate::vision::prepare_image(&b))
+            {
+                Ok(prep) => urls.push(prep.data_url),
+                Err(e) => {
+                    tracing::warn!("vision prepare failed for {}: {e}", a.filename);
+                    images_skipped += 1;
+                }
+            }
+        }
+        if !urls.is_empty() {
+            if let Some(last_user) = turns.iter_mut().rev().find(|t| t.role == "user") {
+                last_user.images = urls;
+            }
+        }
+    } else {
+        images_skipped = attachments.iter().filter(|a| a.kind == "image").count();
+    }
+    Ok(RequestContext {
+        sys_prompt,
+        sys_mode: conv.mode.clone(),
+        model_name,
+        turns,
+        images_skipped,
+        chat_workspace,
+        reasoning_default: conv.reasoning_default,
+        search_default: conv.search_default,
+    })
+}
+
 async fn classify_request(
     State(s): State<AppState>,
     Json(req): Json<ClassifyReq>,
@@ -1137,14 +1337,6 @@ async fn classify_request(
         )
     })?;
     guard_agent_running(&s, false).await?;
-    let history = {
-        let st = s.storage.lock().await;
-        st.get_conversation(&req.conversation_id)
-            .map_err(|e| ApiError::internal(e.to_string()))?
-            .ok_or_else(|| ApiError::not_found("conversation not found"))?;
-        st.context_messages_for(&req.conversation_id)
-            .map_err(|e| ApiError::internal(e.to_string()))?
-    };
     let runtime = {
         let mut llama = s.llama.write().await;
         if llama.is_running() {
@@ -1162,22 +1354,38 @@ async fn classify_request(
             "Load a model before sending a message.",
         ));
     };
-    let turns = crate::request_router::classification_turns(&history, &req.message);
+    // The routing request is the chat request's prefix plus one instruction
+    // turn, so the reply that follows re-prefills only the instruction.
+    let context = assemble_request_context(
+        &s,
+        Some(req.conversation_id.as_str()),
+        Some(&req.message),
+        cfg.n_ctx,
+    )
+    .await?;
+    let mut turns = vec![ChatTurn::text("system", context.sys_prompt)];
+    turns.extend(context.turns);
+    let turns = crate::request_router::classification_turns_from_prefix(turns);
     let client = SidecarClient::new(url).map_err(|e| ApiError::internal(e.to_string()))?;
     let result = tokio::time::timeout(
-        std::time::Duration::from_secs(25),
+        std::time::Duration::from_secs(60),
         client.classify_request(&turns, &cfg),
     )
     .await;
     let decision = match result {
         Ok(Ok(completion)) => crate::request_router::parse_decision(&completion),
-        _ => None,
+        Ok(Err(error)) => {
+            tracing::warn!("request routing failed: {error}");
+            None
+        }
+        Err(_) => None,
     };
     Ok(Json(serde_json::json!({
         "intent": decision.unwrap_or(crate::request_router::RequestIntent::Ask),
         "source": if decision.is_some() { "model" } else { "fallback" }
     })))
 }
+
 
 /// Resolved reasoning mode for one request (§§110–113).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1339,7 +1547,12 @@ async fn cached_repo_index(
             return idx.clone();
         }
     }
-    let idx = crate::repo_index::build(path);
+    // Walking thousands of files is blocking work; keep it off the async
+    // workers that serve streaming responses.
+    let root = path.to_path_buf();
+    let idx = tokio::task::spawn_blocking(move || crate::repo_index::build(&root))
+        .await
+        .unwrap_or_default();
     s.repo_index
         .write()
         .await
@@ -1491,14 +1704,28 @@ async fn run_chat_tool_round(
             .map(crate::tools::ToolResult::ok)
             .map_err(crate::tools::ToolError::InvalidArgs)
     } else {
-        crate::tools::execute(&req, &ws, false)
+        // File reads and regex searches are blocking filesystem work.
+        let blocking_ws = ws.clone();
+        let blocking_req = req.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::tools::execute(&blocking_req, &blocking_ws, false)
+        })
+        .await
+        .unwrap_or_else(|error| {
+            Err(crate::tools::ToolError::InvalidArgs(format!(
+                "tool task failed: {error}"
+            )))
+        })
     };
     let (ok, output) = match executed {
         Ok(r) => (r.ok, r.output),
         Err(crate::tools::ToolError::PermissionRequired { reason, .. }) => {
             (false, format!("Permission required: {reason}"))
         }
-        Err(e) => (false, format!("Tool failed: {e}")),
+        Err(e) => (
+            false,
+            format!("Tool failed: {e}\nYou sent args: {}", call.args),
+        ),
     };
     status(&format!(
         "{} {}",
@@ -1692,6 +1919,18 @@ async fn run_command_as_chat(
     }
     Ok(stream_text(text, action))
 }
+/// Output allowance for one chat reply: generous enough for a long code answer,
+/// never larger than what the context can hold after the input.
+fn chat_output_budget(n_ctx: u32, input_tokens: u32, reasoning: ReasoningMode, budget: &str) -> u32 {
+    let cap = match reasoning {
+        ReasoningMode::Off => 8192,
+        _ if budget == "high" => 16384,
+        _ => 12288,
+    };
+    let room = n_ctx.saturating_sub(input_tokens).saturating_sub(256);
+    cap.min(room).max(256)
+}
+
 async fn chat_sse(
     State(s): State<AppState>,
     Json(req): Json<ChatReq>,
@@ -1782,8 +2021,6 @@ async fn chat_sse(
 
     // Verify the conversation exists and persist the user turn first so a
     // crash never silently drops it (§83).
-    let mut conv_reasoning_default = false;
-    let mut conv_search_default = false;
     if let Some(ref cid) = conv_id {
         let st = s.storage.lock().await;
         match st.get_conversation(cid) {
@@ -1795,8 +2032,6 @@ async fn chat_sse(
                             .map_err(|error| ApiError::internal(error.to_string()))?;
                     }
                 }
-                conv_reasoning_default = conv.reasoning_default;
-                conv_search_default = conv.search_default;
                 st.add_message(&Message {
                     id: uuid::Uuid::new_v4().to_string(),
                     conversation_id: cid.clone(),
@@ -1813,34 +2048,7 @@ async fn chat_sse(
         }
     }
 
-    // Stage 11 capability resolution (§115): message > conversation > settings.
-    // Search has no global on-switch: it stays off unless the message or the
-    // conversation explicitly enables it (§117).
     let settings = s.settings.read().await.clone();
-    let want_reasoning = req
-        .reasoning
-        .unwrap_or(conv_reasoning_default || settings.reasoning.default_on);
-    let want_search = req.search.unwrap_or(conv_search_default);
-    let native_reasoning = s
-        .models
-        .read()
-        .await
-        .current()
-        .map(|m| m.supports_reasoning)
-        .unwrap_or(false);
-    let reasoning = if !want_reasoning {
-        ReasoningMode::Off
-    } else if native_reasoning {
-        ReasoningMode::Native
-    } else {
-        ReasoningMode::Extended
-    };
-    let max_tokens: u32 = match reasoning {
-        ReasoningMode::Off => 2048,
-        _ if settings.reasoning.budget == "high" => 6144,
-        _ => 4096,
-    };
-
     let sidecar = {
         let mut llama = s.llama.write().await;
         if llama.is_running() {
@@ -1853,9 +2061,19 @@ async fn chat_sse(
         }
     };
 
-    // Stub path (no sidecar): deterministic word-split stream + done event.
+    // No live runtime: a model that is merely marked loaded (or whose worker
+    // died) must never produce a fake echo reply. Say what happened instead.
     if sidecar.is_none() {
-        let full = stub_reply(&s, &req.message).await;
+        let marked_loaded = s.inference.read().await.is_loaded();
+        if marked_loaded {
+            s.inference.write().await.unload();
+            s.models.write().await.unload_all();
+        }
+        let full = if marked_loaded {
+            "The model runtime stopped unexpectedly. Reload the model and send your message again; your message was saved.".to_string()
+        } else {
+            stub_reply(&s, &req.message).await
+        };
         if let Some(cid) = conv_id {
             let st = s.storage.lock().await;
             if let Err(e) = st.add_message(&Message {
@@ -1878,12 +2096,35 @@ async fn chat_sse(
         )));
         return Ok(Sse::new(stream::iter(events).boxed()).keep_alive(KeepAlive::default()));
     }
+    let (base_url, cfg) = sidecar.expect("checked");
+
+    // Stage 11 capability resolution (§115): message > conversation > settings.
+    // Search has no global on-switch: it stays off unless the message or the
+    // conversation explicitly enables it (§117).
+    let context = assemble_request_context(&s, conv_id.as_deref(), None, cfg.n_ctx).await?;
+    let want_reasoning = req
+        .reasoning
+        .unwrap_or(context.reasoning_default || settings.reasoning.default_on);
+    let want_search = req.search.unwrap_or(context.search_default);
+    let native_reasoning = s
+        .models
+        .read()
+        .await
+        .current()
+        .map(|m| m.supports_reasoning)
+        .unwrap_or(false);
+    let reasoning = if !want_reasoning {
+        ReasoningMode::Off
+    } else if native_reasoning {
+        ReasoningMode::Native
+    } else {
+        ReasoningMode::Extended
+    };
 
     // Live sidecar path: true token-passthrough (§19). A background task runs
-    // `chat_stream`, forwarding each delta into the SSE channel immediately.
+    // the stream, forwarding each delta into the SSE channel immediately.
     // The run is registered with the generation tracker so Stop (or a new
     // turn) cancels the sidecar request itself and keeps the partial (§46).
-    let (base_url, cfg) = sidecar.expect("checked");
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Event, Infallible>>();
     let gen_id = uuid::Uuid::new_v4().to_string();
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1891,136 +2132,17 @@ async fn chat_sse(
     let persisted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // A new turn supersedes any running one: cancel it (partial kept) first.
     s.generations.write().await.cancel_current(&s.storage).await;
-    // Stage 6: the model sees the recent thread + attachment excerpts, not
-    // just the latest message (history already includes the turn above).
-    // Stage 19: image attachments become data URLs when the loaded model has
-    // vision; otherwise their honest fallback excerpts already cover it (§73).
-    let vision_ok = s
-        .models
-        .read()
-        .await
-        .current()
-        .map(|m| m.vision)
-        .unwrap_or(false);
-    // System prompt inputs (§22): session mode + project snapshot so the
-    // model knows what project it can see instead of denying it can.
-    // Resolve the subject once for this request. The snapshot, retrieval and
-    // file tools must all use the same root, including conversational follow-ups.
-    let chat_workspace = if let Some(cid) = &conv_id {
-        let st = s.storage.lock().await;
-        let conv = st
-            .get_conversation(cid)
-            .map_err(|e| ApiError::internal(e.to_string()))?;
-        if let Some(conv) = conv.filter(|conv| conv.mode == "code") {
-            let linked = linked_code_workspace(&st, &conv)?;
-            let history = st
-                .context_messages_for(cid)
-                .map_err(|e| ApiError::internal(e.to_string()))?;
-            let references = history
-                .into_iter()
-                .filter(|message| message.role == "user")
-                .map(|message| message.content)
-                .collect::<Vec<_>>();
-            let root = crate::agent_runner::focused_workspace_root(
-                std::path::Path::new(&linked.path),
-                &references,
-            );
-            let name = root
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or(&linked.name)
-                .to_owned();
-            Some((linked.id, name, root))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    let (sys_mode, sys_snapshot, sys_model) = if let Some(ref cid) = conv_id {
-        let st = s.storage.lock().await;
-        match st.get_conversation(cid) {
-            Ok(Some(conv)) => {
-                let snap = chat_workspace
-                    .as_ref()
-                    .map(|(_, name, root)| workspace_snapshot(&root.to_string_lossy(), name))
-                    .unwrap_or_default();
-                let model = s
-                    .models
-                    .read()
-                    .await
-                    .current()
-                    .map(|m| m.name.clone())
-                    .unwrap_or_else(|| "local model".into());
-                (conv.mode.clone(), snap, model)
-            }
-            _ => ("chat".into(), String::new(), "local model".into()),
-        }
-    } else {
-        (
-            "chat".into(),
-            String::new(),
-            s.models
-                .read()
-                .await
-                .current()
-                .map(|m| m.name.clone())
-                .unwrap_or_else(|| "local model".into()),
-        )
-    };
-    let mut sys_prompt = build_system_prompt(&sys_mode, &sys_snapshot, &sys_model);
+    let RequestContext {
+        mut sys_prompt,
+        sys_mode,
+        turns: bg_turns,
+        images_skipped,
+        chat_workspace,
+        ..
+    } = context;
     if let Some(task) = resumed_task {
         sys_prompt.push_str(&format!("\nThe user's continuation refers only to this saved unfinished task in this same project: {task}\nThis Ask reply remains read-only; continue inspection or explanation, never implement changes."));
     }
-    if let Some(cid) = &conv_id {
-        let st = s.storage.lock().await;
-        let workspace = st
-            .get_conversation(cid)
-            .ok()
-            .flatten()
-            .map(|conversation| conversation.workspace)
-            .unwrap_or_default();
-        sys_prompt.push_str(
-            &st.memory_context(cid, &workspace)
-                .map_err(|error| {
-                    ApiError::internal(format!("Could not read saved memory: {error}"))
-                })?
-                .text,
-        );
-    }
-    let (bg_turns, images_skipped) = if let Some(ref cid) = conv_id {
-        let st = s.storage.lock().await;
-        let history = st.context_messages_for(cid).unwrap_or_default();
-        let attachments = st.attachments_for(cid).unwrap_or_default();
-        let mut turns = build_turns(&history, &attachments);
-        let mut skipped = 0usize;
-        if vision_ok {
-            let mut urls = vec![];
-            for a in attachments.iter().filter(|a| a.kind == "image").take(4) {
-                let p = s.attachments_dir.join(cid).join(&a.filename);
-                match std::fs::read(&p)
-                    .map_err(|e| e.to_string())
-                    .and_then(|b| crate::vision::prepare_image(&b))
-                {
-                    Ok(prep) => urls.push(prep.data_url),
-                    Err(e) => {
-                        tracing::warn!("vision prepare failed for {}: {e}", a.filename);
-                        skipped += 1;
-                    }
-                }
-            }
-            if !urls.is_empty() {
-                if let Some(last_user) = turns.iter_mut().rev().find(|t| t.role == "user") {
-                    last_user.images = urls;
-                }
-            }
-        } else {
-            skipped = attachments.iter().filter(|a| a.kind == "image").count();
-        }
-        (turns, skipped)
-    } else {
-        (vec![ChatTurn::text("user", req.message.clone())], 0)
-    };
     let bg_state = s.clone();
     let bg_conv = conv_id.clone();
     let bg_sys = sys_prompt;
@@ -2096,12 +2218,14 @@ async fn chat_sse(
         }
         // Native thinking is reported only when the sidecar actually emits a
         // reasoning-channel delta, never inferred from a requested setting.
-        // Prepend the reasoning preface as a transient system turn (never
-        // persisted) and append web context to the latest user turn.
+        // The reasoning preface is a transient system turn (never persisted)
+        // placed AFTER the identity prompt so the cached prefix survives it;
+        // web context is appended to the latest user turn.
         let mut turns = bg_turns;
+        turns.insert(0, ChatTurn::text("system", bg_sys));
         if reasoning != ReasoningMode::Off {
             turns.insert(
-                0,
+                1,
                 ChatTurn::text(
                     "system",
                     reasoning_preface(
@@ -2111,8 +2235,6 @@ async fn chat_sse(
                 ),
             );
         }
-        // Identity + project snapshot always first (§22).
-        turns.insert(0, ChatTurn::text("system", bg_sys));
         if !web_block.is_empty() {
             if let Some(last_user) = turns.iter_mut().rev().find(|t| t.role == "user") {
                 last_user.content.push_str(&web_block);
@@ -2122,6 +2244,12 @@ async fn chat_sse(
             ReasoningMode::Off => "off",
             ReasoningMode::Native => "native",
             ReasoningMode::Extended => "extended",
+        };
+        // Reasoning off means off: thinking models are asked not to think,
+        // instead of silently spending thousands of hidden tokens per reply.
+        let request_options = crate::llamaserver::RequestOptions {
+            thinking: (reasoning == ReasoningMode::Off).then_some(false),
+            ..crate::llamaserver::RequestOptions::default()
         };
         // Stage 31/32/35: code sessions get index hints + local knowledge so
         // the model can find files itself instead of guessing from the tree.
@@ -2189,6 +2317,8 @@ async fn chat_sse(
         let mut timing = crate::inference::OutputTiming::default();
         let mut tool_uses = 0u32;
         let mut pending_tool_limit = false;
+        let mut truncated = false;
+        let mut reasoning_seen = false;
         let mut failed: Option<String> = None;
         let client = match SidecarClient::new(base_url) {
             Ok(c) => Some(c),
@@ -2203,13 +2333,29 @@ async fn chat_sse(
                 if bg_cancel.load(std::sync::atomic::Ordering::SeqCst) {
                     break;
                 }
+                // Room kept for the reply while old tool results are released:
+                // a quarter of the window (1K-8K). The reply's own allowance is
+                // computed afterwards from whatever input remains, so a large
+                // output cap never starves the inspection of context.
+                let output_reserve = (cfg.n_ctx / 4).clamp(1024, 8192).min(cfg.n_ctx / 2);
                 // Only shorten old transient tool results, never the user's
                 // question, saved conversation, or latest chunk. Full evidence
                 // remains in the activity journal and can be read again.
-                if tool_uses > 0 && !inspection_memory.compact(&mut turns, cfg.n_ctx, max_tokens) {
+                if tool_uses > 0
+                    && !inspection_memory.compact(&mut turns, cfg.n_ctx, output_reserve)
+                {
                     failed = Some("Inspection reached the model's context capacity. Completed reads are saved in file activity; this is a partial inspection, not a completed answer. Continue with a narrower question or a larger context.".into());
                     break;
                 }
+                let estimated_input =
+                    crate::agent::AgentContextUsage::for_turns(&turns, cfg.n_ctx, 0, 0)
+                        .estimated_tokens;
+                let max_tokens = chat_output_budget(
+                    cfg.n_ctx,
+                    estimated_input,
+                    reasoning,
+                    &settings.reasoning.budget,
+                );
                 if tool_uses == CHAT_TOOL_ROUNDS {
                     turns.push(ChatTurn::text("user", "[Inspection budget reached. Do not request more tools. Answer using the evidence already read, cite relevant paths/lines, and clearly identify unverified areas. Do not claim a complete project audit.]"));
                 }
@@ -2217,40 +2363,60 @@ async fn chat_sse(
                 let round_offset_ms = request_started.elapsed().as_millis() as u64;
                 let full_r = full_cb.clone();
                 let tx_r = tx_tok.clone();
+                let tx_reason = tx_tok.clone();
                 let tx_phase = tx_status.clone();
                 let round = tool_uses + 1;
                 let cancel_r = cancel_cb.clone();
                 let round_base = full_cb.lock().expect("lock").len();
+                // In code sessions a complete action fence ends the round: the
+                // runtime is released instead of generating text after it.
+                let stop_on_action = code_activity && chat_ws.is_some();
+                let handlers = crate::llamaserver::StreamHandlers {
+                    on_token: Box::new(move |tok: &str| {
+                        full_r.lock().expect("lock").push_str(tok);
+                        let _ = tx_r.send(Ok(Event::default().event("token").data(tok.to_string())));
+                    }),
+                    on_reasoning: Box::new(move |text: &str| {
+                        let _ = tx_reason
+                            .send(Ok(Event::default().event("reasoning").data(text.to_string())));
+                    }),
+                    on_phase: Box::new(move |phase| {
+                        let _ = tx_phase.send(Ok(Event::default().event("phase").data(
+                            serde_json::json!({"phase": phase, "round": round}).to_string(),
+                        )));
+                    }),
+                    is_cancelled: Box::new(move || {
+                        cancel_r.load(std::sync::atomic::Ordering::SeqCst)
+                    }),
+                    should_stop: Box::new(move |text: &str| {
+                        stop_on_action
+                            && text.contains("```tool")
+                            && crate::agent_runner::parse_tool_block(text).is_some()
+                    }),
+                };
                 let out = client
-                    .chat_turns_stream_observed(
-                        &turns,
-                        max_tokens,
-                        &cfg,
-                        move |tok: String| {
-                            full_r.lock().expect("lock").push_str(&tok);
-                            let _ = tx_r.send(Ok(Event::default().event("token").data(tok)));
-                        },
-                        move |phase| {
-                            let _ = tx_phase.send(Ok(Event::default().event("phase").data(
-                                serde_json::json!({"phase": phase, "round": round}).to_string(),
-                            )));
-                        },
-                        move || cancel_r.load(std::sync::atomic::Ordering::SeqCst),
-                    )
+                    .stream(&turns, max_tokens, &cfg, &request_options, handlers)
                     .await;
                 let gen_ms = gen_start.elapsed().as_millis().max(1) as u64;
                 match out {
-                    Ok(m) => {
+                    Ok(outcome) => {
+                        let m = &outcome.metrics;
                         prompt_sum += m.prompt_tokens;
                         gen_sum += m.generated_tokens;
                         ms_sum += gen_ms;
+                        reasoning_seen |= outcome.reasoning_present;
                         if let Some(round_timing) = m.timing.as_ref() {
                             timing.add_round(round_timing, round_offset_ms);
                         }
                         let round_text = full_cb.lock().expect("lock")[round_base..].to_string();
+                        let has_tool = crate::agent_runner::parse_tool_block(&round_text).is_some();
+                        if outcome.finish_reason.as_deref() == Some("length")
+                            && !outcome.early_stopped
+                            && !has_tool
+                        {
+                            truncated = true;
+                        }
                         if code_activity {
-                            let has_tool =
-                                crate::agent_runner::parse_tool_block(&round_text).is_some();
                             let narrative = if has_tool {
                                 crate::agent_runner::visible_progress(&round_text)
                             } else {
@@ -2292,8 +2458,7 @@ async fn chat_sse(
                             )
                             .await
                         } else {
-                            pending_tool_limit =
-                                crate::agent_runner::parse_tool_block(&round_text).is_some();
+                            pending_tool_limit = has_tool;
                             false
                         };
                         if worked {
@@ -2384,7 +2549,8 @@ async fn chat_sse(
                         "prompt_tokens": prompt_sum,
                         "generated_tokens": gen_sum,
                         "stopped": was_cancelled,
-                        "reasoning": reasoning_label,
+                        "truncated": truncated,
+                        "reasoning": if reasoning_seen && reasoning_label == "off" { "native" } else { reasoning_label },
                         "sources": cite_block.lines().filter(|l| l.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)).count(),
                         "vision": if images_skipped > 0 { "unsupported" } else { "off" },
                         // Stage 32 measured generation speed (output tok/s).
@@ -2603,11 +2769,14 @@ async fn list_messages(
             let messages = st
                 .messages_for(&id)
                 .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
+            // One query for every journal in the conversation instead of one
+            // per message (a long session used to issue hundreds).
+            let mut journals = st
+                .conversation_activities(&id)
+                .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
             let mut payload = vec![];
             for message in messages {
-                let activities = st
-                    .message_activities(&message.id)
-                    .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
+                let activities = journals.remove(&message.id).unwrap_or_default();
                 let mut value =
                     serde_json::to_value(message).map_err(|e| ApiError::internal(e.to_string()))?;
                 if !activities.is_empty() {
@@ -2694,6 +2863,17 @@ pub(crate) fn build_turns(
     history: &[Message],
     attachments: &[crate::storage::Attachment],
 ) -> Vec<ChatTurn> {
+    build_turns_budgeted(history, attachments, HISTORY_CHARS)
+}
+
+/// Same as `build_turns` with an explicit character budget derived from the
+/// loaded context window, so an 8K CPU context and a 128K GPU context each
+/// carry as much history as they can actually hold.
+pub(crate) fn build_turns_budgeted(
+    history: &[Message],
+    attachments: &[crate::storage::Attachment],
+    max_chars: usize,
+) -> Vec<ChatTurn> {
     let summary = history
         .first()
         .filter(|message| message.id.starts_with("context-summary:"));
@@ -2707,9 +2887,18 @@ pub(crate) fn build_turns(
     if let Some(summary) = summary {
         window.insert(0, summary);
     }
+    // Attachment excerpts ride on the latest turn and count against the same
+    // budget, so a big attachment on a small context displaces old history
+    // rather than overflowing the window.
+    let attach_reserved: usize = attachments
+        .iter()
+        .map(|a| a.text_excerpt.len())
+        .sum::<usize>()
+        .min(ATTACH_CHARS_PER_TURN);
+    let history_budget = max_chars.saturating_sub(attach_reserved).max(2_000);
     // Drop oldest until within budget (never drop the final turn).
     let mut chars: usize = window.iter().map(|m| m.content.len()).sum();
-    while window.len() > 1 && chars > HISTORY_CHARS {
+    while window.len() > 1 && chars > history_budget {
         let remove_at = if summary.is_some() && window.len() > 2 {
             1
         } else {
@@ -3622,6 +3811,11 @@ struct AgentReq {
     /// Stage 11: Search-toggle consent for this run (default off, §117).
     #[serde(default)]
     search: bool,
+    /// Native thinking for this run; defaults to the conversation, then the
+    /// saved preference. Off asks thinking models not to think, which keeps
+    /// each step's output budget for the action itself.
+    #[serde(default)]
+    reasoning: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3845,10 +4039,12 @@ async fn run_agent(
     };
     // Agent work belongs to the session that launched it. Persist the user's
     // natural-language task in the transcript before orchestration starts.
+    let mut conversation_reasoning = false;
     if !req.conversation_id.trim().is_empty() {
         let st = s.storage.lock().await;
         match st.get_conversation(req.conversation_id.trim()) {
             Ok(Some(conversation)) => {
+                conversation_reasoning = conversation.reasoning_default;
                 if conversation.mode == "code" {
                     let linked = linked_code_workspace(&st, &conversation)?;
                     let linked_root = std::fs::canonicalize(&linked.path).map_err(|error| {
@@ -3880,6 +4076,9 @@ async fn run_agent(
             Err(error) => return Err(ApiError::internal(format!("storage error: {error}"))),
         };
     }
+    let reasoning = req
+        .reasoning
+        .unwrap_or(conversation_reasoning || s.settings.read().await.reasoning.default_on);
     let run_id = spawn_agent_run(
         &s,
         ws_root,
@@ -3887,6 +4086,7 @@ async fn run_agent(
         mode,
         req.conversation_id.trim().to_string(),
         req.search,
+        reasoning,
     )
     .await?;
     Ok(Json(
@@ -3901,6 +4101,7 @@ async fn spawn_agent_run(
     mode: AgentMode,
     conversation_id: String,
     search: bool,
+    reasoning: bool,
 ) -> Result<String, ApiError> {
     use crate::agent_runner::{AgentSpec, LiveRun};
     use tokio::sync::broadcast;
@@ -3923,10 +4124,13 @@ async fn spawn_agent_run(
             mode,
             conversation_id,
             search_enabled: search,
+            reasoning,
         },
         cancel: CancelToken::new(),
         events: std::sync::Mutex::new(vec![]),
-        broadcaster: broadcast::channel(128).0,
+        // Live subscribers also receive streamed partial text; a slow browser
+        // tab must lag, never close the stream.
+        broadcaster: broadcast::channel(1024).0,
         activity_tx,
         pending: std::sync::Mutex::new(None),
         pending_tx: std::sync::Mutex::new(None),
@@ -4184,7 +4388,11 @@ fn async_stream_like(
                         return;
                     }
                 }
-                Err(_) => return, // broadcaster closed / lagged out
+                // A slow subscriber drops some streamed partial text but keeps
+                // following the run; every journaled event is replayed from
+                // the durable log when the client reconnects.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
             }
         }
     });
@@ -4449,6 +4657,7 @@ async fn run_slash_command(
                 }
                 _ => "Inspect this repository (structure, build system, key files) and summarize the project. Do not modify anything.".into(),
             };
+            let reasoning = s.settings.read().await.reasoning.default_on;
             let run_id = spawn_agent_run(
                 s,
                 ws,
@@ -4456,6 +4665,7 @@ async fn run_slash_command(
                 AgentMode::CodeAssist,
                 conv_id.unwrap_or_default(),
                 false,
+                reasoning,
             )
             .await?;
             Ok(O::AgentRun {
@@ -4495,6 +4705,7 @@ async fn run_slash_command(
                     format!("Run this project command and report the result: {args}")
                 }
             };
+            let reasoning = s.settings.read().await.reasoning.default_on;
             let run_id = spawn_agent_run(
                 s,
                 ws,
@@ -4502,6 +4713,7 @@ async fn run_slash_command(
                 AgentMode::Agent,
                 conv_id.unwrap_or_default(),
                 false,
+                reasoning,
             )
             .await?;
             Ok(O::AgentRun { run_id: run_id.clone(), message: format!("Agent run started ({}) — it will ask before builds/commands. Watch the Agent tab.", &run_id[..8]) })
@@ -6005,18 +6217,26 @@ async fn benchmark(
     let client = SidecarClient::new(base_url.clone())
         .map_err(|e| ApiError::internal(format!("sidecar client failed: {e}")))?;
     let start = std::time::Instant::now();
+    // Thinking off: a benchmark measures decode speed, not a hidden reasoning
+    // channel that would leave the visible sample empty.
     let (text, m) = client
-        .chat_turns(&[ChatTurn::text("user", prompt)], max_tokens, &cfg)
+        .chat_turns_without_reasoning(&[ChatTurn::text("user", prompt)], max_tokens, &cfg)
         .await
         .map_err(|e| ApiError::internal(format!("benchmark generation failed: {e}")))?;
     let ms = start.elapsed().as_millis().max(1) as u64;
-    let gen_tps = (m.generated_tokens as f64 * 1000.0 / ms as f64 * 10.0).round() / 10.0;
+    let wall_tps = (m.generated_tokens as f64 * 1000.0 / ms as f64 * 10.0).round() / 10.0;
+    let engine = m.engine.clone();
     Ok(Json(serde_json::json!({
         "model": model,
         "prompt_tokens": m.prompt_tokens,
         "generated_tokens": m.generated_tokens,
         "total_ms": ms,
-        "generation_tps": gen_tps,
+        // Engine-measured decode rate when the runtime reports it; the
+        // wall-clock rate (which includes prefill and HTTP) otherwise.
+        "generation_tps": engine.as_ref().and_then(|e| e.predicted_tps).unwrap_or(wall_tps),
+        "prompt_tps": engine.as_ref().and_then(|e| e.prompt_tps),
+        "cached_tokens": engine.as_ref().map(|e| e.cached_tokens),
+        "engine": engine,
         "context_limit": cfg.n_ctx,
         "sample_chars": text.len(),
     })))
@@ -6638,12 +6858,11 @@ async fn runtime_policy(
     let model = {
         let registry = s.models.read().await;
         if let Some(id) = q.model_id.as_ref().filter(|id| !id.is_empty()) {
-            Some(
-                registry
-                    .get(id)
-                    .cloned()
-                    .ok_or_else(|| ApiError::not_found("The selected model is unavailable."))?,
-            )
+            // A saved default that is no longer installed (or an empty models
+            // folder) must not turn the settings page into an error: the plan
+            // for "no particular model" is still meaningful, and the response
+            // says which model it could not find.
+            registry.get(id).cloned()
         } else {
             registry
                 .current()
@@ -6660,12 +6879,44 @@ async fn runtime_policy(
         kv_cache_gpu: settings.hardware.kv_cache_gpu,
         ..InferenceConfig::default()
     };
-    let next =
-        crate::inference::resolve_runtime_policy(model.as_ref(), &requested, settings.runtime_auto);
+    // The plan for the next load uses the sampler's latest GPU reading; the
+    // load itself re-measures after the previous worker has exited.
+    let vram = s
+        .metrics
+        .lock()
+        .ok()
+        .and_then(|log| log.latest())
+        .and_then(|sample| {
+            let total = sample.vram_total_gb?;
+            let used = sample.vram_used_gb.unwrap_or(0.0);
+            let running_share = if running { total * 0.0 } else { 0.0 };
+            let _ = running_share;
+            (total > 0.0).then(|| crate::inference::VramState {
+                total_bytes: (total * 1_073_741_824.0) as u64,
+                used_bytes: (used * 1_073_741_824.0) as u64,
+            })
+        });
+    let ram_available = (hardware::detect().ram.available_gb * 1_073_741_824.0) as u64;
+    let next = crate::inference::resolve_runtime_policy_for_machine(
+        model.as_ref(),
+        &requested,
+        settings.runtime_auto,
+        &settings.runtime,
+        // While a model is loaded its own memory counts as "used"; the
+        // preview would then under-size the next context. Skip fitting until
+        // the load re-measures.
+        if running { None } else { vram },
+        Some(ram_available),
+    );
+    let missing_model = q
+        .model_id
+        .as_ref()
+        .filter(|id| !id.is_empty() && model.as_ref().map(|m| &m.id) != Some(id));
     Ok(Json(serde_json::json!({
         "running": running,
         "model_id": model.as_ref().map(|m| &m.id),
         "model_name": model.as_ref().map(|m| &m.name),
+        "missing_model": missing_model,
         "active": active, "next": next, "applies_on": "next_model_load"
     })))
 }
@@ -6805,6 +7056,18 @@ async fn put_settings(
             "Keep between 2 and 200 recent messages when compacting.",
         ));
     }
+    if !["auto", "off"].contains(&next.runtime.speculative.as_str()) {
+        return Err(ApiError::bad(
+            "unknown speculative decoding setting",
+            "Use auto (draft from context) or off.",
+        ));
+    }
+    if !["f16", "q8_0"].contains(&next.runtime.kv_cache.as_str()) {
+        return Err(ApiError::bad(
+            "unknown KV cache precision",
+            "Use f16 (compatibility) or q8_0 (half the cache memory).",
+        ));
+    }
     if next.agent.max_iterations == 0 || next.agent.max_iterations > 200 {
         return Err(ApiError::bad(
             "max_iterations out of range",
@@ -6851,7 +7114,13 @@ async fn put_settings(
 async fn system_info(State(s): State<AppState>) -> Json<serde_json::Value> {
     let hw = hardware::detect();
     let inf = s.inference.read().await;
-    let snap = hardware::snapshot(0, inf.context_size(), inf.metrics().tokens_per_sec);
+    let latest = s.metrics.lock().ok().and_then(|log| log.latest());
+    let snap = hardware::snapshot(
+        latest.as_ref(),
+        0,
+        inf.context_size(),
+        inf.metrics().tokens_per_sec,
+    );
     Json(serde_json::json!({"hardware": hw, "resources": snap}))
 }
 
@@ -6885,7 +7154,13 @@ async fn system_metrics(
 async fn system_overview(State(s): State<AppState>) -> Json<serde_json::Value> {
     let hw = hardware::detect();
     let inf = s.inference.read().await;
-    let snap = hardware::snapshot(0, inf.context_size(), inf.metrics().tokens_per_sec);
+    let latest_sample = s.metrics.lock().ok().and_then(|log| log.latest());
+    let snap = hardware::snapshot(
+        latest_sample.as_ref(),
+        0,
+        inf.context_size(),
+        inf.metrics().tokens_per_sec,
+    );
     drop(inf);
     let (engine, model_id, shared_gb) = {
         let mut llama = s.llama.write().await;
@@ -7520,6 +7795,7 @@ mod tests {
                 mode,
                 conversation_id: String::new(),
                 search_enabled,
+                reasoning: false,
             },
             cancel: CancelToken::new(),
             events: std::sync::Mutex::new(vec![crate::agent::AgentEvent::activity(

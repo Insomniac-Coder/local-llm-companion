@@ -157,12 +157,37 @@ impl Default for SearchSettings {
     }
 }
 
+/// Runtime tuning that applies in both automatic and manual hardware modes.
+/// Each option maps to one validated llama-server flag; see docs/PERFORMANCE.md
+/// for the measurements behind the defaults.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RuntimeSettings {
+    /// "auto" drafts from the context (n-gram, lossless); "off" disables it.
+    pub speculative: String,
+    /// "f16" (compatibility default) or "q8_0" (half the cache memory).
+    pub kv_cache: String,
+    /// Reuse unchanged KV chunks after a prompt diverges (agent loops).
+    pub cache_reuse: bool,
+}
+
+impl Default for RuntimeSettings {
+    fn default() -> Self {
+        Self {
+            speculative: "auto".into(),
+            kv_cache: "f16".into(),
+            cache_reuse: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     /// Managed loading defaults. Legacy inactive cache preferences remain stored,
     /// but are never reinterpreted as an explicit runtime override.
     #[serde(default = "default_runtime_auto")]
     pub runtime_auto: bool,
+    #[serde(default)]
+    pub runtime: RuntimeSettings,
     pub general: GeneralSettings,
     pub inference: InferenceSettings,
     pub hardware: HardwareSettings,
@@ -262,6 +287,7 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             runtime_auto: true,
+            runtime: RuntimeSettings::default(),
             general: GeneralSettings {
                 theme: "dark".into(),
                 default_model: "".into(),

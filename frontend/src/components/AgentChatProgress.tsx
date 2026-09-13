@@ -113,6 +113,8 @@ export default function AgentChatProgress({
   const [runs, setRuns] = useState<AgentRunSummary[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(focusRun ?? null);
   const [events, setEvents] = useState<AgentEvent[]>([]);
+  // Partial model text for the step in progress; cleared by the next journaled event.
+  const [liveText, setLiveText] = useState('');
   const finished = useRef(new Set<string>());
   const finishedCallback = useRef(onFinished);
   const contextCallback = useRef(onContextUsage);
@@ -138,9 +140,15 @@ export default function AgentChatProgress({
 
   useEffect(() => {
     setEvents([]);
+    setLiveText('');
     if (!selectedId) return;
     const controller = new AbortController();
     void streamAgentEvents(selectedId, (event) => {
+      if (event.kind === 'thought_delta') {
+        setLiveText((text) => text + event.message);
+        return;
+      }
+      setLiveText('');
       contextCallback.current?.(event, selectedId);
       setEvents((previous) => mergeEvent(previous, event));
       if (TERMINAL.includes(event.state) && !finished.current.has(selectedId)) {
@@ -192,6 +200,11 @@ export default function AgentChatProgress({
         <ol className="agent-run-steps">
           {updates.map((update, index) => <li key={`${index}-${update}`}>{update}</li>)}
         </ol>
+      )}
+      {liveText.trim() && !waiting && (
+        <p className="live-thought" aria-live="off" title="What the model is writing right now">
+          {liveText.replace(/```tool[\s\S]*$/, '').trim().slice(-220)}
+        </p>
       )}
       <button type="button" className="agent-run-open" onClick={() => onOpenActivity(selected.id)}>
         {state === 'WAITING_PERMISSION' ? 'Review the request' : 'Open agent activity'} <Icon name="arrowRight" size={14} />

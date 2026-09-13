@@ -41,6 +41,15 @@ pub struct ModelMetadata {
     /// native reasoning a model does not have.
     #[serde(default)]
     pub supports_reasoning: bool,
+    /// f16 KV-cache bytes per context token, from the GGUF's own layer/head
+    /// shape (block_count × kv heads × (key + value length) × 2 bytes). Used
+    /// to size the context to the GPU before loading. None when the header
+    /// lacks the keys; sliding-window layers make this an overestimate.
+    #[serde(default)]
+    pub kv_bytes_per_token: Option<u64>,
+    /// Weight file size in bytes at scan time.
+    #[serde(default)]
+    pub weights_bytes: Option<u64>,
     #[serde(default)]
     pub projector_file: Option<String>,
     /// GGUF filename inside `dir`. Older metadata omits this and continues to
@@ -260,6 +269,80 @@ impl ModelManager {
 struct GgufHeader {
     architecture: Option<String>,
     context_length: Option<u32>,
+    /// What the embedded chat template can express. A template that has an
+    /// `enable_thinking` switch or `<think>` markup carries native reasoning;
+    /// one that renders `tools`/`tool_call` blocks supports tool calling. This
+    /// is evidence from the model file itself, unlike a filename.
+    template: TemplateHints,
+    /// f16 KV bytes per token derived from the attention shape, when present.
+    kv_bytes_per_token: Option<u64>,
+}
+
+/// Attention shape keys needed to size the KV cache exactly.
+#[derive(Debug, Default)]
+struct AttentionShape {
+    block_count: Option<u64>,
+    head_count: Option<u64>,
+    head_count_kv: Option<u64>,
+    embedding_length: Option<u64>,
+    key_length: Option<u64>,
+    value_length: Option<u64>,
+}
+
+impl AttentionShape {
+    fn kv_bytes_per_token(&self) -> Option<u64> {
+        let layers = self.block_count?;
+        let kv_heads = self.head_count_kv.or(self.head_count)?;
+        let head_dim = self.key_length.or_else(|| {
+            Some(self.embedding_length? / self.head_count?.max(1))
+        })?;
+        let value_dim = self.value_length.unwrap_or(head_dim);
+        let bytes = layers
+            .checked_mul(kv_heads)?
+            .checked_mul(head_dim.checked_add(value_dim)?)?
+            .checked_mul(2)?;
+        (bytes > 0).then_some(bytes)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TemplateHints {
+    thinking: bool,
+    tools: bool,
+}
+
+fn template_hints(template: &str) -> TemplateHints {
+    let lower = template.to_ascii_lowercase();
+    TemplateHints {
+        thinking: lower.contains("enable_thinking")
+            || lower.contains("<think>")
+            || lower.contains("reasoning_effort")
+            || lower.contains("thinking_mode"),
+        tools: lower.contains("tool_call") || lower.contains("tools"),
+    }
+}
+
+/// A multimodal projector next to the weights. Only an unambiguous single
+/// candidate is paired automatically; two projectors need metadata.json.
+fn projector_in(dir: &Path) -> Option<String> {
+    let mut candidates: Vec<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .filter_map(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+        })
+        .filter(|name| {
+            let lower = name.to_ascii_lowercase();
+            lower.ends_with(".gguf") && lower.contains("mmproj")
+        })
+        .collect();
+    candidates.sort();
+    (candidates.len() == 1).then(|| candidates.remove(0))
 }
 
 type HeaderCache = HashMap<
@@ -397,7 +480,16 @@ fn parse_gguf_header(path: &Path) -> std::io::Result<GgufHeader> {
     }
     let mut header = GgufHeader::default();
     let mut contexts = Vec::new();
+    let mut shape: Vec<(String, u64)> = Vec::new();
     let mut alignment = 32u64;
+    const SHAPE_SUFFIXES: [&str; 6] = [
+        ".block_count",
+        ".attention.head_count",
+        ".attention.head_count_kv",
+        ".embedding_length",
+        ".attention.key_length",
+        ".attention.value_length",
+    ];
     for _ in 0..count {
         if reader.stream_position()? > 128 * 1024 * 1024 {
             return Err(invalid("metadata scan limit exceeded"));
@@ -406,6 +498,8 @@ fn parse_gguf_header(path: &Path) -> std::io::Result<GgufHeader> {
         let kind = u32_value(&mut reader)?;
         if key == "general.architecture" && kind == 8 {
             header.architecture = Some(string(&mut reader)?);
+        } else if key == "tokenizer.chat_template" && kind == 8 {
+            header.template = template_hints(&string(&mut reader)?);
         } else if key == "general.alignment" && kind == 4 {
             alignment = u32_value(&mut reader)? as u64;
             if alignment == 0 || alignment > 4096 || !alignment.is_power_of_two() {
@@ -422,6 +516,34 @@ fn parse_gguf_header(path: &Path) -> std::io::Result<GgufHeader> {
                     contexts.push((key, value));
                 }
             }
+        } else if SHAPE_SUFFIXES.iter().any(|suffix| key.ends_with(suffix))
+            && matches!(kind, 4 | 10)
+        {
+            let value = if kind == 4 {
+                u32_value(&mut reader)? as u64
+            } else {
+                u64_value(&mut reader)?
+            };
+            shape.push((key, value));
+        } else if key.ends_with(".attention.head_count_kv") && kind == 9 {
+            // Per-layer KV head counts (some hybrid architectures): take the
+            // largest so the cache estimate stays conservative.
+            let element = u32_value(&mut reader)?;
+            let count = u64_value(&mut reader)?;
+            if count > 2_000_000 {
+                return Err(invalid("metadata array too large"));
+            }
+            if element == 4 {
+                let mut largest = 0u64;
+                for _ in 0..count {
+                    largest = largest.max(u32_value(&mut reader)? as u64);
+                }
+                shape.push((key, largest));
+            } else {
+                for _ in 0..count {
+                    skip_value(&mut reader, element, length, true)?;
+                }
+            }
         } else {
             skip_value(&mut reader, kind, length, false)?;
         }
@@ -431,6 +553,21 @@ fn parse_gguf_header(path: &Path) -> std::io::Result<GgufHeader> {
             .into_iter()
             .find(|(key, _)| key == &format!("{architecture}.context_length"))
             .map(|(_, value)| value);
+        let lookup = |suffix: &str| {
+            shape
+                .iter()
+                .find(|(key, _)| key == &format!("{architecture}{suffix}"))
+                .map(|(_, value)| *value)
+        };
+        header.kv_bytes_per_token = AttentionShape {
+            block_count: lookup(".block_count"),
+            head_count: lookup(".attention.head_count"),
+            head_count_kv: lookup(".attention.head_count_kv"),
+            embedding_length: lookup(".embedding_length"),
+            key_length: lookup(".attention.key_length"),
+            value_length: lookup(".attention.value_length"),
+        }
+        .kv_bytes_per_token();
     }
     // Validate tensor locations without reading weights. A file whose header
     // finished downloading but whose tensor data is missing is not ready yet.
@@ -628,6 +765,7 @@ fn inferred_metadata(
     };
     let quantization = infer_quantization(stem);
     let parameters = infer_parameters(stem);
+    let projector_file = projector_in(folder);
     ModelMetadata {
         id,
         name: inferred_name(stem, &quantization),
@@ -638,11 +776,14 @@ fn inferred_metadata(
         quantization,
         parameters,
         context_length: header.context_length.unwrap_or(4096),
-        vision: false,
-        tool_calling: false,
-        // A filename is not evidence of native reasoning or tool support.
-        supports_reasoning: false,
-        projector_file: None,
+        vision: projector_file.is_some(),
+        // The chat template embedded in the file is the evidence, never the
+        // filename: a Qwen 3 or Gemma 4 template declares its thinking switch.
+        tool_calling: header.template.tools,
+        supports_reasoning: header.template.thinking,
+        kv_bytes_per_token: header.kv_bytes_per_token,
+        weights_bytes: std::fs::metadata(gguf).ok().map(|m| m.len()),
+        projector_file: projector_file.clone(),
         model_file: gguf
             .file_name()
             .and_then(|v| v.to_str())
@@ -650,6 +791,8 @@ fn inferred_metadata(
         dir: folder.to_path_buf(),
         capabilities: ModelCapabilities {
             chat: true,
+            tool_calling: header.template.tools,
+            vision: projector_file.is_some(),
             ..ModelCapabilities::default()
         },
         loaded: false,
@@ -760,6 +903,18 @@ pub fn scan_models_dir(dir: &std::path::Path) -> (Vec<ModelMetadata>, Vec<String
                     if let Some(context) = header.context_length {
                         m.context_length = m.context_length.min(context);
                     }
+                    // The file's template can only add capabilities the JSON
+                    // omitted; it never removes an explicit declaration.
+                    m.supports_reasoning |= header.template.thinking;
+                    m.tool_calling |= header.template.tools;
+                    m.kv_bytes_per_token = header.kv_bytes_per_token;
+                    m.weights_bytes = std::fs::metadata(m.gguf_path()).ok().map(|f| f.len());
+                    if m.projector_file.is_none() {
+                        if let Some(projector) = projector_in(&entry_path) {
+                            m.projector_file = Some(projector);
+                            m.vision = true;
+                        }
+                    }
                     m.capabilities.tool_calling |= m.tool_calling;
                     m.tool_calling |= m.capabilities.tool_calling;
                     m.capabilities.vision |= m.vision;
@@ -852,6 +1007,8 @@ mod tests {
             vision: false,
             tool_calling: true,
             supports_reasoning: false,
+            kv_bytes_per_token: None,
+            weights_bytes: None,
             projector_file: None,
             model_file: None,
             dir: PathBuf::from(format!("models/{id}")),
@@ -1080,6 +1237,109 @@ mod tests {
         assert_eq!(infer_quantization("Qwen3-8B"), "unknown");
         assert_eq!(infer_quantization("Qwen3-8B-Q4_K_M"), "Q4_K_M");
         assert_eq!(infer_quantization("Gemma-BF16"), "BF16");
+    }
+
+    #[test]
+    fn chat_template_is_the_evidence_for_thinking_and_tool_support() {
+        let qwen3 = "{%- if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>{%- endif %}{%- for tool in tools %}{{ tool | tojson }}{%- endfor %}";
+        assert_eq!(
+            template_hints(qwen3),
+            TemplateHints {
+                thinking: true,
+                tools: true
+            }
+        );
+        let chatml = "{% for message in messages %}<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>\n{% endfor %}";
+        assert_eq!(template_hints(chatml), TemplateHints::default());
+        // A file whose template declares thinking is registered as reasoning-
+        // capable even without metadata.json; a plain template is not.
+        let root = scan_fixture();
+        let folder = root.join("thinker");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("thinker-8b-q4_k_m.gguf"), gguf_with_template(qwen3)).unwrap();
+        let plain = root.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::write(plain.join("plain-8b-q4_k_m.gguf"), test_gguf_bytes()).unwrap();
+        let (found, warnings) = scan_models_dir(&root);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let thinker = found.iter().find(|m| m.id == "thinker").unwrap();
+        assert!(thinker.supports_reasoning && thinker.tool_calling);
+        let plain = found.iter().find(|m| m.id == "plain").unwrap();
+        assert!(!plain.supports_reasoning && !plain.tool_calling);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn kv_bytes_per_token_follow_the_attention_shape() {
+        // Qwen3-8B: 36 layers, 8 KV heads, head dim 128 -> 147,456 bytes/token at f16.
+        let qwen3 = AttentionShape {
+            block_count: Some(36),
+            head_count: Some(32),
+            head_count_kv: Some(8),
+            embedding_length: Some(4096),
+            key_length: Some(128),
+            value_length: Some(128),
+        };
+        assert_eq!(qwen3.kv_bytes_per_token(), Some(147_456));
+        // Without explicit key/value lengths the head dimension is derived.
+        let derived = AttentionShape {
+            block_count: Some(48),
+            head_count: Some(40),
+            head_count_kv: Some(8),
+            embedding_length: Some(5120),
+            ..AttentionShape::default()
+        };
+        assert_eq!(derived.kv_bytes_per_token(), Some(48 * 8 * 256 * 2));
+        assert_eq!(AttentionShape::default().kv_bytes_per_token(), None);
+    }
+
+    #[test]
+    fn a_single_projector_next_to_the_weights_enables_vision() {
+        let root = scan_fixture();
+        let folder = root.join("seeing");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("seeing-4b-q4_k_m.gguf"), test_gguf_bytes()).unwrap();
+        std::fs::write(folder.join("mmproj-seeing-f16.gguf"), test_gguf_bytes()).unwrap();
+        let (found, _) = scan_models_dir(&root);
+        let model = found.iter().find(|m| m.id == "seeing").unwrap();
+        assert!(model.vision);
+        assert_eq!(model.projector_file.as_deref(), Some("mmproj-seeing-f16.gguf"));
+        // Two projectors are ambiguous: leave vision to explicit metadata.
+        std::fs::write(folder.join("mmproj-seeing-bf16.gguf"), test_gguf_bytes()).unwrap();
+        let (found, _) = scan_models_dir(&root);
+        assert!(!found.iter().find(|m| m.id == "seeing").unwrap().vision);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Same fixture as `test_gguf_bytes` with one extra string key.
+    fn gguf_with_template(template: &str) -> Vec<u8> {
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&3u64.to_le_bytes());
+        for (key, value) in [
+            ("general.architecture", "llama"),
+            ("tokenizer.chat_template", template),
+        ] {
+            bytes.extend_from_slice(&(key.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(key.as_bytes());
+            bytes.extend_from_slice(&8u32.to_le_bytes());
+            bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(value.as_bytes());
+        }
+        let key = b"llama.context_length";
+        bytes.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(key);
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(&8192u32.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(b"x");
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.resize(bytes.len().div_ceil(32) * 32 + 4, 0);
+        bytes
     }
 
     #[test]

@@ -134,7 +134,7 @@ export default function ToolTimeline({ events }: { events: AgentEvent[] }) {
   if (events.length === 0) return null;
   const terminal = events.some((event) => ['COMPLETED', 'FAILED', 'CANCELLED'].includes(event.state));
   const visible = events.reduce<AgentEvent[]>((items, event) => {
-    if (event.kind === 'context') return items;
+    if (event.kind === 'context' || event.kind === 'thought_delta') return items;
     if (event.kind === 'tool_result' || event.kind === 'tool_error') {
       const pending = items.findIndex((item) => item.kind === 'tool_started'
         && item.iteration === event.iteration && item.tool === event.tool);

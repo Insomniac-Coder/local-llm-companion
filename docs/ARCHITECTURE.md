@@ -141,6 +141,64 @@ Source of truth: `Local_LLM_PC_Companion_Design.md` (§§1–107).
 - Agent: `POST /api/agent/run` spawns the LLM loop; `.../events` tails SSE;
   `.../resume` approves/denies; `.../stop` cancels. Code-assist is read-only.
 
+## Runtime performance contract (2026-09-13, see docs/PERFORMANCE.md)
+- Launch flags are measured, not assumed: automatic mode sends
+  `--cache-reuse 256 --spec-type ngram-simple` and leaves batch/threads to the
+  runtime; `Settings > Performance` adds speculative (auto/off) and KV cache
+  precision (f16/q8_0). CPU fallback keeps speculation and the runtime's
+  thread choice; the context is capped by free RAM (`inference::cpu_context_cap`,
+  8,192 when comfortable) and KV stays f16.
+- Memory fit at every load (`inference::fit_to_memory` → `MemoryPlan`):
+  free VRAM is re-measured after the old worker exits, the KV cost per token
+  comes from the GGUF header (`ModelMetadata::kv_bytes_per_token`), and the
+  plan chooses placement `gpu` / `hybrid` / `oversubscribed` / `cpu` with the
+  largest fitting context (halving to 4,096, f16 then q8_0). The resolved
+  policy carries `placement` and notes; the policy endpoint reports the plan
+  for the next load (VRAM fitting is skipped while a model is running, since
+  its own memory would be counted as used). A `model_id` that is not
+  installed (a saved default after the file was removed, or an empty models
+  folder) yields the generic plan plus `missing_model`, never an error; an
+  empty models folder still seeds the in-memory demo entry (§88) so the
+  selector is never blank, and loading that entry fails with a clear message.
+- One shared HTTP client to the sidecar (connect + idle-read bounds only; no
+  whole-request timeout). Downloads use a separate client with the same shape.
+- `SidecarClient::stream` is the single streaming core: visible deltas,
+  `reasoning_content` deltas, phase changes, `finish_reason`, the engine's
+  `timings` (prompt/decode tok/s, `cache_n`, draft acceptance) and an early
+  `should_stop` predicate that closes the connection so the slot is released.
+- Every request of a conversation shares one KV prefix
+  (`api::assemble_request_context`): chat, routing (`/api/chat/classify`
+  appends one instruction turn after the identical prefix) and the agent's
+  completion review (appended to the run transcript). Reasoning off sends
+  `chat_template_kwargs.enable_thinking=false`; `supports_reasoning` and
+  `tool_calling` are read from the GGUF chat template, and a lone `mmproj`
+  next to the weights enables vision.
+- Chat: `max_tokens` is derived from the loaded context (8K/12K/16K caps),
+  history is sized from `n_ctx` (`history_char_budget`), `done` carries
+  `truncated`, and `event: reasoning` streams native thinking (never stored).
+  A dead worker produces an error, never an echo.
+- Agent: streamed action requests emit `thought_delta` events (live only,
+  never journaled), stop at the first complete action object, prune the
+  transcript by estimated size (release old tool-result bodies first), run
+  tools on the blocking pool, and honour the run's `reasoning` flag.
+- Action parsing (`agent_runner::locate_action`) accepts every shape local
+  models produce: `tool`/`json`/bare fences (the latter two only for a
+  registered tool name), an unterminated fence when the turn ends after the
+  object, the `<tool_call>` tag, the Gemma envelope, a bare object or the
+  structured `kind` envelope, `arguments`/`parameters` aliases, raw newlines
+  inside JSON strings, prose after a closed action. Two actions stay
+  ambiguous. The transcript copy of an unterminated action gets its closing
+  marker so later turns imitate a well-formed example.
+- Recovery and budgets (`ActionResponsePolicy`, `agent_progress`): unreadable
+  reply → native retry with reminder → schema-constrained envelope → stop;
+  six consecutive non-successful steps end a run, identical repeats warn at
+  two and stop at five, any successful action resets both. Every tool error
+  echoes the received arguments; `edit_file` reports the closest region for a
+  missing `old` and the count for an ambiguous one; a missing `path` names the
+  last file; rejected completion claims are journaled as `thought` events.
+- Storage: indexes on every conversation/workspace-keyed table, one query for
+  all journals of a conversation, `busy_timeout`.
+
 ## Stage 5 streaming contract
 - Chat is true token-passthrough: sidecar deltas forward into the SSE channel
   immediately (`token` events); a terminal `done` event carries

@@ -76,6 +76,18 @@ pub struct InferenceConfig {
     pub kv_cache_type_v: String,
     #[serde(default)]
     pub runtime_policy: Option<ResolvedRuntimePolicy>,
+    /// Minimum KV chunk (tokens) llama-server may shift-reuse when a prompt
+    /// diverges from the cached one. 0 disables chunk reuse (only the exact
+    /// common prefix is reused). Agent loops prune and edit the middle of the
+    /// transcript, so chunk reuse avoids re-prefilling the unchanged tail.
+    #[serde(default = "default_cache_reuse")]
+    pub cache_reuse: u32,
+    /// Self-speculative decoding mode passed as `--spec-type` ("none" omits
+    /// the flag). N-gram drafting needs no draft model: it proposes tokens that
+    /// already occur in the context, which is exactly what code edits, file
+    /// rewrites and repeated tool envelopes produce. Lossless by construction.
+    #[serde(default = "default_speculative")]
+    pub speculative: String,
     pub temperature: f32,
     pub top_p: f32,
     pub top_k: u32,
@@ -98,6 +110,8 @@ impl Default for InferenceConfig {
             kv_cache_type_k: default_cache_type(),
             kv_cache_type_v: default_cache_type(),
             runtime_policy: None,
+            cache_reuse: default_cache_reuse(),
+            speculative: default_speculative(),
             temperature: 0.7,
             top_p: 0.9,
             top_k: 40,
@@ -112,6 +126,61 @@ fn default_true() -> bool {
 }
 fn default_cache_type() -> String {
     "f16".into()
+}
+fn default_cache_reuse() -> u32 {
+    256
+}
+/// Measured on this project's benchmark suite (docs/PERFORMANCE.md): ngram-simple
+/// had no measurable cost on novel prose and a 12-15x gain on file rewrites.
+pub fn default_speculative() -> String {
+    "ngram-simple".into()
+}
+
+/// Engine-reported timings for one completion, straight from llama-server's
+/// `timings` object. These are the numbers the runtime itself measured: prompt
+/// (prefill) throughput, decode throughput, and how many prompt tokens were
+/// served from the KV cache instead of being recomputed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct EngineTimings {
+    pub prompt_tokens: u32,
+    pub prompt_ms: f64,
+    pub prompt_tps: Option<f64>,
+    pub predicted_tokens: u32,
+    pub predicted_ms: f64,
+    pub predicted_tps: Option<f64>,
+    /// Prompt tokens reused from the slot's KV cache (not re-prefilled).
+    pub cached_tokens: u32,
+    /// Speculative decoding statistics when the runtime drafted tokens.
+    #[serde(default)]
+    pub draft_tokens: Option<u32>,
+    #[serde(default)]
+    pub draft_accepted: Option<u32>,
+}
+
+impl EngineTimings {
+    pub fn from_json(value: &serde_json::Value) -> Option<Self> {
+        let timings = value.as_object()?;
+        let number = |key: &str| timings.get(key).and_then(|v| v.as_f64());
+        let count = |key: &str| number(key).map(|v| v.max(0.0).min(u32::MAX as f64) as u32);
+        let predicted_tokens = count("predicted_n")?;
+        let rate = |tokens: u32, ms: f64| {
+            (tokens > 0 && ms > 0.0).then(|| (tokens as f64 * 1000.0 / ms * 10.0).round() / 10.0)
+        };
+        let prompt_tokens = count("prompt_n").unwrap_or(0);
+        let prompt_ms = number("prompt_ms").unwrap_or(0.0);
+        let predicted_ms = number("predicted_ms").unwrap_or(0.0);
+        Some(Self {
+            prompt_tokens,
+            prompt_ms,
+            prompt_tps: rate(prompt_tokens, prompt_ms),
+            predicted_tokens,
+            predicted_ms,
+            predicted_tps: rate(predicted_tokens, predicted_ms),
+            cached_tokens: count("cache_n").unwrap_or(0),
+            draft_tokens: count("draft_n"),
+            draft_accepted: count("draft_n_accepted"),
+        })
+    }
 }
 
 /// Resolved launch policy, not a claim about measured device placement. The
@@ -131,9 +200,32 @@ pub struct ResolvedRuntimePolicy {
     /// Zero means omit the worker flag and let its native default choose.
     pub threads: u32,
     pub gpu_layers: i32,
+    /// Zero means the runtime's own default logical/physical batch (2048/512
+    /// in the bundled build), which prefilled measurably faster than a forced
+    /// 512 logical batch.
     pub batch_size: u32,
+    #[serde(default = "default_cache_reuse")]
+    pub cache_reuse: u32,
+    #[serde(default = "default_speculative")]
+    pub speculative: String,
+    /// Context ceiling applied if the load falls back to the CPU, sized from
+    /// free system RAM (8192 when RAM is plentiful or unknown).
+    #[serde(default = "default_cpu_context_cap")]
+    pub cpu_context_cap: u32,
+    /// Planned residency from measured memory: gpu | hybrid | oversubscribed
+    /// | cpu | unknown. A plan, not a measurement of where layers landed.
+    #[serde(default = "default_placement")]
+    pub placement: String,
     pub cache_rebuild: String,
     pub notes: Vec<String>,
+}
+
+fn default_cpu_context_cap() -> u32 {
+    8192
+}
+
+fn default_placement() -> String {
+    "unknown".into()
 }
 
 pub fn resolve_runtime_policy(
@@ -141,23 +233,297 @@ pub fn resolve_runtime_policy(
     requested: &InferenceConfig,
     automatic: bool,
 ) -> ResolvedRuntimePolicy {
+    resolve_runtime_policy_with(
+        model,
+        requested,
+        automatic,
+        &crate::settings::RuntimeSettings::default(),
+    )
+}
+
+pub fn resolve_runtime_policy_with(
+    model: Option<&crate::models::ModelMetadata>,
+    requested: &InferenceConfig,
+    automatic: bool,
+    tuning: &crate::settings::RuntimeSettings,
+) -> ResolvedRuntimePolicy {
+    resolve_runtime_policy_fitted(model, requested, automatic, tuning, None)
+}
+
+/// Measured GPU memory at load time, in bytes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VramState {
+    pub total_bytes: u64,
+    /// Memory other processes (desktop, browser) already hold.
+    pub used_bytes: u64,
+}
+
+/// KV-cache bytes per token for a cache type relative to f16.
+fn cache_bytes_per_token(f16_bytes: u64, cache_type: &str) -> u64 {
+    match cache_type {
+        // q8_0: 8-bit values plus one f16 scale per 32 -> 8.5 bits/value.
+        "q8_0" => f16_bytes * 17 / 32,
+        _ => f16_bytes,
+    }
+}
+
+/// Where the loaded model will live, decided from measured memory.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryPlan {
+    pub context: u32,
+    pub cache_type: String,
+    /// "gpu" (fully resident), "hybrid" (weights split between GPU and RAM),
+    /// "oversubscribed" (does not fit RAM + VRAM either).
+    pub placement: &'static str,
+    pub note: Option<String>,
+}
+
+/// Fit the context (and, if allowed, the cache precision) to the machine.
+/// Spilling layers to the CPU costs 3-5x in decode speed (measured: a 14B
+/// model at 32K f16 ran at 18 tok/s on a 12 GB card) while a smaller context
+/// or an 8-bit cache costs almost nothing, so the order of preference is:
+/// everything on the GPU; a smaller context or q8_0 cache on the GPU; and only
+/// then a hybrid split, sized so the GPU holds as much of the weights as
+/// possible and the remainder fits system RAM. None when the inputs are
+/// unknown or there is no GPU (the CPU cap handles that case).
+fn fit_to_memory(
+    requested_context: u32,
+    cache_type: &str,
+    allow_q8: bool,
+    model: &crate::models::ModelMetadata,
+    vram: VramState,
+    ram_available: Option<u64>,
+) -> Option<MemoryPlan> {
+    let weights = model.weights_bytes?;
+    let kv_f16 = model.kv_bytes_per_token?;
+    if vram.total_bytes == 0 {
+        return None;
+    }
+    let gb = |bytes: u64| bytes as f64 / 1e9;
+    // Room the runtime can actually use: what is free now, minus compute
+    // buffers (grow with model width) and a safety margin for fragmentation.
+    let free = vram.total_bytes.saturating_sub(vram.used_bytes);
+    let compute = (weights / 12).max(768 * 1024 * 1024);
+    let safety = vram.total_bytes / 20;
+    let gpu_budget = free.saturating_sub(compute).saturating_sub(safety);
+    let kv_bytes = |context: u32, cache: &str| cache_bytes_per_token(kv_f16, cache) * context as u64;
+    let fits_gpu = |context: u32, cache: &str| weights.saturating_add(kv_bytes(context, cache)) <= gpu_budget;
+    if fits_gpu(requested_context, cache_type) {
+        return Some(MemoryPlan {
+            context: requested_context,
+            cache_type: cache_type.to_string(),
+            placement: "gpu",
+            note: None,
+        });
+    }
+    let mut candidates: Vec<(u32, &str)> = Vec::new();
+    let mut context = requested_context;
+    while context >= 4096 {
+        candidates.push((context, cache_type));
+        if allow_q8 && cache_type != "q8_0" {
+            candidates.push((context, "q8_0"));
+        }
+        context /= 2;
+    }
+    // Largest context first; at equal context prefer the requested precision.
+    if let Some((context, cache)) = candidates
+        .iter()
+        .copied()
+        .filter(|(context, cache)| fits_gpu(*context, cache))
+        .max_by_key(|(context, cache)| (*context, u8::from(*cache == cache_type)))
+    {
+        let note = if cache != cache_type && context < requested_context {
+            format!(
+                "Context reduced from {requested_context} to {context} tokens and the KV cache stored as q8_0 (8-bit) so the whole model stays on the GPU: {:.1} GB of weights plus a {:.1} GB cache fit the {:.1} GB of free GPU memory; the f16 cache would have forced layers onto the CPU. The saved preference is unchanged; a smaller model or quantization allows a larger context.",
+                gb(weights), gb(kv_bytes(context, cache)), gb(free)
+            )
+        } else if cache != cache_type {
+            format!(
+                "Context kept at {context} tokens by storing the KV cache as q8_0 (8-bit): {:.1} GB of weights plus a {:.1} GB cache fit the {:.1} GB of free GPU memory, where the f16 cache would have forced layers onto the CPU. Set KV cache precision to f16 in Settings to prefer a smaller f16 context instead.",
+                gb(weights), gb(kv_bytes(context, cache)), gb(free)
+            )
+        } else {
+            format!(
+                "Context reduced from {requested_context} to {context} tokens so the whole model stays on the GPU: {:.1} GB of weights plus a {:.1} GB {cache} cache fit the {:.1} GB of free GPU memory. The saved preference is unchanged; a smaller model or quantization allows a larger context.",
+                gb(weights), gb(kv_bytes(context, cache)), gb(free)
+            )
+        };
+        return Some(MemoryPlan {
+            context,
+            cache_type: cache.to_string(),
+            placement: "gpu",
+            note: Some(note),
+        });
+    }
+    // Hybrid: the weights alone overflow the GPU. Keep the cache small (at
+    // most a quarter of the GPU budget, 8-bit when allowed) so the GPU holds
+    // as many layers as possible, and check the remainder against RAM.
+    let hybrid_cache = if allow_q8 { "q8_0" } else { cache_type };
+    let kv_room = gpu_budget / 4;
+    let context = candidates
+        .iter()
+        .filter(|(_, cache)| *cache == hybrid_cache || (!allow_q8 && *cache == cache_type))
+        .map(|(context, _)| *context)
+        .filter(|context| kv_bytes(*context, hybrid_cache) <= kv_room)
+        .max()
+        .unwrap_or(4096);
+    let gpu_weights = gpu_budget.saturating_sub(kv_bytes(context, hybrid_cache));
+    let cpu_weights = weights.saturating_sub(gpu_weights);
+    let cpu_share = cpu_weights as f64 / weights.max(1) as f64;
+    let ram_needed = cpu_weights.saturating_add((kv_bytes(context, hybrid_cache) as f64 * cpu_share) as u64);
+    let ram_budget = ram_available.map(|ram| ram.saturating_sub(ram / 8).saturating_sub(compute / 2));
+    let (placement, ram_note) = match ram_budget {
+        Some(budget) if ram_needed > budget => (
+            "oversubscribed",
+            format!(" System RAM ({:.1} GB free) cannot hold the {:.1} GB that does not fit the GPU; loading may fail or page heavily. Use a smaller model or quantization.", gb(ram_available.unwrap_or(0)), gb(ram_needed)),
+        ),
+        Some(_) => ("hybrid", String::new()),
+        None => ("hybrid", " Free system RAM was not measured.".into()),
+    };
+    Some(MemoryPlan {
+        context,
+        cache_type: hybrid_cache.to_string(),
+        placement,
+        note: Some(format!(
+            "The weights ({:.1} GB) exceed the {:.1} GB of free GPU memory, so about {:.1} GB ({:.0}%) of the layers will run on the CPU and replies will be slower. Context {context} with a {hybrid_cache} cache keeps the cache under a quarter of GPU memory so the GPU holds as much of the model as possible.{ram_note}",
+            gb(weights), gb(free), gb(cpu_weights), cpu_share * 100.0
+        )),
+    })
+}
+
+/// Largest context the CPU fallback may use: the comfort cap (decode slows as
+/// a CPU-side cache fills) lowered to what system RAM can hold next to the
+/// weights. Returns the cap and a note when RAM, not the cap, decided.
+pub fn cpu_context_cap(
+    model: Option<&crate::models::ModelMetadata>,
+    ram_available_bytes: Option<u64>,
+) -> (u32, Option<String>) {
+    const COMFORT_CAP: u32 = 8192;
+    let (Some(model), Some(ram)) = (model, ram_available_bytes) else {
+        return (COMFORT_CAP, None);
+    };
+    let (Some(weights), Some(kv)) = (model.weights_bytes, model.kv_bytes_per_token) else {
+        return (COMFORT_CAP, None);
+    };
+    // Keep an eighth of free RAM for the OS and page cache, plus compute buffers.
+    let budget = ram
+        .saturating_sub(ram / 8)
+        .saturating_sub((weights / 12).max(512 * 1024 * 1024));
+    let room = budget.saturating_sub(weights);
+    if weights > budget || room < kv * 2048 {
+        return (
+            2048,
+            Some(format!(
+                "System RAM is tight for this model on CPU ({:.1} GB of weights, {:.1} GB free): context is limited to 2048 tokens and the OS may page. A smaller model or quantization would be far more responsive.",
+                weights as f64 / 1e9,
+                ram as f64 / 1e9
+            )),
+        );
+    }
+    let by_ram = (room / kv).min(u32::MAX as u64) as u32;
+    let mut cap = COMFORT_CAP;
+    while cap > 2048 && cap > by_ram {
+        cap /= 2;
+    }
+    let note = (cap < COMFORT_CAP).then(|| {
+        format!(
+            "CPU context limited to {cap} tokens by free system RAM ({:.1} GB): the {:.1} GB of weights plus the cache must stay resident.",
+            ram as f64 / 1e9,
+            weights as f64 / 1e9
+        )
+    });
+    (cap, note)
+}
+
+pub fn resolve_runtime_policy_fitted(
+    model: Option<&crate::models::ModelMetadata>,
+    requested: &InferenceConfig,
+    automatic: bool,
+    tuning: &crate::settings::RuntimeSettings,
+    vram: Option<VramState>,
+) -> ResolvedRuntimePolicy {
+    resolve_runtime_policy_for_machine(model, requested, automatic, tuning, vram, None)
+}
+
+pub fn resolve_runtime_policy_for_machine(
+    model: Option<&crate::models::ModelMetadata>,
+    requested: &InferenceConfig,
+    automatic: bool,
+    tuning: &crate::settings::RuntimeSettings,
+    vram: Option<VramState>,
+    ram_available_bytes: Option<u64>,
+) -> ResolvedRuntimePolicy {
     let requested_context = requested.n_ctx.max(1);
-    let effective_context = model
+    let mut effective_context = model
         .map(|model| requested_context.min(model.context_length.max(1)))
         .unwrap_or(requested_context);
+    let mut cache_type = if tuning.kv_cache == "q8_0" {
+        "q8_0".to_string()
+    } else {
+        default_cache_type()
+    };
+    let mut fit_note = None;
+    let mut placement = if vram.is_some() { "gpu" } else { "unknown" };
+    let (cpu_cap, cpu_note) = if automatic {
+        cpu_context_cap(model, ram_available_bytes)
+    } else {
+        (u32::MAX, None)
+    };
+    if automatic {
+        if let (Some(model), Some(vram)) = (model, vram) {
+            if let Some(plan) = fit_to_memory(
+                effective_context,
+                &cache_type,
+                true,
+                model,
+                vram,
+                ram_available_bytes,
+            ) {
+                effective_context = plan.context;
+                cache_type = plan.cache_type;
+                placement = plan.placement;
+                fit_note = plan.note;
+            }
+        }
+    }
+    let speculative = if tuning.speculative == "off" {
+        "none".to_string()
+    } else {
+        default_speculative()
+    };
+    let cache_reuse = if tuning.cache_reuse {
+        default_cache_reuse()
+    } else {
+        0
+    };
     let mut notes = vec![
-        "Weight precision and KV-cache precision are independent. Compatibility-first K/V f16 is explicit; legacy inactive cache preferences are not applied.".into(),
+        if cache_type == "q8_0" {
+            "Weight precision and KV-cache precision are independent. The KV cache is stored as 8-bit integers (q8_0) with Flash Attention, halving cache memory versus f16 at a negligible quality cost; the runtime validates architecture support at load.".into()
+        } else {
+            "Weight precision and KV-cache precision are independent. Compatibility-first K/V f16 is explicit; legacy inactive cache preferences are not applied.".into()
+        },
         "llama.cpp uses this model's GGUF metadata and chat template to construct its native attention, sliding-window or recurrent state.".into(),
         "Every model load uses a fresh process/cache; subsequent requests rebuild context from saved messages using the selected model's tokenizer and template.".into(),
     ];
-    if effective_context < requested_context {
+    if speculative != "none" {
+        notes.push(format!("Self-speculative decoding ({speculative}) drafts tokens already present in the context and verifies them in one batch. Output is identical to plain decoding; it is faster when the reply repeats context (code edits, file rewrites, tool envelopes)."));
+    }
+    if cache_reuse > 0 {
+        notes.push(format!("Prompt-cache chunk reuse ({cache_reuse}-token minimum) keeps the unchanged tail of a transcript in the KV cache when earlier turns are pruned, so only the changed part is re-prefilled."));
+    }
+    if let Some(note) = fit_note {
+        notes.push(note);
+    } else if effective_context < requested_context {
         notes.push(format!("Context capped at the model's advertised limit of {effective_context} tokens; the configured preference is unchanged."));
+    }
+    if let Some(note) = cpu_note {
+        notes.push(note);
     }
     if model.is_none() {
         notes.push("Model metadata is unavailable; no model context limit can be verified. Native load validation remains authoritative.".into());
     }
     if automatic {
-        notes.push("The installed runtime is checked for usable devices at load time, including supported integrated GPUs. With no usable GPU, automatic CPU settings are selected; GPU initialization failures retry once on CPU. CPU operation caps context at 8192 and batch size at 128 without changing saved preferences.".into());
+        notes.push("The installed runtime is checked for usable devices at load time, including supported integrated GPUs. With no usable GPU, automatic CPU settings are selected; GPU initialization failures retry once on CPU. CPU operation caps context at 8192 without changing saved preferences; all physical cores are used, which measured faster than performance cores alone on a hybrid CPU.".into());
     }
     ResolvedRuntimePolicy {
         mode: if automatic { "automatic" } else { "manual" }.into(),
@@ -169,8 +535,8 @@ pub fn resolve_runtime_policy(
             .unwrap_or_else(|| "unknown".into()),
         requested_context,
         effective_context,
-        cache_type_k: default_cache_type(),
-        cache_type_v: default_cache_type(),
+        cache_type_k: cache_type.clone(),
+        cache_type_v: cache_type,
         flash_attention: if automatic {
             "auto"
         } else if requested.flash_attn {
@@ -198,10 +564,14 @@ pub fn resolve_runtime_policy(
             requested.n_gpu_layers
         },
         batch_size: if automatic {
-            512.min(effective_context)
+            0
         } else {
             requested.n_batch.max(1).min(effective_context)
         },
+        cache_reuse,
+        speculative,
+        cpu_context_cap: cpu_cap,
+        placement: placement.into(),
         cache_rebuild: "fresh_process".into(),
         notes,
     }
@@ -218,6 +588,8 @@ impl ResolvedRuntimePolicy {
         cfg.kv_cache_gpu = self.kv_offload != "off";
         cfg.kv_cache_type_k = self.cache_type_k.clone();
         cfg.kv_cache_type_v = self.cache_type_v.clone();
+        cfg.cache_reuse = self.cache_reuse;
+        cfg.speculative = self.speculative.clone();
         cfg.runtime_policy = Some(self.clone());
     }
 }
@@ -234,6 +606,13 @@ pub struct Metrics {
     /// Versioned visible-output timing. Absent on legacy/non-streaming metrics.
     #[serde(default)]
     pub timing: Option<OutputTiming>,
+    /// Runtime-measured timings for the last completion, when reported.
+    #[serde(default)]
+    pub engine: Option<EngineTimings>,
+    /// Why the runtime stopped: "stop" (natural end), "length" (hit the
+    /// output limit), or another provider value. `None` when not reported.
+    #[serde(default)]
+    pub finish_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -248,6 +627,31 @@ pub struct OutputTiming {
     /// Observed reasoning-channel duration, never inferred from silence.
     pub thinking_ms: Option<u64>,
     pub total_ms: u64,
+    /// Engine-measured decode throughput (all generated tokens, including any
+    /// hidden reasoning) summed across the rounds of this turn.
+    #[serde(default)]
+    pub engine_output_tps: Option<f64>,
+    /// Engine-measured prefill throughput for the tokens that were not cached.
+    #[serde(default)]
+    pub engine_prompt_tps: Option<f64>,
+    /// Prompt tokens served from the KV cache across the rounds of this turn.
+    #[serde(default)]
+    pub cached_tokens: Option<u32>,
+    /// Engine-counted generated tokens across the rounds of this turn.
+    #[serde(default)]
+    pub predicted_tokens: Option<u32>,
+    /// Speculative decoding acceptance across the rounds of this turn.
+    #[serde(default)]
+    pub draft_tokens: Option<u32>,
+    #[serde(default)]
+    pub draft_accepted: Option<u32>,
+    /// Accumulators for engine rates (never displayed directly).
+    #[serde(default, skip_serializing)]
+    pub engine_predicted_ms: f64,
+    #[serde(default, skip_serializing)]
+    pub engine_prompt_ms: f64,
+    #[serde(default, skip_serializing)]
+    pub engine_prompt_tokens: u32,
 }
 
 impl Default for OutputTiming {
@@ -262,6 +666,15 @@ impl Default for OutputTiming {
             output_ms: 0,
             thinking_ms: None,
             total_ms: 0,
+            engine_output_tps: None,
+            engine_prompt_tps: None,
+            cached_tokens: None,
+            predicted_tokens: None,
+            draft_tokens: None,
+            draft_accepted: None,
+            engine_predicted_ms: 0.0,
+            engine_prompt_ms: 0.0,
+            engine_prompt_tokens: 0,
         }
     }
 }
@@ -271,6 +684,42 @@ impl OutputTiming {
         self.output_tps = (self.output_tokens > 0 && self.output_ms > 0).then(|| {
             (self.output_tokens as f64 * 1000.0 / self.output_ms as f64 * 10.0).round() / 10.0
         });
+        if let Some(predicted) = self.predicted_tokens {
+            self.engine_output_tps = (predicted > 0 && self.engine_predicted_ms > 0.0).then(|| {
+                (predicted as f64 * 1000.0 / self.engine_predicted_ms * 10.0).round() / 10.0
+            });
+        }
+        self.engine_prompt_tps =
+            (self.engine_prompt_tokens > 0 && self.engine_prompt_ms > 0.0).then(|| {
+                (self.engine_prompt_tokens as f64 * 1000.0 / self.engine_prompt_ms * 10.0).round()
+                    / 10.0
+            });
+    }
+
+    /// Fold one completion's engine timings into this turn's totals.
+    pub fn add_engine(&mut self, engine: &EngineTimings) {
+        self.predicted_tokens = Some(
+            self.predicted_tokens
+                .unwrap_or(0)
+                .saturating_add(engine.predicted_tokens),
+        );
+        self.engine_predicted_ms += engine.predicted_ms;
+        self.engine_prompt_tokens = self.engine_prompt_tokens.saturating_add(engine.prompt_tokens);
+        self.engine_prompt_ms += engine.prompt_ms;
+        self.cached_tokens = Some(
+            self.cached_tokens
+                .unwrap_or(0)
+                .saturating_add(engine.cached_tokens),
+        );
+        if let Some(drafted) = engine.draft_tokens {
+            self.draft_tokens = Some(self.draft_tokens.unwrap_or(0).saturating_add(drafted));
+            self.draft_accepted = Some(
+                self.draft_accepted
+                    .unwrap_or(0)
+                    .saturating_add(engine.draft_accepted.unwrap_or(0)),
+            );
+        }
+        self.update_rate();
     }
 
     /// Combine only active visible emission spans. Time spent in another
@@ -296,6 +745,23 @@ impl OutputTiming {
         if let Some(ms) = round.thinking_ms {
             self.thinking_ms = Some(self.thinking_ms.unwrap_or(0).saturating_add(ms));
         }
+        if let Some(predicted) = round.predicted_tokens {
+            self.predicted_tokens = Some(self.predicted_tokens.unwrap_or(0).saturating_add(predicted));
+        }
+        self.engine_predicted_ms += round.engine_predicted_ms;
+        self.engine_prompt_tokens = self.engine_prompt_tokens.saturating_add(round.engine_prompt_tokens);
+        self.engine_prompt_ms += round.engine_prompt_ms;
+        if let Some(cached) = round.cached_tokens {
+            self.cached_tokens = Some(self.cached_tokens.unwrap_or(0).saturating_add(cached));
+        }
+        if let Some(drafted) = round.draft_tokens {
+            self.draft_tokens = Some(self.draft_tokens.unwrap_or(0).saturating_add(drafted));
+            self.draft_accepted = Some(
+                self.draft_accepted
+                    .unwrap_or(0)
+                    .saturating_add(round.draft_accepted.unwrap_or(0)),
+            );
+        }
         self.update_rate();
     }
 }
@@ -311,6 +777,8 @@ impl Default for Metrics {
             kv_cache_used: 0,
             kv_cache_limit: 32768,
             timing: None,
+            engine: None,
+            finish_reason: None,
         }
     }
 }
@@ -552,8 +1020,172 @@ mod tests {
             second.threads, 0,
             "native runtime chooses automatic thread count"
         );
-        assert_eq!(second.batch_size, 512);
+        assert_eq!(
+            second.batch_size, 0,
+            "automatic mode leaves prompt batching to the runtime default"
+        );
+        assert_eq!(second.cache_reuse, 256);
+        assert_eq!(second.speculative, "ngram-simple");
         assert_eq!(second.cache_rebuild, "fresh_process");
+    }
+
+    #[test]
+    fn runtime_tuning_preferences_select_cache_precision_and_speculation() {
+        let requested = InferenceConfig::default();
+        let tuning = crate::settings::RuntimeSettings {
+            speculative: "off".into(),
+            kv_cache: "q8_0".into(),
+            cache_reuse: false,
+        };
+        let policy = resolve_runtime_policy_with(None, &requested, true, &tuning);
+        assert_eq!(policy.cache_type_k, "q8_0");
+        assert_eq!(policy.cache_type_v, "q8_0");
+        assert_eq!(policy.speculative, "none");
+        assert_eq!(policy.cache_reuse, 0);
+        let mut applied = requested.clone();
+        policy.apply_to(&mut applied);
+        assert_eq!(applied.kv_cache_type_k, "q8_0");
+        assert_eq!(applied.speculative, "none");
+        assert_eq!(applied.cache_reuse, 0);
+        let unknown = crate::settings::RuntimeSettings {
+            kv_cache: "q4_0".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_runtime_policy_with(None, &requested, true, &unknown).cache_type_k,
+            "f16",
+            "only the validated q8_0 option changes cache precision"
+        );
+    }
+
+    #[test]
+    fn context_and_cache_are_fitted_to_the_gpu_before_loading() {
+        let gib = 1024u64 * 1024 * 1024;
+        let card = VramState {
+            total_bytes: 12227 * 1024 * 1024,
+            used_bytes: 1360 * 1024 * 1024,
+        };
+        let tuning = crate::settings::RuntimeSettings::default();
+        let requested = InferenceConfig {
+            n_ctx: 32768,
+            ..InferenceConfig::default()
+        };
+        // 8B Q4_K_M (5.0 GB, 147 KB/token): 32K f16 fits, nothing changes.
+        let mut small = policy_test_model("qwen3", 40960);
+        small.weights_bytes = Some(5_027_783_488);
+        small.kv_bytes_per_token = Some(147_456);
+        let policy = resolve_runtime_policy_fitted(Some(&small), &requested, true, &tuning, Some(card));
+        assert_eq!(policy.effective_context, 32768);
+        assert_eq!(policy.cache_type_k, "f16");
+        // 14B Q4_K_M (9.0 GB, 196 KB/token): 32K needs 6.4 GB of f16 cache and
+        // spills; the fit keeps the model resident with a smaller context.
+        let mut large = policy_test_model("qwen2", 32768);
+        large.weights_bytes = Some(8_988_110_272);
+        large.kv_bytes_per_token = Some(196_608);
+        let policy = resolve_runtime_policy_fitted(Some(&large), &requested, true, &tuning, Some(card));
+        assert!(policy.effective_context < 32768 && policy.effective_context >= 4096, "{}", policy.effective_context);
+        let bytes = large.weights_bytes.unwrap()
+            + cache_bytes_per_token(196_608, &policy.cache_type_k) * policy.effective_context as u64;
+        assert!(bytes < card.total_bytes - card.used_bytes, "fitted plan must be resident");
+        assert!(policy.notes.iter().any(|note| note.contains("GPU memory")));
+        // The same model with the f16-only preference still fits, at a
+        // smaller f16 context rather than an 8-bit cache.
+        let f16_only = resolve_runtime_policy_fitted(
+            Some(&large), &requested, true,
+            &crate::settings::RuntimeSettings { kv_cache: "f16".into(), ..tuning.clone() }, Some(card),
+        );
+        assert_eq!(f16_only.cache_type_k, if policy.cache_type_k == "q8_0" { "q8_0" } else { "f16" });
+        // Manual mode and unknown memory never change the request.
+        assert_eq!(resolve_runtime_policy_fitted(Some(&large), &requested, false, &tuning, Some(card)).effective_context, 32768);
+        assert_eq!(resolve_runtime_policy_fitted(Some(&large), &requested, true, &tuning, None).effective_context, 32768);
+        assert_eq!(policy.placement, "gpu");
+        // A 32B Q4 (19 GB) on the same card: hybrid, with the cache kept small
+        // so the GPU holds as many layers as possible, and RAM checked.
+        let mut big = policy_test_model("qwen2", 32768);
+        big.weights_bytes = Some(19 * gib);
+        big.kv_bytes_per_token = Some(262_144);
+        let policy = resolve_runtime_policy_for_machine(Some(&big), &requested, true, &tuning, Some(card), Some(40 * gib));
+        assert_eq!(policy.placement, "hybrid");
+        assert_eq!(policy.cache_type_k, "q8_0");
+        assert!(policy.effective_context >= 4096 && policy.effective_context <= 32768);
+        assert!(policy.notes.iter().any(|note| note.contains("run on the CPU")));
+        // The same model on a 16 GB machine cannot hold the spilled layers.
+        let starved = resolve_runtime_policy_for_machine(Some(&big), &requested, true, &tuning, Some(card), Some(6 * gib));
+        assert_eq!(starved.placement, "oversubscribed");
+        assert!(starved.notes.iter().any(|note| note.contains("cannot hold")));
+    }
+
+    #[test]
+    fn cpu_context_cap_follows_free_ram() {
+        let gib = 1024u64 * 1024 * 1024;
+        let mut eight_b = policy_test_model("qwen3", 40960);
+        eight_b.weights_bytes = Some(5 * gib);
+        eight_b.kv_bytes_per_token = Some(147_456);
+        // 32 GB laptop with ~24 GB free: the comfort cap applies.
+        assert_eq!(cpu_context_cap(Some(&eight_b), Some(24 * gib)), (8192, None));
+        // 7 GiB free: 5 GiB weights + overheads leave ~0.7 GB, so 4096 tokens.
+        let (cap, note) = cpu_context_cap(Some(&eight_b), Some(7 * gib));
+        assert_eq!(cap, 4096);
+        assert!(note.unwrap().contains("free system RAM"));
+        // A 14B model on a machine with 6 GB free cannot be resident.
+        let mut fourteen_b = policy_test_model("qwen2", 32768);
+        fourteen_b.weights_bytes = Some(9 * gib);
+        fourteen_b.kv_bytes_per_token = Some(196_608);
+        let (cap, note) = cpu_context_cap(Some(&fourteen_b), Some(6 * gib));
+        assert_eq!(cap, 2048);
+        assert!(note.unwrap().contains("tight"));
+        // Unknown inputs keep the default cap.
+        assert_eq!(cpu_context_cap(None, Some(64 * gib)), (8192, None));
+        assert_eq!(cpu_context_cap(Some(&eight_b), None), (8192, None));
+        // The resolved policy carries the cap for the CPU fallback and never
+        // changes the GPU plan because of RAM.
+        let requested = InferenceConfig { n_ctx: 32768, ..InferenceConfig::default() };
+        let tuning = crate::settings::RuntimeSettings::default();
+        let policy = resolve_runtime_policy_for_machine(Some(&eight_b), &requested, true, &tuning, None, Some(7 * gib));
+        assert_eq!(policy.cpu_context_cap, 4096);
+        assert_eq!(policy.effective_context, 32768);
+        let mut applied = requested.clone();
+        policy.apply_to(&mut applied);
+        let cpu = crate::runtime_selection::cpu_configuration(applied, "test");
+        assert_eq!(cpu.n_ctx, 4096);
+    }
+
+    #[test]
+    fn engine_timings_parse_llama_server_timings_and_rates() {
+        let timings = serde_json::json!({
+            "prompt_n": 8133, "prompt_ms": 2496.293, "prompt_per_second": 3258.0,
+            "predicted_n": 80, "predicted_ms": 1369.927, "cache_n": 552,
+            "draft_n": 64, "draft_n_accepted": 3
+        });
+        let engine = EngineTimings::from_json(&timings).unwrap();
+        assert_eq!(engine.prompt_tokens, 8133);
+        assert_eq!(engine.predicted_tokens, 80);
+        assert_eq!(engine.cached_tokens, 552);
+        assert_eq!(engine.prompt_tps, Some(3258.0));
+        assert_eq!(engine.predicted_tps, Some(58.4));
+        assert_eq!(engine.draft_tokens, Some(64));
+        assert_eq!(engine.draft_accepted, Some(3));
+        assert!(EngineTimings::from_json(&serde_json::json!({})).is_none());
+        assert!(EngineTimings::from_json(&serde_json::Value::Null).is_none());
+        let mut timing = OutputTiming::default();
+        timing.add_engine(&engine);
+        timing.add_engine(&EngineTimings {
+            predicted_tokens: 20,
+            predicted_ms: 200.0,
+            ..EngineTimings::default()
+        });
+        assert_eq!(timing.predicted_tokens, Some(100));
+        assert_eq!(timing.cached_tokens, Some(552));
+        assert_eq!(timing.engine_output_tps, Some(63.7));
+        assert_eq!(timing.engine_prompt_tps, Some(3258.0));
+        let stored: OutputTiming =
+            serde_json::from_str(&serde_json::to_string(&timing).unwrap()).unwrap();
+        assert_eq!(stored.engine_output_tps, Some(63.7));
+        let legacy: OutputTiming = serde_json::from_str(
+            r#"{"basis":"visible_output_v1","output_tps":20.0,"estimated":false,"token_basis":"tokenizer","output_tokens":20,"first_visible_ms":100,"output_ms":1000,"thinking_ms":null,"total_ms":1200}"#,
+        )
+        .unwrap();
+        assert!(legacy.engine_output_tps.is_none());
     }
 
     #[test]

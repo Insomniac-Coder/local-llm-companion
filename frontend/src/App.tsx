@@ -153,6 +153,9 @@ export default function App() {
   const [showGenerationSpeed, setShowGenerationSpeed] = useState(true);
   const [showDetailedMetrics, setShowDetailedMetrics] = useState(false);
   const [perfMap, setPerfMap] = useState<Record<string, Perf>>({});
+  // Native reasoning streamed this session, keyed by reply id. Never persisted:
+  // reloading the page shows the answer without its thought process.
+  const [thinkingMap, setThinkingMap] = useState<Record<string, string>>({});
   const [generationPhase, setGenerationPhase] = useState<GenerationPhase>('processing');
   const lastTpsPush = useRef(0);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
@@ -609,7 +612,7 @@ export default function App() {
       setAgentPhase('ROUTING');
       try {
         const agentMode = inferredIntent === 'plan' ? 'plan' : 'agent';
-        const run = await startAgent(workspace.path, text.trim(), agentMode, cid, {search, classified});
+        const run = await startAgent(workspace.path, text.trim(), agentMode, cid, {search, classified, reasoning});
         if ('run_id' in run) {
           if (conversationRef.current === cid) {
             setFocusRun(run.run_id);
@@ -673,6 +676,11 @@ export default function App() {
           }
           setMsgs((messages) => updateMessage(messages, `${tmpId}-a`, (message) => ({ ...message, text: acc })));
         },
+        onReasoning: (t) => {
+          if (conversationRef.current !== cid || !t) return;
+          setGenerationPhase('thinking');
+          setThinkingMap((map) => ({ ...map, [`${tmpId}-a`]: (map[`${tmpId}-a`] ?? '') + t }));
+        },
         onStatus: (s) => { if (conversationRef.current === cid) setStatusLine(s); },
         onPhase: ({phase}) => {
           if (conversationRef.current !== cid) return;
@@ -695,8 +703,17 @@ export default function App() {
           setStatusLine('');
           setLiveTps(null);
           if (u.timing || u.gen_tps != null) {
-            const entry: Perf = { tps: u.timing ? u.timing.output_tps : u.gen_tps ?? null, timing: u.timing, legacy: !u.timing, model: answeringModel };
+            const entry: Perf = { tps: u.timing ? (u.timing.engine_output_tps ?? u.timing.output_tps) : u.gen_tps ?? null, timing: u.timing, legacy: !u.timing, model: answeringModel };
             setPerfMap((p) => ({ ...p, [u.message_id ?? `${tmpId}-a`]: entry }));
+          }
+          if (u.message_id) {
+            // The persisted reply id replaces the temporary streaming id.
+            setThinkingMap((map) => {
+              const thought = map[`${tmpId}-a`];
+              if (!thought) return map;
+              const { [`${tmpId}-a`]: _dropped, ...rest } = map;
+              return { ...rest, [u.message_id!]: thought };
+            });
           }
           const cmd = u.command;
           if (cmd?.type === 'clear' && cmd.conversation_id) {
@@ -1168,7 +1185,7 @@ export default function App() {
         </div>
       );
     }
-    const status = live ? 'Working' : waiting ? 'Waiting for approval' : sess?.activity === 'error' ? 'Error' : stale ? 'Interrupted' : '';
+    const status = live ? 'Working' : waiting ? 'Waiting for approval' : sess?.activity === 'error' ? 'Error' : stale ? 'Used another model' : '';
     return (
       <div key={c.id} className={`sb-row${isActive ? ' active' : ''}`}>
         <button type="button" className="sb-row-main" onClick={() => void selectConv(c.id)} title={status ? `${c.title} · ${status}` : c.title} aria-current={isActive ? 'true' : undefined}>
@@ -1199,6 +1216,7 @@ export default function App() {
   if (usage && !visibleWork) {
     receipt.push({ text: `Last reply · ${usage.prompt_tokens.toLocaleString()} in / ${usage.generated_tokens.toLocaleString()} out` });
     if (usage.stopped) receipt.push({ text: 'Stopped early · partial reply kept', warn: true });
+    if (usage.truncated && !usage.stopped) receipt.push({ text: 'Reached the output limit · ask it to continue', warn: true });
     if (usage.reasoning && usage.reasoning !== 'off') receipt.push({ text: `Reasoned (${usage.reasoning})`, icon: 'sparkle' });
     if (usage.sources) receipt.push({ text: `${usage.sources} source${usage.sources === 1 ? '' : 's'}`, icon: 'globe' });
     if (usage.vision === 'unsupported') receipt.push({ text: 'Images skipped — this model has no vision', warn: true, icon: 'image' });
@@ -1291,7 +1309,7 @@ export default function App() {
                     notify('info', 'Session restored. The loaded model will rebuild context when you send a message.');
                   }}
                   onDiscard={(id) => discardStale(id, loadedModel).then(() => {
-                    notify('info', 'Interrupted marker cleared.');
+                    notify('info', 'Other-model marker cleared.');
                     getRecovery().then(setRecovery).catch(() => {});
                     refreshConvs();
                   }).catch((e) => notify('error', e.message))}
@@ -1551,6 +1569,7 @@ export default function App() {
                             showMetrics={showGenerationSpeed}
                             detailedMetrics={showDetailedMetrics}
                             byline={m.role === 'assistant' ? modelName(perfMap[m.id]?.model) : undefined}
+                            thinking={m.role === 'assistant' ? thinkingMap[m.id] : undefined}
                             agentRunId={m.id}
                             onOpenAgentActivity={(runId) => {
                               setFocusRun(runId);

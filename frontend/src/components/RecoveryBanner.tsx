@@ -19,16 +19,22 @@ export default function RecoveryBanner({
   const [open, setOpen] = useState(false);
   const count = recovery.stale.length + recovery.busy.length;
   if (count === 0) return null;
+  // A session whose last model differs from the loaded one is not broken:
+  // its history is intact and rebuilds on the next message. Only live work
+  // left behind is worth the alarm wording.
+  const summary = recovery.busy.length > 0
+    ? `${count} ${count === 1 ? 'session needs' : 'sessions need'} attention`
+    : `${count} ${count === 1 ? 'session used' : 'sessions used'} another model`;
   return (
     <div className="pop-anchor" style={{ display: 'block' }}>
       <button type="button" className="sb-attention" aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
-        <Icon name="alert" size={15} />
-        <span>{count} {count === 1 ? 'session needs' : 'sessions need'} attention</span>
+        <Icon name={recovery.busy.length > 0 ? 'alert' : 'info'} size={15} />
+        <span>{summary}</span>
         <Icon name="chevronRight" size={14} />
       </button>
-      <Popover open={open} onClose={() => setOpen(false)} label="Sessions needing attention" side="bottom" align="start" className="attention-pop" autoFocus={false}>
+      <Popover open={open} onClose={() => setOpen(false)} label="Sessions from another model" side="bottom" align="start" className="attention-pop" autoFocus={false}>
         <PopLabel>
-          <span>Interrupted sessions</span>
+          <span>{recovery.busy.length > 0 ? 'Interrupted sessions' : 'Last used with another model'}</span>
         </PopLabel>
         {recovery.busy.length > 0 && <p className="attention-note">{recovery.busy.length} {recovery.busy.length === 1 ? 'session still has' : 'sessions still have'} live work.</p>}
         {recovery.stale.slice(0, 6).map((session) => (
@@ -37,11 +43,11 @@ export default function RecoveryBanner({
             <small>Last used with {session.last_model || 'an unknown model'}</small>
             <div className="attention-actions">
               <Button size="sm" onClick={() => { setOpen(false); onResume(session.id); }}>Resume</Button>
-              <IconButton icon="x" label={`Discard the interrupted state of ${session.title}`} size="sm" tipSide="left" onClick={() => onDiscard(session.id)} />
+              <IconButton icon="x" label={`Clear the other-model marker of ${session.title}`} size="sm" tipSide="left" onClick={() => onDiscard(session.id)} />
             </div>
           </div>
         ))}
-        <p className="attention-note">Resume reopens the saved history for the model that is loaded now. Discard only clears the interrupted marker; nothing is deleted.</p>
+        <p className="attention-note">Resume reopens the saved history with the model that is loaded now; the context is rebuilt on the next message and nothing is lost. Clearing only removes the marker.</p>
         <div style={{ display: 'flex', justifyContent: 'flex-end', padding: '2px 4px 4px' }}>
           <Button size="sm" variant="ghost" onClick={() => { setOpen(false); onDismiss(); }}>Hide for now</Button>
         </div>

@@ -119,10 +119,17 @@ not treated as proof that no GPU exists.
 If the runtime reports no usable GPU, Companion loads the model on CPU. If GPU
 initialization/allocation fails, it retries once with GPU, KV-cache, operation,
 and vision-projector offloading disabled. Automatic CPU operation caps context
-at 8,192 tokens and batch size at 128 to reduce overhead, without overwriting
-saved settings. The app reports CPU operation and shows the effective settings
-under the loaded session's runtime configuration. Manual hardware overrides are
-respected and do not opt into automatic retries.
+at 8,192 tokens, keeps the runtime's default prompt batch and thread count
+(all physical cores measured faster than performance cores alone), and keeps
+context-drafted speculative decoding on (it measured 4x faster on code
+rewrites on CPU with no loss elsewhere). Saved settings are not overwritten.
+The app reports CPU operation and shows the effective settings under the
+loaded session's runtime configuration. Manual hardware overrides are
+respected and do not opt into automatic retries. On a CPU-only laptop prefer a
+4B-8B model at Q4_K_M or a mixture-of-experts model with few active
+parameters, and leave Reasoning off unless you need it: only the new text of
+each turn is processed thanks to the prompt cache, so long conversations stay
+usable. See `docs/PERFORMANCE.md` for the measurements.
 
 This fallback uses the **same installed llama-server**, which must itself be
 able to start and support CPU execution. It cannot repair a missing executable,

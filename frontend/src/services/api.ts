@@ -299,6 +299,8 @@ export interface StreamUsage {
   prompt_tokens: number;
   generated_tokens: number;
   stopped?: boolean;
+  /** The runtime hit the output limit before the reply finished. */
+  truncated?: boolean;
   reasoning?: string;
   sources?: number;
   vision?: string;
@@ -325,6 +327,8 @@ export async function streamChat(
   conversationId: string | null,
   cbs: {
     onToken: (t: string) => void;
+    /** Native reasoning text as the model produces it (never persisted). */
+    onReasoning?: (t: string) => void;
     onStatus?: (s: string) => void;
     onPhase?: (phase: {phase: GenerationPhase; round?:number}) => void;
     onActivity?: (event: AgentEvent) => void;
@@ -360,7 +364,11 @@ export async function streamChat(
   let buf = '';
   const handleFrame = (frame: string) => {
     let event = 'message';
-    let data = '';
+    // SSE joins consecutive `data:` lines with a newline. A delta that IS a
+    // newline arrives as two empty data lines; joining with a "was there
+    // data before?" check dropped it, which glued code fences to the code
+    // that followed them.
+    const parts: string[] = [];
     for (const line of frame.split('\n')) {
       if (line.startsWith('event:')) event = line.slice(6).trim();
       else if (line.startsWith('data:')) {
@@ -369,10 +377,12 @@ export async function streamChat(
         // in their leading space (trimStart here ate all spaces).
         let v = line.slice(5);
         if (v.startsWith(' ')) v = v.slice(1);
-        data += (data ? '\n' : '') + v;
+        parts.push(v);
       }
     }
+    const data = parts.join('\n');
     if (event === 'token') cbs.onToken(data);
+    else if (event === 'reasoning') { if (cbs.onReasoning) cbs.onReasoning(data); }
     else if (event === 'status' && cbs.onStatus) cbs.onStatus(data);
     else if (event === 'phase' && cbs.onPhase) {
       try { const phase = JSON.parse(data); if (['processing','thinking','responding'].includes(phase.phase)) cbs.onPhase(phase); } catch { /* unknown phase leaves the current public status unchanged */ }
@@ -503,7 +513,17 @@ export interface ResolvedRuntimePolicy {
   mode: string; architecture: string; weights_quantization: string;
   requested_context: number; effective_context: number;
   cache_type_k: string; cache_type_v: string; flash_attention: string;
-  kv_offload: string; threads: number; gpu_layers: number; batch_size: number;
+  kv_offload: string; threads: number; gpu_layers: number;
+  /** 0 = the runtime's own default batch sizes. */
+  batch_size: number;
+  /** Minimum KV chunk reused after a prompt diverges; 0 = off. */
+  cache_reuse?: number;
+  /** `--spec-type` value, or "none". */
+  speculative?: string;
+  /** Planned residency from measured memory: gpu | hybrid | oversubscribed | cpu | unknown. */
+  placement?: string;
+  /** Context ceiling applied on the CPU fallback, sized from free RAM. */
+  cpu_context_cap?: number;
   cache_rebuild: string; notes: string[];
 }
 
@@ -659,7 +679,8 @@ export interface AgentEvent {
   state: string;
   message: string;
   iteration: number;
-  kind?: 'task' | 'thought' | 'tool_started' | 'tool_result' | 'permission' | 'final' | 'status' | string;
+  /** `thought_delta` is live partial model text: streamed only, never journaled or replayed. */
+  kind?: 'task' | 'thought' | 'thought_delta' | 'tool_started' | 'tool_result' | 'permission' | 'final' | 'status' | string;
   tool?: string | null;
   args?: Record<string, unknown> | null;
   output?: string | null;
@@ -671,11 +692,14 @@ export type AgentStartResult =
   | { disposition?: 'run'; run_id: string; state?: string }
   | { disposition: 'conversation' | 'needs_task'; message: string; message_id: string };
 
-export async function startAgent(workspace: string, task: string, mode: string, conversation_id?: string, options: {search?: boolean; classified?: boolean} = {}): Promise<AgentStartResult> {
+export async function startAgent(workspace: string, task: string, mode: string, conversation_id?: string, options: {search?: boolean; classified?: boolean; reasoning?: boolean} = {}): Promise<AgentStartResult> {
   return req('/api/agent/run', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ workspace, task, mode, conversation_id: conversation_id ?? '', search: options.search ?? false, classified: options.classified ?? false }),
+    body: JSON.stringify({
+      workspace, task, mode, conversation_id: conversation_id ?? '', search: options.search ?? false, classified: options.classified ?? false,
+      ...(options.reasoning !== undefined ? { reasoning: options.reasoning } : {}),
+    }),
   });
 }
 
@@ -1090,7 +1114,10 @@ export interface BenchmarkResult {
   prompt_tokens: number;
   generated_tokens: number;
   total_ms: number;
+  /** Engine-measured decode rate when reported, else wall-clock. */
   generation_tps: number;
+  prompt_tps?: number | null;
+  cached_tokens?: number | null;
   context_limit: number;
   sample_chars: number;
 }

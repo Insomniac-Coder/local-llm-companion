@@ -239,8 +239,13 @@ impl Storage {
             }
         }
         let conn = Connection::open(path)?;
-        // Crash safety over raw speed for conversation history (§83).
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+        // Crash safety over raw speed for conversation history (§83). A busy
+        // timeout covers a second process (backup script) holding the file;
+        // temp tables and sort scratch stay in memory.
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;
+             PRAGMA temp_store=MEMORY; PRAGMA cache_size=-16000;",
+        )?;
         let s = Self { conn };
         s.migrate()?;
         s.recover_interrupted_activity()?;
@@ -377,6 +382,18 @@ impl Storage {
                 self.conn.execute_batch(ddl)?;
             }
         }
+        // Every hot read is keyed by conversation or workspace; without these
+        // each request scanned whole tables, which grows with history.
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS messages_by_conversation ON messages(conversation_id);
+             CREATE INDEX IF NOT EXISTS attachments_by_conversation ON attachments(conversation_id);
+             CREATE INDEX IF NOT EXISTS tool_executions_by_conversation ON tool_executions(conversation_id);
+             CREATE INDEX IF NOT EXISTS artifacts_by_conversation ON artifacts(conversation_id);
+             CREATE INDEX IF NOT EXISTS generation_metrics_by_conversation ON generation_metrics(conversation_id);
+             CREATE INDEX IF NOT EXISTS knowledge_chunks_by_workspace ON knowledge_chunks(workspace_id, path, chunk_idx);
+             CREATE INDEX IF NOT EXISTS memory_entries_by_scope ON memory_entries(scope, scope_id);
+             CREATE INDEX IF NOT EXISTS search_runs_by_conversation ON search_runs(conversation_id);",
+        )?;
         Ok(())
     }
 
@@ -559,6 +576,30 @@ impl Storage {
             params![mid, serde_json::to_string(event).unwrap_or_default()],
         )?;
         Ok(())
+    }
+
+    /// Every journal in one conversation, grouped by message id, in one query.
+    pub fn conversation_activities(
+        &self,
+        conv: &str,
+    ) -> rusqlite::Result<std::collections::HashMap<String, Vec<crate::agent::AgentEvent>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT a.message_id, a.event_json FROM message_activities a
+             JOIN messages m ON m.id = a.message_id
+             WHERE m.conversation_id=? ORDER BY a.rowid",
+        )?;
+        let rows = stmt.query_map([conv], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut grouped: std::collections::HashMap<String, Vec<crate::agent::AgentEvent>> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let (message_id, json) = row?;
+            if let Ok(event) = serde_json::from_str(&json) {
+                grouped.entry(message_id).or_default().push(event);
+            }
+        }
+        Ok(grouped)
     }
 
     pub fn message_activities(&self, mid: &str) -> rusqlite::Result<Vec<crate::agent::AgentEvent>> {

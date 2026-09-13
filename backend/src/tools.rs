@@ -97,7 +97,7 @@ pub fn registry() -> Vec<ToolDescriptor> {
         },
         ToolDescriptor {
             name: "edit_file",
-            description: "Apply a unified-diff patch to a workspace file",
+            description: "Replace exact existing text in a workspace file: path, old (the exact lines to change, copied from read_file without the line-number labels), new (their replacement). old must occur once; add surrounding lines to make it unique. A unified-diff patch argument is also accepted.",
             risk: RiskLevel::Moderate,
             permission_required: "explicit",
         },
@@ -238,19 +238,29 @@ pub fn execute(
         }
         "edit_file" => {
             require_approved(req, approved, "File modifications need explicit approval.")?;
+            const USAGE: &str = "edit_file requires {\"path\": \"...\", \"old\": \"exact existing text\", \"new\": \"replacement text\"} (or {\"path\", \"patch\"} with a unified diff)";
             let rel = req.args.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
-                ToolError::InvalidArgs("edit_file requires {\"path\": \"...\", \"patch\": \"--- ...\"}".into())
-            })?;
-            let patch = req.args.get("patch").and_then(|v| v.as_str()).ok_or_else(|| {
-                ToolError::InvalidArgs("edit_file requires {\"path\": \"...\", \"patch\": \"--- ...\"}".into())
+                ToolError::InvalidArgs(USAGE.into())
             })?;
             let p = ws.resolve(rel).map_err(ToolError::Workspace)?;
             let original = std::fs::read_to_string(&p).map_err(ToolError::Io)?;
             if original.len() as u64 > MAX_FILE_BYTES {
                 return Err(ToolError::InvalidArgs("file too large to patch; rewrite it in chunks".into()));
             }
-            let updated = apply_unified_patch(&original, patch)
-                .map_err(ToolError::InvalidArgs)?;
+            // Exact-text replacement is what small local models produce
+            // reliably: they copy the lines they saw and write the new ones.
+            // Unified diffs stay supported for models that emit them well.
+            let updated = if let Some(old) = req.args.get("old").and_then(|v| v.as_str()) {
+                let new = req.args.get("new").and_then(|v| v.as_str()).ok_or_else(|| {
+                    ToolError::InvalidArgs(USAGE.into())
+                })?;
+                let replace_all = req.args.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
+                apply_replacement(&original, old, new, replace_all).map_err(ToolError::InvalidArgs)?
+            } else if let Some(patch) = req.args.get("patch").and_then(|v| v.as_str()) {
+                apply_unified_patch(&original, patch).map_err(ToolError::InvalidArgs)?
+            } else {
+                return Err(ToolError::InvalidArgs(USAGE.into()));
+            };
             std::fs::write(&p, &updated).map_err(ToolError::Io)?;
             Ok(ToolResult::ok(format!(
                 "patched {rel}: {} -> {} bytes",
@@ -386,95 +396,258 @@ pub fn execute(
 /// `---`/`+++` headers are informational; the caller already resolved the
 /// target path through the workspace manager.
 pub fn apply_unified_patch(original: &str, patch: &str) -> Result<String, String> {
-    let orig: Vec<&str> = original.lines().collect();
-    let mut out: Vec<String> = vec![];
-    let mut orig_idx = 0usize; // 0-based cursor into orig
-    let mut hunk_count = 0usize;
-    let lines: Vec<&str> = patch.lines().collect();
-    let mut i = 0;
-    while i < lines.len() {
-        let line = lines[i];
-        if line.starts_with("---") || line.starts_with("+++") {
-            i += 1;
+    // Hunk headers from local models are routinely wrong about line numbers
+    // and counts, while the context and removed lines are usually right. Each
+    // hunk is therefore located by its old-side lines (exact first, then
+    // ignoring surrounding whitespace), starting from the header's hint and
+    // scanning forward from the previous hunk. Counts in the header are not
+    // trusted; the located lines are.
+    struct Hunk {
+        hint: usize,
+        lines: Vec<(char, String)>,
+    }
+    let mut hunks: Vec<Hunk> = Vec::new();
+    for line in patch.lines() {
+        if line.starts_with("---") || line.starts_with("+++") || line.starts_with("diff ") {
             continue;
         }
-        if !line.starts_with("@@") {
+        if line.starts_with("@@") {
+            let (start, _) = parse_hunk_header(line)?;
+            hunks.push(Hunk {
+                hint: start.saturating_sub(1),
+                lines: Vec::new(),
+            });
+            continue;
+        }
+        let Some(hunk) = hunks.last_mut() else {
             return Err(format!("expected '@@' hunk header, got: {line}"));
-        }
-        hunk_count += 1;
-        let (old_start, old_len) = parse_hunk_header(line)?;
-        // Copy unchanged lines between the end of the last hunk and this one.
-        // old_start is 1-based; converting to 0-based cursor position.
-        let want_idx = old_start.saturating_sub(1);
-        if want_idx < orig_idx {
-            return Err("overlapping hunks".into());
-        }
-        while orig_idx < want_idx {
-            if orig_idx >= orig.len() {
-                return Err("hunk starts past end of file".into());
+        };
+        let (kind, text) = if line.is_empty() {
+            (' ', "")
+        } else {
+            let mut chars = line.chars();
+            (chars.next().unwrap_or(' '), chars.as_str())
+        };
+        match kind {
+            ' ' | '-' | '+' => hunk.lines.push((kind, text.to_string())),
+            '\\' => {} // "\ No newline at end of file"
+            _ => {
+                return Err(format!(
+                    "bad hunk line: {line:?} (must start with ' ', '-', '+')"
+                ))
             }
-            out.push(orig[orig_idx].to_string());
-            orig_idx += 1;
-        }
-        i += 1;
-        let mut consumed_old = 0usize;
-        while i < lines.len() && !lines[i].starts_with("@@") && !lines[i].starts_with("---") {
-            let hunk_line = lines[i];
-            let (kind, text) = hunk_line.split_at(1.min(hunk_line.len()));
-            match kind {
-                " " => {
-                    if orig.get(orig_idx) != Some(&text) {
-                        return Err(format!(
-                            "context mismatch at line {}: expected {text:?}, found {:?}. Re-read the file and retry.",
-                            orig_idx + 1,
-                            orig.get(orig_idx)
-                        ));
-                    }
-                    out.push(text.to_string());
-                    orig_idx += 1;
-                    consumed_old += 1;
-                }
-                "-" => {
-                    if orig.get(orig_idx) != Some(&text) {
-                        return Err(format!(
-                            "removal mismatch at line {}: expected {text:?}, found {:?}. Re-read the file and retry.",
-                            orig_idx + 1,
-                            orig.get(orig_idx)
-                        ));
-                    }
-                    orig_idx += 1;
-                    consumed_old += 1;
-                }
-                "+" => {
-                    out.push(text.to_string());
-                }
-                _ => {
-                    return Err(format!(
-                        "bad hunk line: {hunk_line:?} (must start with ' ', '-', '+')"
-                    ))
-                }
-            }
-            i += 1;
-        }
-        if consumed_old != old_len {
-            return Err(format!(
-                "hunk consumed {consumed_old} original lines but header claims {old_len}"
-            ));
         }
     }
-    if hunk_count == 0 {
+    if hunks.is_empty() {
         return Err("patch contains no hunks".into());
     }
-    // Copy the tail. Preserve a trailing newline iff the original had one.
-    while orig_idx < orig.len() {
-        out.push(orig[orig_idx].to_string());
-        orig_idx += 1;
+    let orig: Vec<&str> = original.lines().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut cursor = 0usize;
+    for hunk in &hunks {
+        let old: Vec<&str> = hunk
+            .lines
+            .iter()
+            .filter(|(kind, _)| *kind != '+')
+            .map(|(_, text)| text.as_str())
+            .collect();
+        let at = if old.is_empty() {
+            // Pure insertion: the header position is all there is.
+            hunk.hint.clamp(cursor, orig.len())
+        } else {
+            locate_lines(&orig, &old, cursor, hunk.hint).ok_or_else(|| {
+                format!(
+                    "the hunk's original lines were not found in the file (first expected line: {:?}). Re-read the file and use edit_file with old/new: old = the exact existing lines, new = their replacement.",
+                    old[0]
+                )
+            })?
+        };
+        out.extend(orig[cursor..at].iter().map(|line| line.to_string()));
+        let mut position = at;
+        for (kind, text) in &hunk.lines {
+            match kind {
+                ' ' => {
+                    // Keep the file's own line (whitespace may differ from the hunk).
+                    out.push(orig.get(position).map(|l| l.to_string()).unwrap_or_else(|| text.clone()));
+                    position += 1;
+                }
+                '-' => position += 1,
+                _ => out.push(text.clone()),
+            }
+        }
+        cursor = position.min(orig.len());
     }
+    out.extend(orig[cursor..].iter().map(|line| line.to_string()));
     let mut result = out.join("\n");
     if original.ends_with('\n') {
         result.push('\n');
     }
     Ok(result)
+}
+
+/// Find `needle` (a run of lines) in `haystack` at or after `from`: exact
+/// match nearest to `hint` first, then a whitespace-insensitive match.
+fn locate_lines(haystack: &[&str], needle: &[&str], from: usize, hint: usize) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len().saturating_sub(from) {
+        return None;
+    }
+    let candidates = |equal: &dyn Fn(&str, &str) -> bool| -> Vec<usize> {
+        (from..=haystack.len() - needle.len())
+            .filter(|&start| {
+                needle
+                    .iter()
+                    .enumerate()
+                    .all(|(offset, line)| equal(haystack[start + offset], line))
+            })
+            .collect()
+    };
+    let nearest = |found: Vec<usize>| {
+        found
+            .into_iter()
+            .min_by_key(|start| start.abs_diff(hint))
+    };
+    nearest(candidates(&|a, b| a == b))
+        .or_else(|| nearest(candidates(&|a, b| a.trim() == b.trim())))
+}
+
+/// The file lines that best resemble the block the model tried to match:
+/// the window whose lines share the most leading characters (after trimming)
+/// with the requested lines. Shown verbatim so the model can copy them.
+fn closest_region(haystack: &[&str], needle: &[&str]) -> Option<String> {
+    if haystack.is_empty() || needle.is_empty() {
+        return None;
+    }
+    let similarity = |a: &str, b: &str| {
+        let (a, b) = (a.trim(), b.trim());
+        let common = a
+            .chars()
+            .zip(b.chars())
+            .take_while(|(x, y)| x == y)
+            .count();
+        // Reward matching content, not matching emptiness.
+        if a.is_empty() || b.is_empty() {
+            0
+        } else {
+            common * 100 / a.len().max(b.len())
+        }
+    };
+    let window = needle.len().min(haystack.len());
+    let (best_start, best_score) = (0..=haystack.len() - window)
+        .map(|start| {
+            let score: usize = needle
+                .iter()
+                .take(window)
+                .enumerate()
+                .map(|(offset, line)| similarity(haystack[start + offset], line))
+                .sum();
+            (start, score)
+        })
+        .max_by_key(|(start, score)| (*score, usize::MAX - *start))?;
+    if best_score == 0 {
+        return None;
+    }
+    let from = best_start.saturating_sub(1);
+    let to = (best_start + window + 1).min(haystack.len());
+    Some(
+        haystack[from..to]
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+/// Exact-text replacement with the fallbacks small models need: CRLF/LF
+/// tolerance, a whitespace-insensitive line match when indentation was
+/// reproduced imperfectly, and stripping of `N: ` line-number labels copied
+/// from read_file output. The match must be unique unless `replace_all`.
+pub fn apply_replacement(
+    original: &str,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+) -> Result<String, String> {
+    if old.is_empty() {
+        return Err("old text is empty: give the exact existing lines to replace".into());
+    }
+    let crlf = original.contains("\r\n");
+    let text = original.replace("\r\n", "\n");
+    let old_lf = old.replace("\r\n", "\n");
+    let new_lf = new.replace("\r\n", "\n");
+    let finish = |updated: String| {
+        if crlf {
+            updated.replace('\n', "\r\n")
+        } else {
+            updated
+        }
+    };
+    let count = text.matches(old_lf.as_str()).count();
+    if count == 1 || (count > 1 && replace_all) {
+        return Ok(finish(text.replace(old_lf.as_str(), &new_lf)));
+    }
+    if count > 1 {
+        return Err(format!(
+            "old text occurs {count} times; include more surrounding lines so it is unique, or set replace_all: true"
+        ));
+    }
+    // Strip "12: " style labels a model may have copied from read_file output.
+    let unlabelled: Vec<String> = old_lf
+        .lines()
+        .map(|line| {
+            let digits = line.chars().take_while(|c| c.is_ascii_digit()).count();
+            if digits > 0 && line[digits..].starts_with(": ") {
+                line[digits + 2..].to_string()
+            } else if digits > 0 && line[digits..] == *":" {
+                String::new()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    let stripped = unlabelled.join("\n");
+    if unlabelled.len() == old_lf.lines().count() && stripped != old_lf {
+        let count = text.matches(stripped.as_str()).count();
+        if count == 1 {
+            return Ok(finish(text.replace(stripped.as_str(), &new_lf)));
+        }
+    }
+    // Whitespace-insensitive line match: locate the block, replace it whole.
+    let haystack: Vec<&str> = text.lines().collect();
+    let needle: Vec<&str> = stripped.lines().collect();
+    let starts: Vec<usize> = if needle.is_empty() || needle.len() > haystack.len() {
+        Vec::new()
+    } else {
+        (0..=haystack.len() - needle.len())
+            .filter(|&start| {
+                needle
+                    .iter()
+                    .enumerate()
+                    .all(|(offset, line)| haystack[start + offset].trim() == line.trim())
+            })
+            .collect()
+    };
+    match starts.len() {
+        1 => {
+            let start = starts[0];
+            let mut out: Vec<String> = haystack[..start].iter().map(|l| l.to_string()).collect();
+            out.extend(new_lf.lines().map(|l| l.to_string()));
+            out.extend(haystack[start + needle.len()..].iter().map(|l| l.to_string()));
+            let mut updated = out.join("\n");
+            if text.ends_with('\n') {
+                updated.push('\n');
+            }
+            Ok(finish(updated))
+        }
+        0 => Err(format!(
+            "old text was not found in the file. Copy the exact existing lines (without the line-number labels) into old, then give their replacement in new.{}",
+            closest_region(&haystack, &needle)
+                .map(|region| format!("\nThe closest text in the file is:\n{region}\nUse those exact lines (or a unique subset of them) as old."))
+                .unwrap_or_default()
+        )),
+        n => Err(format!(
+            "old text matches {n} places when ignoring indentation; include more surrounding lines so it is unique"
+        )),
+    }
 }
 
 fn parse_hunk_header(line: &str) -> Result<(usize, usize), String> {
@@ -751,8 +924,51 @@ mod tests {
         );
         let stale = "@@ -1,3 +1,3 @@\n line1\n-CHANGED\n+X\n line3\n";
         let err = apply_unified_patch(original, stale).unwrap_err();
-        assert!(err.contains("mismatch"), "{err}");
+        assert!(err.contains("not found"), "{err}");
         assert!(apply_unified_patch(original, "no hunks here").is_err());
+    }
+
+    #[test]
+    fn replacement_edit_tolerates_labels_indentation_and_line_endings() {
+        let original = "function subtract(a, b) {\n  return a + b; // BUG\n}\n\nfunction add(a, b) {\n  return a + b;\n}\n";
+        // Unique exact match.
+        let fixed = apply_replacement(original, "  return a + b; // BUG", "  return a - b;", false).unwrap();
+        assert!(fixed.contains("return a - b;") && !fixed.contains("BUG"));
+        // Ambiguous without replace_all.
+        let err = apply_replacement(original, "  return a + b;", "x", false).unwrap_err();
+        assert!(err.contains("2 times"), "{err}");
+        assert_eq!(apply_replacement(original, "  return a + b;", "  return 0;", true).unwrap().matches("return 0;").count(), 2);
+        // Line-number labels copied from read_file output are stripped.
+        let labelled = apply_replacement(original, "1: function subtract(a, b) {\n2:   return a + b; // BUG", "function subtract(a, b) {\n  return a - b;", false).unwrap();
+        assert!(labelled.starts_with("function subtract(a, b) {\n  return a - b;\n}"));
+        // Indentation reproduced imperfectly still locates the block.
+        let loose = apply_replacement(original, "return a + b; // BUG", "  return a - b;", false).unwrap();
+        assert!(loose.contains("  return a - b;\n}"));
+        // CRLF files keep CRLF.
+        let crlf = original.replace('\n', "\r\n");
+        let fixed_crlf = apply_replacement(&crlf, "  return a + b; // BUG", "  return a - b;", false).unwrap();
+        assert!(fixed_crlf.contains("return a - b;\r\n}"));
+        assert!(!fixed_crlf.contains("\n\n") || fixed_crlf.contains("\r\n\r\n"));
+        assert!(apply_replacement(original, "nothing like this", "x", false).unwrap_err().contains("not found"));
+        assert!(apply_replacement(original, "", "x", false).is_err());
+        // A near miss (the model dropped the trailing comment) shows the real
+        // lines so the next attempt can copy them.
+        let err = apply_replacement(original, "function subtract(a, b) {\n  return a + b;\n}", "x", false).unwrap_err();
+        assert!(err.contains("closest text"), "{err}");
+        assert!(err.contains("return a + b; // BUG"), "{err}");
+    }
+
+    #[test]
+    fn unified_patch_locates_hunks_by_content_not_by_wrong_headers() {
+        let original = "// header\nfunction add(a, b) {\n  return a + b;\n}\n\nfunction subtract(a, b) {\n  return a + b; // BUG\n}\n";
+        // Wrong start line and counts (what an 8B model produced), right lines.
+        let patch = "--- a/calc.js\n+++ b/calc.js\n@@ -1,2 +1,2 @@\n function subtract(a, b) {\n-  return a + b; // BUG\n+  return a - b;\n }\n";
+        let fixed = apply_unified_patch(original, patch).unwrap();
+        assert!(fixed.contains("function subtract(a, b) {\n  return a - b;\n}"));
+        assert!(fixed.contains("function add(a, b) {\n  return a + b;\n}"), "the other function is untouched");
+        // Lines that do not exist anywhere are still rejected.
+        let bogus = "@@ -6,2 +6,2 @@\n-  return a - b; // Fixed\n+  return a * b;\n";
+        assert!(apply_unified_patch(original, bogus).unwrap_err().contains("not found"));
     }
 
     #[test]

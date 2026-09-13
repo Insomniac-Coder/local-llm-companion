@@ -156,6 +156,7 @@ export default function MessageView({
   activities,
   agentRunId,
   byline,
+  thinking,
   onOpenAgentActivity,
   onEdit,
   onRegenerate,
@@ -175,6 +176,8 @@ export default function MessageView({
   agentRunId?: string;
   /** Model that produced this reply, when recorded. */
   byline?: string;
+  /** Native reasoning streamed for this reply during the session (not persisted). */
+  thinking?: string;
   onOpenAgentActivity?: (runId: string) => void;
   onEdit?: () => void;
   onRegenerate?: () => void;
@@ -248,6 +251,12 @@ export default function MessageView({
         <summary>View file activity</summary>
         <ToolTimeline events={chatDetails} />
       </details>}
+      {thinking && (
+        <details className="thinking-block" open={streaming && !answerBody}>
+          <summary>{streaming && !answerBody ? 'Thinking…' : 'Thought process'}</summary>
+          <pre>{thinking}</pre>
+        </details>
+      )}
       <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={MARKDOWN_COMPONENTS}>
         {answerBody}
       </ReactMarkdown>

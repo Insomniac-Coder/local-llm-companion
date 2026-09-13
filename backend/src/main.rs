@@ -100,6 +100,8 @@ async fn main() {
                 vision: false,
                 tool_calling: true,
                 supports_reasoning: false,
+                kv_bytes_per_token: None,
+                weights_bytes: None,
                 projector_file: None,
                 model_file: None,
                 dir: cfg.models_dir.join("demo-8b"),

@@ -45,8 +45,25 @@ pub fn cpu_configuration(mut cfg: InferenceConfig, reason: &str) -> InferenceCon
     cfg.flash_attn_auto = false;
     cfg.flash_attn = false;
     cfg.n_threads = 0; // Let the CPU runtime choose; never force a machine-specific value.
-    cfg.n_ctx = cfg.n_ctx.min(8192);
-    cfg.n_batch = cfg.n_batch.min(128).min(cfg.n_ctx).max(1);
+    // The policy sized this cap from free system RAM (8192 when plentiful).
+    let cap = cfg
+        .runtime_policy
+        .as_ref()
+        .map(|policy| policy.cpu_context_cap)
+        .unwrap_or(8192)
+        .max(1024);
+    cfg.n_ctx = cfg.n_ctx.min(cap);
+    // A CPU cache pays a prompt-processing penalty for q8_0 (measured ~15%);
+    // f16 is the better CPU default regardless of the GPU-oriented preference.
+    cfg.kv_cache_type_k = "f16".into();
+    cfg.kv_cache_type_v = "f16".into();
+    // Measured on the bundled CPU backend (docs/PERFORMANCE.md): the runtime's
+    // default batch prefilled slightly faster than the old 128 cap, so an
+    // automatic (0) preference stays automatic. An explicit manual value is
+    // still bounded by the context.
+    if cfg.n_batch > 0 {
+        cfg.n_batch = cfg.n_batch.min(cfg.n_ctx).max(1);
+    }
     if let Some(policy) = &mut cfg.runtime_policy {
         policy.gpu_layers = 0;
         policy.kv_offload = "off".into();
@@ -54,7 +71,10 @@ pub fn cpu_configuration(mut cfg: InferenceConfig, reason: &str) -> InferenceCon
         policy.threads = 0;
         policy.effective_context = cfg.n_ctx;
         policy.batch_size = cfg.n_batch;
-        policy.notes.push(format!("CPU mode selected automatically: {reason}. GPU, cache and projector offloading are disabled. Context is capped at 8192 and batch size at 128 for CPU operation; saved preferences are unchanged. Responses may be slower, and the model must still fit available system memory."));
+        policy.cache_type_k = "f16".into();
+        policy.cache_type_v = "f16".into();
+        policy.placement = "cpu".into();
+        policy.notes.push(format!("CPU mode selected automatically: {reason}. GPU, cache and projector offloading are disabled. Context is capped at 8192 for CPU operation; saved preferences are unchanged. Responses are slower on CPU: prefer a 4B-8B model at Q4_K_M or a small-active-parameter MoE model, keep Reasoning off unless needed, and rely on the prompt cache (only new text is processed each turn)."));
     }
     cfg
 }
@@ -194,7 +214,17 @@ mod tests {
         assert!(!active.kv_cache_gpu);
         assert!(!active.flash_attn);
         assert_eq!(active.n_ctx, 8192);
-        assert_eq!(active.n_batch, 128);
+        assert_eq!(
+            active.n_batch, 0,
+            "automatic batch stays the runtime default on CPU (measured faster than a 128 cap)"
+        );
+        let mut manual = cfg.clone();
+        manual.n_batch = 4096;
+        assert_eq!(
+            cpu_configuration(manual, "test").n_batch,
+            8192.min(4096),
+            "an explicit batch is bounded by the CPU context, not silently replaced"
+        );
         assert_eq!(cfg.n_ctx, 32768);
         assert_eq!(cfg.n_gpu_layers, -1);
         assert!(notice.unwrap().contains("CPU"));
