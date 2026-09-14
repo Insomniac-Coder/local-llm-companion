@@ -1211,8 +1211,8 @@ export default function App() {
   };
 
   const workLabel = visibleWork?.kind === 'agent'
-    ? agentPhase === 'ROUTING' ? 'Understanding your request…' : !inf?.running ? 'Model stopped · this run needs attention' : agentPhase === 'WAITING_PERMISSION' ? 'Waiting for your approval' : agentPhase === 'EXECUTING_TOOL' ? 'Working through the project…' : agentPhase === 'OBSERVING' ? 'Reviewing the results…' : 'Planning the next step…'
-    : statusLine || (generationPhase === 'thinking' ? `${loadedMeta?.name ?? 'The model'} is thinking…` : generationPhase === 'responding' ? `${loadedMeta?.name ?? 'The model'} is writing…` : 'Processing your request…');
+    ? agentPhase === 'ROUTING' ? 'Understanding your request…' : !inf?.running ? 'Model stopped · this run needs attention' : agentPhase === 'WAITING_PERMISSION' ? 'Waiting for your approval' : agentPhase === 'COMPACTING' ? 'Compacting context… the run resumes on its own' : agentPhase === 'EXECUTING_TOOL' ? 'Working through the project…' : agentPhase === 'OBSERVING' ? 'Reviewing the results…' : 'Planning the next step…'
+    : statusLine || (generationPhase === 'compacting' ? 'Compacting the conversation before replying…' : generationPhase === 'thinking' ? `${loadedMeta?.name ?? 'The model'} is thinking…` : generationPhase === 'responding' ? `${loadedMeta?.name ?? 'The model'} is writing…` : 'Processing your request…');
 
   const receipt: { text: string; warn?: boolean; icon?: IconName }[] = [];
   if (search) receipt.push({ text: 'Web search is on for your next message — queries leave this PC', warn: true, icon: 'globe' });
@@ -1371,7 +1371,7 @@ export default function App() {
           activity={machineActivity}
           liveTps={liveTps}
           lastTps={lastReplyTps}
-          phaseLabel={busy ? (generationPhase === 'thinking' ? 'Thinking…' : generationPhase === 'responding' ? 'Writing…' : 'Reading your message…') : agentBusy ? 'Agent working…' : undefined}
+          phaseLabel={busy ? (generationPhase === 'compacting' ? 'Compacting context…' : generationPhase === 'thinking' ? 'Thinking…' : generationPhase === 'responding' ? 'Writing…' : 'Reading your message…') : agentBusy ? 'Agent working…' : undefined}
           collapsed={rail}
           onSelect={chooseModel}
           onLoad={requestLoad}

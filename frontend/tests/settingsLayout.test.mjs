@@ -92,9 +92,13 @@ test('runtime details separate requested configuration from measurements and uns
 
 test('inactive preferences are not exposed as editable settings', () => {
   const source = readFileSync(sourcePath, 'utf8');
-  for (const key of ['allowed_dirs', 'blocked_dirs', 'auto_compact', 'max_attach_mb', 'max_image_mb', 'output_dir', 'log_redaction', 'telemetry', 'server_port', 'kv_cache_type', 'log_level', 'confirm_outside_copy', 'default_dir', 'command_timeout_secs']) {
+  for (const key of ['allowed_dirs', 'blocked_dirs', 'max_attach_mb', 'max_image_mb', 'output_dir', 'log_redaction', 'telemetry', 'server_port', 'kv_cache_type', 'log_level', 'confirm_outside_copy', 'default_dir', 'command_timeout_secs']) {
     assert.equal(source.includes(`'${key}'`), false, `${key} must not be editable`);
   }
+  // Automatic compaction is applied by the backend (chat before a reply, the
+  // agent between steps), so its switch and threshold are real settings.
+  assert.match(source, /set\(\['memory', 'auto_compact'\]/);
+  assert.match(source, /set\(\['memory', 'compact_at_pct'\]/);
   assert.match(source, /Older, inactive preferences remain/);
   assert.match(source, /saved custom provider is not implemented/);
 });

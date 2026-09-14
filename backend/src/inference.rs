@@ -304,7 +304,13 @@ fn fit_to_memory(
     // buffers (grow with model width) and a safety margin for fragmentation.
     let free = vram.total_bytes.saturating_sub(vram.used_bytes);
     let compute = (weights / 12).max(768 * 1024 * 1024);
-    let safety = vram.total_bytes / 20;
+    // Measured on a 12 GB card with 1.7 GB held by other applications: a
+    // 14B Q4 model (9.0 GB) ran fully on the GPU at 11,264 tokens with an
+    // 8-bit cache (72 tok/s) and spilled at 12,288 (49 tok/s). The compute
+    // reserve alone matches that boundary; this margin covers what other
+    // applications add while the model loads (they varied by ~0.4 GB). A 5%
+    // margin cost the same model more than half its usable window.
+    let safety = (vram.total_bytes / 48).max(256 * 1024 * 1024);
     let gpu_budget = free.saturating_sub(compute).saturating_sub(safety);
     let kv_bytes = |context: u32, cache: &str| cache_bytes_per_token(kv_f16, cache) * context as u64;
     let fits_gpu = |context: u32, cache: &str| weights.saturating_add(kv_bytes(context, cache)) <= gpu_budget;
@@ -316,22 +322,35 @@ fn fit_to_memory(
             note: None,
         });
     }
-    let mut candidates: Vec<(u32, &str)> = Vec::new();
-    let mut context = requested_context;
-    while context >= 4096 {
-        candidates.push((context, cache_type));
-        if allow_q8 && cache_type != "q8_0" {
-            candidates.push((context, "q8_0"));
-        }
-        context /= 2;
+    // The largest context a precision allows within `room` bytes, in
+    // 1,024-token steps. Halving from the request (32K, 16K, 8K, 4K) turned a
+    // few hundred megabytes of shortfall into half the window: a 14B model
+    // that fits 7.7K tokens got 4K.
+    // Below 4K an agent cannot hold its instructions and one action; a smaller
+    // saved preference is honoured as the floor instead of being raised.
+    let floor = requested_context.min(4096);
+    let largest = |room: u64, cache: &str| -> Option<u32> {
+        let per_token = cache_bytes_per_token(kv_f16, cache).max(1);
+        let tokens = (room / per_token).min(u64::from(requested_context)) as u32;
+        let stepped = if tokens >= requested_context {
+            requested_context
+        } else {
+            tokens / 1024 * 1024
+        };
+        (stepped >= floor).then_some(stepped)
+    };
+    let mut precisions = vec![cache_type];
+    if allow_q8 && cache_type != "q8_0" {
+        precisions.push("q8_0");
     }
+    let gpu_room = gpu_budget.checked_sub(weights);
     // Largest context first; at equal context prefer the requested precision.
-    if let Some((context, cache)) = candidates
-        .iter()
-        .copied()
-        .filter(|(context, cache)| fits_gpu(*context, cache))
-        .max_by_key(|(context, cache)| (*context, u8::from(*cache == cache_type)))
-    {
+    if let Some((context, cache)) = gpu_room.and_then(|room| {
+        precisions
+            .iter()
+            .filter_map(|cache| largest(room, cache).map(|context| (context, *cache)))
+            .max_by_key(|(context, cache)| (*context, u8::from(*cache == cache_type)))
+    }) {
         let note = if cache != cache_type && context < requested_context {
             format!(
                 "Context reduced from {requested_context} to {context} tokens and the KV cache stored as q8_0 (8-bit) so the whole model stays on the GPU: {:.1} GB of weights plus a {:.1} GB cache fit the {:.1} GB of free GPU memory; the f16 cache would have forced layers onto the CPU. The saved preference is unchanged; a smaller model or quantization allows a larger context.",
@@ -355,18 +374,32 @@ fn fit_to_memory(
             note: Some(note),
         });
     }
+    // Near fit: the weights fit the budget and only the smallest cache does
+    // not, by less than the safety margin. Take the smallest window and keep
+    // the model on the GPU. The hybrid rule below would reserve a quarter of
+    // the GPU for a large cache (21K tokens for a 14B model 70 MB short) and
+    // push weights to the CPU, the slowest plan for a model that nearly fits.
+    let small_cache = if allow_q8 { "q8_0" } else { cache_type };
+    if weights <= gpu_budget
+        && weights.saturating_add(kv_bytes(floor, small_cache)) <= gpu_budget.saturating_add(safety)
+    {
+        return Some(MemoryPlan {
+            context: floor,
+            cache_type: small_cache.to_string(),
+            placement: "gpu",
+            note: Some(format!(
+                "Context reduced from {requested_context} to {floor} tokens with a {small_cache} KV cache: {:.1} GB of weights leave little of the {:.1} GB of free GPU memory, and a larger window would push layers onto the CPU. Closing other GPU-heavy applications before loading allows a larger context.",
+                gb(weights),
+                gb(free)
+            )),
+        });
+    }
     // Hybrid: the weights alone overflow the GPU. Keep the cache small (at
     // most a quarter of the GPU budget, 8-bit when allowed) so the GPU holds
     // as many layers as possible, and check the remainder against RAM.
     let hybrid_cache = if allow_q8 { "q8_0" } else { cache_type };
     let kv_room = gpu_budget / 4;
-    let context = candidates
-        .iter()
-        .filter(|(_, cache)| *cache == hybrid_cache || (!allow_q8 && *cache == cache_type))
-        .map(|(context, _)| *context)
-        .filter(|context| kv_bytes(*context, hybrid_cache) <= kv_room)
-        .max()
-        .unwrap_or(4096);
+    let context = largest(kv_room, hybrid_cache).unwrap_or(floor);
     let gpu_weights = gpu_budget.saturating_sub(kv_bytes(context, hybrid_cache));
     let cpu_weights = weights.saturating_sub(gpu_weights);
     let cpu_share = cpu_weights as f64 / weights.max(1) as f64;
@@ -1095,6 +1128,37 @@ mod tests {
             &crate::settings::RuntimeSettings { kv_cache: "f16".into(), ..tuning.clone() }, Some(card),
         );
         assert_eq!(f16_only.cache_type_k, if policy.cache_type_k == "q8_0" { "q8_0" } else { "f16" });
+        // Another application holding a few hundred MB more: the context
+        // shrinks by what is missing, in 1,024-token steps, instead of
+        // halving from 8K to 4K (which left a coding agent a 4K window).
+        let busier = VramState { used_bytes: 1600 * 1024 * 1024, ..card };
+        let tight = resolve_runtime_policy_fitted(Some(&large), &requested, true, &tuning, Some(busier));
+        assert_eq!(tight.placement, "gpu");
+        assert_eq!(tight.effective_context, 10240, "halving would have given 8192, the old margins 6144");
+        assert_eq!(tight.cache_type_k, "q8_0");
+        // The measured boundary on that card with 1,721 MiB held by other
+        // applications: 11,264 tokens ran fully on the GPU, 12,288 spilled.
+        // The plan must stay inside it and still leave a usable window.
+        let measured = VramState { used_bytes: 1721 * 1024 * 1024, ..card };
+        let plan = resolve_runtime_policy_fitted(Some(&large), &requested, true, &tuning, Some(measured));
+        assert!(plan.effective_context >= 8192 && plan.effective_context <= 11264, "{}", plan.effective_context);
+        assert_eq!(plan.cache_type_k, "q8_0");
+        let bytes = large.weights_bytes.unwrap()
+            + cache_bytes_per_token(196_608, &tight.cache_type_k) * tight.effective_context as u64;
+        assert!(bytes < busier.total_bytes - busier.used_bytes, "fitted plan must be resident");
+        // Other applications holding ~2.4 GB: the weights still fit, only the
+        // smallest cache misses the budget by less than the safety margin.
+        // The model stays on the GPU at the smallest window instead of a
+        // hybrid plan with a large cache that spills layers to the CPU.
+        let near = VramState { used_bytes: 2450 * 1024 * 1024, ..card };
+        let near_fit = resolve_runtime_policy_fitted(Some(&large), &requested, true, &tuning, Some(near));
+        assert_eq!(near_fit.placement, "gpu");
+        assert_eq!(near_fit.effective_context, 4096);
+        assert_eq!(near_fit.cache_type_k, "q8_0");
+        // A saved window below 4K is honoured, not raised.
+        let small_request = InferenceConfig { n_ctx: 2048, ..InferenceConfig::default() };
+        let starved_gpu = VramState { used_bytes: 11000 * 1024 * 1024, ..card };
+        assert!(resolve_runtime_policy_fitted(Some(&large), &small_request, true, &tuning, Some(starved_gpu)).effective_context <= 2048);
         // Manual mode and unknown memory never change the request.
         assert_eq!(resolve_runtime_policy_fitted(Some(&large), &requested, false, &tuning, Some(card)).effective_context, 32768);
         assert_eq!(resolve_runtime_policy_fitted(Some(&large), &requested, true, &tuning, None).effective_context, 32768);

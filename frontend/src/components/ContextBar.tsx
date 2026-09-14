@@ -31,11 +31,12 @@ function ContextDetails({ ctx, onCompact, compacting, heading }: Props & { ctx: 
       {heading !== false && (
         <div className="ctx-headline">
           <strong>{display.pending ? '—' : `${display.estimated ? '≈' : ''}${fmtK(display.tokens!)}`}</strong>
-          <span>of {fmtK(display.limit)} tokens · {display.label.toLowerCase()}{display.pending ? ' preparing…' : ` · ${display.percentLabel}`}</span>
+          <span>of {fmtK(display.room > 0 ? display.room : display.limit)} {display.room > 0 ? 'usable ' : ''}tokens · {display.label.toLowerCase()}{display.pending ? ' preparing…' : ` · ${display.percentLabel}`}</span>
         </div>
       )}
       <div className={`ctx-track${trackTone}`} aria-hidden="true"><i style={{ width: `${display.percent}%` }} /></div>
       {!display.pending && display.health !== 'healthy' && <p className="ctx-note">{healthLabel(display.health)}</p>}
+      <p className="ctx-note">{display.compactAt > 0 ? `Compacts automatically at ${display.compactAt}% of the usable context (the ${fmtK(display.limit)}-token window minus room for the reply). ${agent?.active ? 'A run pauses between steps while it happens, then resumes.' : 'Older messages are summarized before the next reply; the originals stay saved.'}` : 'Automatic compaction is off. Older context is trimmed when the window is full.'}</p>
       {usage ? (
         <section className="ctx-section">
           <div className="ctx-row total"><span>{agent?.active ? 'Agent task input' : 'Last agent task input'}</span><span>{display.estimated ? '≈' : ''}{fmtK(display.tokens!)} tokens</span></div>
@@ -43,6 +44,7 @@ function ContextDetails({ ctx, onCompact, compacting, heading }: Props & { ctx: 
           <div className="ctx-row"><span>Input turns · iteration {agent?.iteration}</span><span>{usage.turns}</span></div>
           <div className="ctx-row"><span>Output budget for this request</span><span>{fmtK(usage.output_reserve)}</span></div>
           {usage.generated_tokens != null && <div className="ctx-row"><span>Reported output tokens</span><span>{fmtK(usage.generated_tokens)}</span></div>}
+          {(usage.compactions ?? 0) > 0 && <div className="ctx-row"><span>Times this run compacted its context</span><span>{usage.compactions}</span></div>}
           {usage.pruned_turns > 0 && <div className="ctx-row"><span>Older turns pruned during this run</span><span>{usage.pruned_turns}</span></div>}
           {usage.context_limit !== ctx.limit && <p className="ctx-note">This recorded request used a {fmtK(usage.context_limit)}-token window, shown in the meter. The currently configured window for new requests is {fmtK(ctx.limit)} tokens.</p>}
           {usage.images > 0 && <p className="ctx-note">{usage.images} image{usage.images === 1 ? '' : 's'} included. Text estimates do not include image token costs.</p>}

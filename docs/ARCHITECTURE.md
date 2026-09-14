@@ -152,7 +152,11 @@ Source of truth: `Local_LLM_PC_Companion_Design.md` (§§1–107).
   free VRAM is re-measured after the old worker exits, the KV cost per token
   comes from the GGUF header (`ModelMetadata::kv_bytes_per_token`), and the
   plan chooses placement `gpu` / `hybrid` / `oversubscribed` / `cpu` with the
-  largest fitting context (halving to 4,096, f16 then q8_0). The resolved
+  largest fitting context in 1,024-token steps (f16 or q8_0, whichever gives
+  more), under a margin of the compute reserve plus max(total/48, 256 MiB)
+  calibrated on a 12 GB card (docs/validation/2026-09-14-stuck-agent-run.md).
+  A model whose weights fit but whose smallest cache misses by less than that
+  margin stays on the GPU at 4,096 tokens rather than a hybrid plan. The resolved
   policy carries `placement` and notes; the policy endpoint reports the plan
   for the next load (VRAM fitting is skipped while a model is running, since
   its own memory would be counted as used). A `model_id` that is not
@@ -196,6 +200,40 @@ Source of truth: `Local_LLM_PC_Companion_Design.md` (§§1–107).
   echoes the received arguments; `edit_file` reports the closest region for a
   missing `old` and the count for an ambiguous one; a missing `path` names the
   last file; rejected completion claims are journaled as `thought` events.
+  An unreadable reply is journaled with the JSON parser's reason and its
+  ending; the retry asks for smaller content only after a real cut-off. JSON
+  repairs also turn `\'` and `` \` `` into plain quotes and keep other stray
+  backslashes literally; offsets are always measured on the original reply.
+- Completion floor (`VerificationState`): a command marks its working folder
+  unobserved until it is listed there (list_directory, `dir`/`ls`, `git
+  status`) or a test/build passes from there or above; writes the host read
+  back byte for byte (`tools::WRITE_VERIFIED`) are confirmed, edits need a
+  read. A tool-free first answer to a change request is sent back once with
+  the tool list. The model check sees neither its earlier verdicts nor more
+  evidence than the window holds; the repeat stop fails a run only when
+  nothing changed between checks, and a check repeating itself after changes
+  ends the run completed with its finding quoted.
+- Tool offer per task: `create_document` only when the task names a document
+  type, `open_path` and window-opening shell commands (`start`, `explorer`,
+  `xdg-open`, `Start-Process`…) only when it asks for something to be opened;
+  otherwise the call is refused with the reason. `open_path` refuses missing
+  paths.
+- Automatic compaction (`settings.memory.auto_compact` automatic|off,
+  `compact_at_pct` 50–98, default 90; legacy "ask" reads as automatic).
+  Agent: checked at the top of each iteration only (never during a reply,
+  tool, approval, check or pending continuation); the run emits a
+  `COMPACTING` status (an active state everywhere via
+  `AgentState::is_active`), the model writes a progress note on its cached
+  transcript, the host appends its action record and outstanding
+  requirements into the task turn, and the latest exchange stays verbatim
+  when it fits under 70% of the room. Applied only when it frees a tenth of
+  the room; repeated only after a sixth of the room of growth. Pruning
+  (`pruning_reserve` = a quarter of the window) is the safety net behind it.
+  Chat: before a reply, saved history at the threshold of
+  `RequestContext::history_room_chars` is folded into the conversation
+  summary in window-sized chunks (`fold_conversation_summary`), keeping what
+  fits in two fifths of the room; the stream shows a `compacting` phase. The
+  context gauge reports usage against the same room.
 - Storage: indexes on every conversation/workspace-keyed table, one query for
   all journals of a conversation, `busy_timeout`.
 - Routing (`request_router`, Code sessions only; Chat never routes): the

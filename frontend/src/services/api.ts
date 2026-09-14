@@ -216,7 +216,11 @@ export interface ContextInfo {
   attachments: { count: number; chars: number };
   breakdown?: { system: number; conversation: number; attachments: number; tools: number; memory: number; output_reserve: number };
   used_with_reserve?: number;
+  /** Saved history as a share of the room a request gives it: the measure automatic compaction uses. */
   usage_pct?: number;
+  history_room_tokens?: number | null;
+  auto_compact?: boolean;
+  compact_at_pct?: number;
   health?: string;
   measurement?: 'saved_history_estimate';
   agent_context?: { run_id: string; iteration: number; active: boolean; usage: AgentContextUsage | null } | null;
@@ -232,6 +236,12 @@ export interface AgentContextUsage {
   pruned_turns: number;
   images: number;
   phase: 'request' | 'response';
+  /** Times this run summarized earlier turns to stay within the window. */
+  compactions?: number;
+  /** Tokens the transcript may occupy; automatic compaction measures against it. */
+  history_room?: number;
+  /** Automatic compaction threshold as a share of history_room; 0 when off. */
+  compact_at_pct?: number;
 }
 
 export async function getContext(conversationId: string): Promise<ContextInfo> {
@@ -388,7 +398,7 @@ export async function streamChat(
     else if (event === 'reasoning') { if (cbs.onReasoning) cbs.onReasoning(data); }
     else if (event === 'status' && cbs.onStatus) cbs.onStatus(data);
     else if (event === 'phase' && cbs.onPhase) {
-      try { const phase = JSON.parse(data); if (['processing','thinking','responding'].includes(phase.phase)) cbs.onPhase(phase); } catch { /* unknown phase leaves the current public status unchanged */ }
+      try { const phase = JSON.parse(data); if (['processing','thinking','responding','compacting'].includes(phase.phase)) cbs.onPhase(phase); } catch { /* unknown phase leaves the current public status unchanged */ }
     }
     else if (event === 'activity' && cbs.onActivity) {
       try { cbs.onActivity(JSON.parse(data)); } catch { /* malformed frames are not execution evidence */ }

@@ -156,26 +156,39 @@ struct StructuredReply {
 /// spreadsheet formula such as `=SUM(C2:C6)` in value position. Text inside
 /// strings is otherwise untouched and structurally broken JSON still fails.
 fn repair_json_strings(body: &str) -> std::borrow::Cow<'_, str> {
-    if !body.contains(['\n', '\r', '\t', ',', '=']) {
+    if !body.contains(['\n', '\r', '\t', ',', '=', '\\']) {
         return std::borrow::Cow::Borrowed(body);
     }
     let mut out = String::with_capacity(body.len() + 16);
     let mut in_string = false;
-    let mut escaped = false;
     let mut changed = false;
     let mut chars = body.chars().peekable();
     while let Some(ch) = chars.next() {
         if in_string {
-            if escaped {
-                escaped = false;
-                out.push(ch);
-                continue;
-            }
             match ch {
-                '\\' => {
-                    escaped = true;
-                    out.push(ch);
-                }
+                '\\' => match chars.peek().copied() {
+                    Some(next @ ('"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' | 'u')) => {
+                        out.push('\\');
+                        out.push(next);
+                        chars.next();
+                    }
+                    // Quotes and backticks escaped for JavaScript or Python,
+                    // which JSON forbids: `querySelector(\'.hero\')` and a
+                    // template literal opened with \` were meant as plain
+                    // delimiters. A rejected page script was exactly this.
+                    Some(next @ ('\'' | '`')) => {
+                        out.push(next);
+                        chars.next();
+                        changed = true;
+                    }
+                    // Any other backslash is one the file needs (a regex, a
+                    // Windows path): keep it literally.
+                    Some(_) => {
+                        out.push_str("\\\\");
+                        changed = true;
+                    }
+                    None => out.push('\\'),
+                },
                 '"' => {
                     in_string = false;
                     out.push(ch);
@@ -336,6 +349,56 @@ fn parse_action_object(body: &str) -> Option<(ToolCall, usize, bool)> {
     ))
 }
 
+/// Parse the action object at the start of `original`, applying the JSON
+/// repairs, and return how many bytes it occupies in `original` itself.
+/// Repairs change lengths (an escaped newline is two bytes where the model
+/// wrote one), so offsets from the repaired copy must never slice the reply:
+/// doing so cut a multi-line file write past its end and crashed the run.
+fn parse_action_object_in(original: &str) -> Option<(ToolCall, usize, bool)> {
+    let repaired = repair_json_strings(original);
+    let (call, consumed, enveloped) = parse_action_object(&repaired)?;
+    let consumed = match repaired {
+        std::borrow::Cow::Borrowed(_) => consumed,
+        std::borrow::Cow::Owned(_) => json_value_end(original)?,
+    };
+    Some((call, consumed, enveloped))
+}
+
+/// Byte offset just past the first top-level JSON object or array in
+/// `text`, matching brackets outside strings. It tolerates exactly the slips
+/// the repairs fix (raw newlines in strings, unquoted formulas, trailing
+/// commas), none of which change bracket structure.
+fn json_value_end(text: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, ch) in text.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' if depth > 0 => in_string = true,
+            '{' | '[' => depth += 1,
+            '}' | ']' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(index + ch.len_utf8());
+                }
+            }
+            c if depth == 0 && !c.is_whitespace() => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
 fn has_action_marker(text: &str) -> bool {
     text.contains("```") || text.contains("<tool_call>") || text.contains("<|tool_call>")
 }
@@ -388,15 +451,15 @@ fn locate_fenced_action(text: &str) -> Option<LocatedAction> {
         };
         let labelled_tool = line.trim().eq_ignore_ascii_case("```tool");
         let body_start = offset;
+        let body = &text[body_start..];
         let candidate = if action_label {
-            let body = repair_json_strings(&text[body_start..]);
-            parse_action_object(&body)
+            parse_action_object_in(body)
                 .filter(|(call, _, enveloped)| labelled_tool || *enveloped || known_tool(&call.name))
-                .map(|(call, consumed, _)| (call, consumed, body.into_owned()))
+                .map(|(call, consumed, _)| (call, consumed))
         } else {
             None
         };
-        let Some((call, consumed, body)) = candidate else {
+        let Some((call, consumed)) = candidate else {
             // An ordinary block: skip to its closing fence and keep scanning.
             if labelled_tool {
                 return None;
@@ -437,8 +500,8 @@ fn locate_tagged_action(text: &str) -> Option<LocatedAction> {
         return None;
     }
     let body_start = start + OPEN.len();
-    let body = repair_json_strings(&text[body_start..]);
-    let (call, consumed, _) = parse_action_object(&body)?;
+    let body = &text[body_start..];
+    let (call, consumed, _) = parse_action_object_in(body)?;
     match action_closing(&body[consumed..], CLOSE) {
         Ok(Some(closing_len)) => Some(LocatedAction {
             call,
@@ -625,12 +688,253 @@ pub fn visible_progress(text: &str) -> String {
     out.trim().chars().take(1200).collect()
 }
 
+/// Output room kept free when fitting history into the window. The action
+/// output cap (4K, or 8K with thinking off) is as large as a whole small
+/// window, and reserving all of it left history no room at all: on a 4K
+/// window every step saw only the rules, the task and its latest exchange,
+/// so the model forgot finished work and repeated it. A quarter of the
+/// window (at least 1,024 tokens) covers a typical action; a request still
+/// uses whatever room is free.
+fn pruning_reserve(n_ctx: u32, output_cap: u32) -> u32 {
+    output_cap.min((n_ctx / 4).max(1024)).min(n_ctx / 2)
+}
+
+/// Tokens the transcript may occupy: the window minus the reply's reserve and
+/// a margin for the character-based estimate.
+fn history_room(n_ctx: u32, reserve: u32) -> u32 {
+    n_ctx.saturating_sub(reserve).saturating_sub(512)
+}
+
+fn estimated_tokens(turns: &[ChatTurn]) -> u32 {
+    crate::agent::AgentContextUsage::for_turns(turns, 0, 0, 0).estimated_tokens
+}
+
+/// Automatic compaction of a run's working transcript.
+struct CompactionPolicy {
+    enabled: bool,
+    threshold_pct: u32,
+}
+
+impl CompactionPolicy {
+    fn from_settings(memory: &crate::settings::MemorySettings) -> Self {
+        Self {
+            enabled: memory.auto_compaction(),
+            threshold_pct: memory.compact_threshold_pct(),
+        }
+    }
+
+    /// The usage percentage when compaction is due: the transcript fills the
+    /// threshold share of the room history may occupy and there are earlier
+    /// turns to summarize. `after_last` is the size the last compaction left:
+    /// until the transcript has grown by a sixth of the room since then, a
+    /// new compaction could only re-summarize the summary. On a 4K window,
+    /// where the instructions alone fill almost half the room, compacting
+    /// every step saved a few hundred tokens each time and cost a model call.
+    fn due(
+        &self,
+        transcript: &[ChatTurn],
+        task_turn_index: usize,
+        room: u32,
+        after_last: Option<u32>,
+    ) -> Option<u32> {
+        if !self.enabled || room == 0 {
+            return None;
+        }
+        let used = estimated_tokens(transcript);
+        let pct = (u64::from(used) * 100 / u64::from(room)) as u32;
+        let compactable = task_turn_index > 1 || transcript.len() > task_turn_index + 2;
+        let grown = after_last.is_none_or(|after| used >= after.saturating_add(room / 6) || pct > 100);
+        (pct >= self.threshold_pct && compactable && grown).then_some(pct)
+    }
+}
+
+/// Characters of `lines`, newest last, that fit `budget` characters; the
+/// count of older lines left out comes first.
+fn recent_lines_within(lines: &[String], budget: usize) -> (usize, Vec<&String>) {
+    let mut used = 0usize;
+    let mut kept: Vec<&String> = Vec::new();
+    for line in lines.iter().rev() {
+        used += line.len() + 3;
+        if used > budget && !kept.is_empty() {
+            break;
+        }
+        kept.push(line);
+    }
+    kept.reverse();
+    (lines.len() - kept.len(), kept)
+}
+
+/// How host messages that relay a completion check begin; the check itself
+/// is never shown them (see `review_completion`).
+const REVIEW_FINDING_PREFIX: &str = "Completion review found remaining work:";
+const REVIEW_UNAVAILABLE_PREFIX: &str = "The completion check could not confirm the result";
+
+const COMPACTION_INSTRUCTION: &str ="Pause the task for a moment. The earlier turns of this conversation are about to be removed to fit your context window, and a note you write now will replace them. Write that note for yourself: what you have done so far (name every file you created or changed and every command you ran with its result), what you found or decided, what is still missing, and your next step. At most 150 words in plain sentences or bullets. Do not call tools and do not continue the task in this reply.";
+
+struct CompactionOutcome {
+    summarized_turns: usize,
+    tokens_before: u32,
+    tokens_after: u32,
+    model_note: bool,
+}
+
+/// One line per completed state-changing action, for the record kept across
+/// compaction. Reads, listings and searches are left to the progress note.
+fn work_log_entry(call: &ToolCall, output: &str, failed: bool) -> Option<String> {
+    let path = arg_str(call, "path").unwrap_or("");
+    let first_line = |text: &str| -> String {
+        text.lines()
+            .find(|line| !line.trim().is_empty() && !line.starts_with("(tool"))
+            .unwrap_or("")
+            .chars()
+            .take(160)
+            .collect()
+    };
+    let entry = match (call.name.as_str(), failed) {
+        ("execute_command", _) => {
+            let command: String = arg_str(call, "command").unwrap_or("").chars().take(120).collect();
+            let cwd = arg_str(call, "cwd").unwrap_or(".");
+            match command_exit_code(output) {
+                Some(code) => format!("ran `{command}` in {cwd}: exit code {code}"),
+                None => format!("ran `{command}` in {cwd}: {}", first_line(output)),
+            }
+        }
+        ("write_file", false) => first_line(output),
+        ("edit_file", false) => format!("edited {path}"),
+        ("delete_file", false) => format!("deleted {path}"),
+        ("create_document", false) => format!(
+            "saved document {} to the Artifacts panel",
+            arg_str(call, "filename").unwrap_or("")
+        ),
+        ("git_commit", false) => format!("committed: {}", arg_str(call, "message").unwrap_or("")),
+        ("write_file" | "edit_file" | "delete_file" | "create_document" | "git_commit", true) => {
+            format!("{} {path} failed: {}", call.name, first_line(output))
+        }
+        _ => return None,
+    };
+    (!entry.trim().is_empty()).then_some(entry)
+}
+
+/// Summarize the earlier turns of a run into the task turn, between steps.
+/// The model writes a progress note from the transcript it already has in
+/// its cache; the host adds the exact record of completed actions and what
+/// completion still requires, so a weak or failed note loses nothing that
+/// matters. The latest exchange stays verbatim when it is small, because the
+/// next step often depends on it (a file just read).
+#[allow(clippy::too_many_arguments)]
+async fn compact_run_transcript(
+    client: &SidecarClient,
+    cfg: &crate::inference::InferenceConfig,
+    transcript: &mut Vec<ChatTurn>,
+    task_turn_index: &mut usize,
+    original_task: &str,
+    work_log: &[String],
+    still_required: &[String],
+    room: u32,
+) -> CompactionOutcome {
+    let tokens_before = estimated_tokens(transcript);
+    let unchanged = CompactionOutcome {
+        summarized_turns: 0,
+        tokens_before,
+        tokens_after: tokens_before,
+        model_note: false,
+    };
+    // The note and the record together stay within about a quarter of the
+    // room, so compaction lands well under the threshold on any window.
+    let note_tokens = (room / 10).clamp(96, 400);
+    let record_chars = (room as usize / 8 * 4).max(600);
+    // What survives any compaction: the instructions and the original task.
+    let fixed = estimated_tokens(&[
+        transcript[0].clone(),
+        ChatTurn::text("user", original_task),
+    ]);
+    let expected_block = note_tokens + (record_chars / 4) as u32 + 120;
+    let tail_start = transcript.len().saturating_sub(2).max(*task_turn_index + 1);
+    // Keep the latest exchange (the next step often depends on it, such as a
+    // file just read) only while the result still lands under 70% of room.
+    let keep_tail = transcript.len() >= *task_turn_index + 3
+        && transcript[tail_start].role == "assistant"
+        && fixed + expected_block + estimated_tokens(&transcript[tail_start..]) <= room * 7 / 10;
+    let summarize_end = if keep_tail { tail_start } else { transcript.len() };
+    let summarized_turns =
+        (*task_turn_index - 1) + summarize_end.saturating_sub(*task_turn_index + 1);
+    if summarized_turns == 0 {
+        return unchanged;
+    }
+
+    let mut request = transcript.clone();
+    request.push(ChatTurn::text("user", COMPACTION_INSTRUCTION));
+    let input = estimated_tokens(&request);
+    let max_tokens = note_tokens.min(cfg.n_ctx.saturating_sub(input.saturating_add(256)));
+    let note = if max_tokens >= 96 {
+        match client.chat_turns_without_reasoning(&request, max_tokens, cfg).await {
+            // A small model may still emit an action: keep only its prose.
+            Ok((text, _)) => Some(visible_progress(&text)).filter(|note| !note.trim().is_empty()),
+            Err(error) => {
+                tracing::warn!("compaction note request failed: {error}; using the host record only");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut block = format!(
+        "[Context compacted between steps: {summarized_turns} earlier turn(s) of this conversation were replaced by this note to fit the model's context window. Files on disk and completed actions are unchanged.]"
+    );
+    if let Some(note) = &note {
+        let note: String = note.trim().chars().take(note_tokens as usize * 5).collect();
+        block.push_str(&format!("\nProgress note written before compaction:\n{note}"));
+    }
+    if !work_log.is_empty() {
+        block.push_str("\nActions completed in this run (recorded by the host):");
+        let (skipped, recent) = recent_lines_within(work_log, record_chars);
+        if skipped > 0 {
+            block.push_str(&format!("\n- ({skipped} older actions not listed)"));
+        }
+        for entry in recent {
+            block.push_str(&format!("\n- {entry}"));
+        }
+    }
+    for requirement in still_required {
+        let requirement: String = requirement.chars().take(400).collect();
+        block.push_str(&format!("\n{requirement}"));
+    }
+    block.push_str("\nContinue the task from here and do not redo completed actions.");
+
+    let kept_tail: Vec<ChatTurn> = transcript[summarize_end..].to_vec();
+    let mut compacted = vec![transcript[0].clone()];
+    let mut task = transcript[*task_turn_index].clone();
+    task.content = format!("{original_task}\n\n{block}");
+    compacted.push(task);
+    compacted.extend(kept_tail);
+    let tokens_after = estimated_tokens(&compacted);
+    // A compaction that frees less than a tenth of the room is not worth the
+    // lost detail: keep the transcript as it was and let pruning act if the
+    // window is actually full.
+    if tokens_after.saturating_add(room / 10) > tokens_before {
+        return CompactionOutcome {
+            model_note: note.is_some(),
+            ..unchanged
+        };
+    }
+    *transcript = compacted;
+    *task_turn_index = 1;
+    CompactionOutcome {
+        summarized_turns,
+        tokens_before,
+        tokens_after,
+        model_note: note.is_some(),
+    }
+}
+
 /// Keep the next request inside the context window. Old tool results are the
 /// bulk of an agent transcript, so their bodies are released first (the call
 /// line and a note remain; the journal keeps the full text). Only then are
 /// whole turns dropped, oldest first: saved history before the task, then the
 /// oldest exchanges after it. The system prompt, the task and the latest
 /// exchange are never touched. Returns the number of turns condensed or removed.
+/// With automatic compaction on this is only the safety net behind it.
 fn prune_transcript(
     transcript: &mut Vec<ChatTurn>,
     task_turn_index: &mut usize,
@@ -692,11 +996,59 @@ pub fn system_prompt(
     workspace: &str,
     tools: &[crate::tools::ToolDescriptor],
     search_enabled: bool,
+    documents_enabled: bool,
+) -> String {
+    system_prompt_for(workspace, tools, search_enabled, documents_enabled, false)
+}
+
+/// Shell commands whose purpose is to open a window (a file in its default
+/// app, a browser, a folder in Explorer). A model ran `start index.html` to
+/// "verify animations" once open_path was withheld.
+pub fn launches_window(command: &str) -> bool {
+    let command = command.trim().to_lowercase();
+    let first = command.split_whitespace().next().unwrap_or("");
+    matches!(
+        first,
+        "start" | "explorer" | "explorer.exe" | "xdg-open" | "open" | "invoke-item" | "ii"
+            | "start-process" | "saps" | "gio" | "wslview" | "rundll32"
+    ) || command.starts_with("cmd /c start")
+        || command.starts_with("cmd.exe /c start")
+        || command.contains("start-process ")
+        || command.starts_with("powershell start")
+        || command.starts_with("pwsh start")
+}
+
+/// Whether the task asks for something to be opened for the user.
+pub fn opening_requested(task: &str) -> bool {
+    let task = task.to_lowercase();
+    ["open ", "open it", "open the", "launch", "preview", "show it in", "in my browser", "in the browser", "in a browser", "reveal"]
+        .iter()
+        .any(|phrase| task.contains(phrase))
+}
+
+pub fn system_prompt_for(
+    workspace: &str,
+    tools: &[crate::tools::ToolDescriptor],
+    search_enabled: bool,
+    documents_enabled: bool,
+    opening_enabled: bool,
 ) -> String {
     let mut tool_docs = String::new();
     for t in tools {
         if t.name == "web_search" && !search_enabled {
             continue; // never advertise what the run may not use (§117)
+        }
+        // Documents go to the chat's Artifacts panel, not the project. Offered
+        // to a coding task, a model used it to "create a project" as a zip and
+        // to park the site's copy in a text file instead of the page.
+        if t.name == "create_document" && !documents_enabled {
+            continue;
+        }
+        // Opening files pops windows over the user's desktop and tells the
+        // model nothing: it called open_path to "verify animations in the
+        // browser". Offered only when the user asked for something opened.
+        if t.name == "open_path" && !opening_enabled {
+            continue;
         }
         tool_docs.push_str(&format!("- {} ({:?}): {}\n", t.name, t.risk, t.description));
         let args = match t.name {
@@ -745,7 +1097,7 @@ pub fn system_prompt(
          5. Never invent file contents you have not read; never redo a failed identical call.\n\
          6. For build, fix, or change requests, use the tools and complete the work; do not stop at a plan or paste code for the user to apply.\n\
          7. Permission prompts are handled by the host. Do not ask how to proceed when a relevant tool can advance the task.\n\
-         8. After changing files, inspect the resulting project and run the most relevant tests, build, or validation available before finishing.\n\
+         8. After changing files, inspect the resulting project and run the most relevant tests, build, or validation available before finishing. Opening a file or a browser shows you nothing: check by reading files, listing folders or running the project's tests.\n\
          9. Each turn must EITHER emit exactly one tool call OR, only when the task is done or impossible, give the final summary with NO tool block.\n\
          10. Conversation history defines follow-up references such as 'this project', 'those tasks', and 'it'. If the workspace contains multiple sibling projects and history identifies one of them, confine searches and reads to that project. Do not inspect unrelated sibling projects merely because they are present.\n",
         os = std::env::consts::OS,
@@ -1045,7 +1397,15 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
         AgentMode::CodeAssist => format!("Inspect the project using read-only tools and answer this exact request from evidence in the project. This is an inspection, not a request for an implementation plan. Resolve follow-up references from the preceding conversation and do not inspect unrelated sibling projects. Request: {}", spec.task),
         _ => spec.task.clone(),
     };
-    let mut prompt = system_prompt(&ws_key, &crate::tools::registry(), spec.search_enabled);
+    let documents_enabled = crate::documents::requested_document_kind(&spec.task).is_some();
+    let opening_enabled = opening_requested(&spec.task);
+    let mut prompt = system_prompt_for(
+        &ws_key,
+        &crate::tools::registry(),
+        spec.search_enabled,
+        documents_enabled,
+        opening_enabled,
+    );
     if matches!(spec.mode, AgentMode::Plan | AgentMode::CodeAssist) {
         prompt.push_str("\nThis run is READ ONLY. Only safe inspection tools are permitted. Do not write, edit, delete, create documents, execute commands or change Git state. Finish with findings or a plan, not implementation.");
     }
@@ -1092,6 +1452,12 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
             ),
         ));
     let mut task_turn_index = transcript.len() - 1;
+    let original_task = transcript[task_turn_index].content.clone();
+    let compaction = CompactionPolicy::from_settings(&state.settings.read().await.memory);
+    let compaction_pct = if compaction.enabled { compaction.threshold_pct } else { 0 };
+    let mut work_log: Vec<String> = Vec::new();
+    let mut compactions = 0u32;
+    let mut tokens_after_last_compaction: Option<u32> = None;
     // Six consecutive non-successful steps end the run. Each failure carries a
     // specific correction (received args, closest matching text), and a model
     // often needs two or three of them to converge; identical loops and the
@@ -1106,6 +1472,9 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
     let mut completion_reviews = 0u32;
     let mut last_review_reason = String::new();
     let mut repeated_review = 0u32;
+    let mut repeated_despite_changes = 0u32;
+    let mut actions_since_review = 0u32;
+    let mut no_action_pushback_used = false;
     let mut verification = VerificationState::for_task(&spec.task);
     let mut failed_calls = FailedCalls::default();
     let mut pruned_turns = 0u32;
@@ -1120,15 +1489,98 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
             ));
             return S::Cancelled;
         }
+        let reserve = pruning_reserve(cfg.n_ctx, response_policy.output_cap());
+        let room = history_room(cfg.n_ctx, reserve);
+        // Automatic compaction happens here and only here: between steps,
+        // once the previous action and its result are recorded, with no model
+        // reply, tool, approval or completion check in flight. A partial
+        // reply awaiting its continuation is a step still in progress.
+        if pending_continuation.is_none() {
+            if let Some(pct) =
+                compaction.due(&transcript, task_turn_index, room, tokens_after_last_compaction)
+            {
+                run.emit(AgentEvent::activity(
+                    "status",
+                    S::Compacting,
+                    format!(
+                        "Compacting context: {pct}% of the usable context is in use (automatic compaction starts at {}%). The run is paused and resumes as soon as the summary is ready…",
+                        compaction.threshold_pct
+                    ),
+                    it,
+                ));
+                let mut still_required = Vec::new();
+                if verification.needs_evidence() {
+                    still_required.push(format!(
+                        "Still required before finishing: {}",
+                        verification.remaining()
+                    ));
+                }
+                if !last_review_reason.is_empty() {
+                    still_required.push(format!(
+                        "The latest completion check found remaining work: {last_review_reason}"
+                    ));
+                }
+                let outcome = compact_run_transcript(
+                    &client,
+                    &cfg,
+                    &mut transcript,
+                    &mut task_turn_index,
+                    &original_task,
+                    &work_log,
+                    &still_required,
+                    room,
+                )
+                .await;
+                // Also after a compaction that was not worth applying: the
+                // next attempt waits until the transcript has grown again.
+                tokens_after_last_compaction = Some(outcome.tokens_after);
+                if outcome.summarized_turns > 0 {
+                    compactions += 1;
+                    run.emit(AgentEvent::activity(
+                        "status",
+                        S::Planning,
+                        format!(
+                            "Context compacted: {} earlier turn(s) summarized, about {} → {} tokens ({}). Resuming the task.",
+                            outcome.summarized_turns,
+                            outcome.tokens_before,
+                            outcome.tokens_after,
+                            if outcome.model_note {
+                                "the model's progress note plus the host's record of completed actions"
+                            } else {
+                                "the host's record of completed actions; the model's note was unavailable"
+                            }
+                        ),
+                        it,
+                    ));
+                    run.emit(AgentEvent::context(
+                        S::Planning,
+                        it,
+                        crate::agent::AgentContextUsage::for_turns(
+                            &transcript,
+                            cfg.n_ctx,
+                            reserve,
+                            pruned_turns,
+                        )
+                        .with_compaction(compactions, room, compaction_pct),
+                    ));
+                } else {
+                    run.emit(AgentEvent::activity(
+                        "status",
+                        S::Planning,
+                        "Compaction would not free enough context to be worth it; resuming with the current context.".into(),
+                        it,
+                    ));
+                }
+                if run.cancel.is_cancelled() {
+                    run.emit(AgentEvent::new(S::Cancelled, "Cancelled by user.".into(), it));
+                    return S::Cancelled;
+                }
+            }
+        }
         // Keep the transcript inside the context window (§21): release old
         // tool-result bodies first, drop whole turns only when that is not
         // enough. The full outputs stay in the journal.
-        pruned_turns += prune_transcript(
-            &mut transcript,
-            &mut task_turn_index,
-            cfg.n_ctx,
-            response_policy.output_cap(),
-        );
+        pruned_turns += prune_transcript(&mut transcript, &mut task_turn_index, cfg.n_ctx, reserve);
         if !state.llama.write().await.is_running() {
             run.emit(AgentEvent::activity("error", S::Failed,
                 "The model runtime stopped. Completed actions and existing file changes were kept. Load a model before continuing.".into(), it));
@@ -1176,7 +1628,8 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
             cfg.n_ctx,
             output_budget,
             pruned_turns,
-        );
+        )
+        .with_compaction(compactions, room, compaction_pct);
         run.emit(AgentEvent::context(S::Planning, it, input_context.clone()));
         // Stream the action: partial text reaches live subscribers as it is
         // produced, and a complete action releases the runtime immediately.
@@ -1282,16 +1735,43 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
             } else {
                 "Retrying with a format reminder and native thinking disabled for this run"
             };
-            // Journal what could not be read so the failure is diagnosable
-            // from the activity view, not only from a debugger.
-            let excerpt: String = reply.trim().chars().take(900).collect();
+            // Journal what could not be read, why, and how it ended, so the
+            // failure is diagnosable from the activity view. The head alone
+            // hid the cause of a rejected file write in a real run.
+            let trimmed = reply.trim();
+            let total_chars = trimmed.chars().count();
+            let head: String = trimmed.chars().take(900).collect();
+            let tail: String = if total_chars > 1300 {
+                let skip = total_chars - 400;
+                format!("\n[… {} characters …]\n{}", skip - 900, trimmed.chars().skip(skip).collect::<String>())
+            } else {
+                trimmed.chars().skip(900).collect()
+            };
+            let problem = action_problem(&reply);
             run.emit(AgentEvent::activity("status", S::Planning,
-                format!("{reason} {strategy}, with up to {retry_budget} output tokens. Incomplete actions are discarded.{}",
-                    if excerpt.is_empty() { String::new() } else { format!("\n\nUnreadable response (excerpt):\n{excerpt}") }), it));
-            transcript.push(ChatTurn::text(
-                "user",
-                "Your previous response was empty, cut off, or invalid; no action from it was executed. Return exactly one complete tool envelope as shown in the system example, with a name and object args and its closing fence. Keep file contents short: create one small file or make one small edit per turn. Escape quotes and newlines INSIDE JSON string values only; outer JSON keys must use ordinary quotes. If finished, return a brief final answer instead. Do not repeat an unfinished payload or output multiple actions.",
-            ));
+                format!("{reason} {strategy}, with up to {retry_budget} output tokens. Incomplete actions are discarded.{}{}",
+                    problem.as_ref().map(|problem| format!("\nWhy it could not be read: {problem}")).unwrap_or_default(),
+                    if head.is_empty() { String::new() } else { format!("\n\nUnreadable response ({total_chars} characters):\n{head}{tail}") }), it));
+            // Say what actually went wrong. Asking for shorter content after a
+            // mere escaping slip made a model replace a real animation script
+            // with a one-line alert; that advice is for a cut-off reply only.
+            let cut_off = completion.is_truncated();
+            let mut correction = String::from(if cut_off {
+                "Your previous response was cut off by the output limit; no action from it was executed."
+            } else {
+                "Your previous response was empty or could not be read; no action from it was executed."
+            });
+            if let Some(problem) = &problem {
+                correction.push_str(&format!(" The JSON parser reported: {problem}. Inside a JSON string a backslash may only precede \" \\ / b f n r t or u; write ' and ` without a backslash."));
+            }
+            correction.push_str(" Return exactly one complete tool envelope as shown in the system example, with a name and object args and its closing fence; outer JSON keys use ordinary quotes.");
+            if cut_off {
+                correction.push_str(" Keep this action smaller: write one file at a time, or split a long file into a first part and an edit that adds the rest.");
+            } else {
+                correction.push_str(" Send the same action again with its complete content, corrected; do not shorten or simplify the content because of the error.");
+            }
+            correction.push_str(" If the work is finished, return a brief final answer instead. Output one action only.");
+            transcript.push(ChatTurn::text("user", correction));
             continue;
         }
         // Failed/truncated payloads never pollute the subsequent transcript.
@@ -1316,6 +1796,26 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
                 persist_final(&state, &run, &reply).await;
                 run.emit(AgentEvent::activity("final", S::Completed, reply, it));
                 return S::Completed;
+            }
+            // A change request answered without a single action is not done.
+            // A 14B model replied "I am unable to create projects" to a
+            // request to build a website, and its own completion check
+            // accepted that as an honest explanation. Once per run, say what
+            // it can do and send it back to work; a second tool-free answer
+            // goes to the normal check.
+            if tool_evidence.is_empty() && !no_action_pushback_used {
+                no_action_pushback_used = true;
+                run.emit(AgentEvent::activity(
+                    "status",
+                    S::Planning,
+                    "No action has been taken yet for this change request. Reminding the model which tools it has and continuing…".into(),
+                    it,
+                ));
+                transcript.push(ChatTurn::text(
+                    "user",
+                    "No action has been taken in this run, and this request asks for work in the workspace. You can create folders and files with write_file (a new path creates its folders), change files with edit_file, and run commands with execute_command. Start the work now with one tool call. Only if something specific truly blocks it, name that blocker instead.",
+                ));
+                continue;
             }
             // A tool-free answer is only a candidate completion. Coding models,
             // especially smaller local ones, often summarize after producing a
@@ -1343,15 +1843,24 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
                 CompletionReview::Continue(reason) => {
                     completion_reviews += 1;
                     let reason = reason.trim().chars().take(600).collect::<String>();
-                    // The same shortfall three times means the model cannot
-                    // act on it: stop with the shortfall named rather than
-                    // re-producing the same result until the step limit.
+                    // The same finding again means one of two things. With no
+                    // change in between, the model cannot act on it: stop with
+                    // the finding named. With changes in between, the checker
+                    // is the one repeating itself (it once quoted a missing
+                    // hype line three times while the page already had one):
+                    // finish, and leave the finding in the answer for the user.
                     if reason == last_review_reason {
-                        repeated_review += 1;
+                        if actions_since_review == 0 {
+                            repeated_review += 1;
+                        } else {
+                            repeated_despite_changes += 1;
+                        }
                     } else {
                         repeated_review = 0;
+                        repeated_despite_changes = 0;
                         last_review_reason = reason.clone();
                     }
+                    actions_since_review = 0;
                     if repeated_review >= 2 {
                         let final_message = format!(
                             "I produced the same result three times without addressing what the check found, so I stopped. Remaining work: {reason}. Existing files were kept."
@@ -1359,6 +1868,15 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
                         persist_final(&state, &run, &final_message).await;
                         run.emit(AgentEvent::activity("error", S::Failed, final_message, it));
                         return S::Failed;
+                    }
+                    if repeated_despite_changes >= 2 {
+                        let final_message = format!(
+                            "{}\n\nNote: my completion check kept reporting \"{reason}\" even after the files were changed to address it, so it may be mistaken. Please review the result.",
+                            reply.trim()
+                        );
+                        persist_final(&state, &run, &final_message).await;
+                        run.emit(AgentEvent::activity("final", S::Completed, final_message, it));
+                        return S::Completed;
                     }
                     run.emit(AgentEvent::activity(
                         "status",
@@ -1433,6 +1951,32 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
                 format!("Unknown tool '{}'; asked model to correct.", call.name),
                 it,
             ));
+            continue;
+        }
+        let unavailable = match call.name.as_str() {
+            "create_document" if !documents_enabled => Some("create_document is not available for this task. It saves a standalone document (report, spreadsheet, slides) to the chat's Artifacts panel, outside the project. Create project files, including any text the page should show, with write_file."),
+            "open_path" if !opening_enabled => Some("open_path is not available for this task: the user did not ask for anything to be opened, and opening a file shows you nothing. Check your work by reading files, listing folders or running the project's tests or build."),
+            "execute_command"
+                if !opening_enabled && launches_window(arg_str(&call, "command").unwrap_or("")) =>
+            {
+                Some("This command opens a window on the user's desktop (a browser, Explorer or another app), and the user did not ask for anything to be opened; it was not run. Opening something shows you nothing. Check your work by reading files, listing folders or running the project's tests or build.")
+            }
+            _ => None,
+        };
+        if let Some(message) = unavailable {
+            // The reply itself is already in the transcript; add the refusal.
+            transcript.push(ChatTurn::text("user", format!("Result of {}:\n(tool error, do not retry identically)\n{message}", call.name)));
+            run.emit(AgentEvent::tool_activity(
+                "tool_error",
+                S::Observing,
+                format!("Action failed: {}", call.name),
+                it,
+                call.name.clone(),
+                call.args.clone(),
+                Some(message.into()),
+                None,
+            ));
+            let _ = progress_guard.observe_tool_result(&call.name, &call.args, message, false);
             continue;
         }
         let risk = crate::tools::risk_of(&call.name);
@@ -1595,22 +2139,16 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
         }
         let shown: String = output.chars().take(TOOL_OUTPUT_CHARS).collect();
         let tool_failed = tool_output_failed(&output);
-        // A re-rendered document gets a fresh artifact id but is the same
-        // result when its arguments are the same: judge repeats without the id.
-        let observed_output = if call.name == "create_document" {
-            output
-                .split_once(": ")
-                .map(|(_, rest)| rest.to_owned())
-                .unwrap_or_else(|| output.clone())
-        } else {
-            output.clone()
-        };
-        let observation = progress_guard.observe_tool_result(
-            &call.name,
-            &call.args,
-            &observed_output,
-            !tool_failed,
-        );
+        if let Some(entry) = work_log_entry(&call, &output, tool_failed) {
+            work_log.push(entry);
+            if !tool_failed {
+                actions_since_review += 1;
+            }
+        }
+        // Document results carry no artifact id, so an identical re-render
+        // reads as an identical result and the repeat guard can see it.
+        let observation =
+            progress_guard.observe_tool_result(&call.name, &call.args, &output, !tool_failed);
         if observation.is_progress() {
             response_policy.useful_progress();
             completion_reviews = 0;
@@ -1717,13 +2255,38 @@ async fn review_completion(
     task: &str,
     evidence: &[String],
 ) -> CompletionReview {
+    // The check rides on the transcript, so its evidence gets only the room
+    // the window has left: twenty 400-character lines on top of a 2K-token
+    // transcript overflowed a 4K window and the check always failed.
+    let spare_tokens = cfg
+        .n_ctx
+        .saturating_sub(estimated_tokens(transcript))
+        .saturating_sub(220 + 256 + 400);
+    let evidence_chars = (spare_tokens as usize * 3).min(8_000);
     let evidence = if evidence.is_empty() {
         "No tools were used.".to_string()
     } else {
-        evidence.join("\n")
+        let (omitted, recent) = recent_lines_within(evidence, evidence_chars);
+        let mut text = recent.into_iter().cloned().collect::<Vec<_>>().join("\n");
+        if omitted > 0 {
+            text = format!("({omitted} earlier actions omitted to fit the context window)\n{text}");
+        }
+        text
     };
+    // The check must judge the work, not repeat its earlier verdicts: with
+    // them in view it quoted the same missing item after it was fixed.
+    let transcript: Vec<ChatTurn> = transcript
+        .iter()
+        .filter(|turn| {
+            !(turn.role == "user"
+                && (turn.content.starts_with(REVIEW_FINDING_PREFIX)
+                    || turn.content.starts_with(REVIEW_UNAVAILABLE_PREFIX)))
+        })
+        .cloned()
+        .collect();
+    let transcript = transcript.as_slice();
     let instruction = format!(
-        "Stop and act as a strict completion checker for your own work above. Compare the original task with your candidate final answer and the recorded tool evidence. Do not assume files exist unless the evidence shows them. For change requests, require all requested deliverables plus a post-change inspection, test, build, or other relevant validation. If the task is fully complete or genuinely impossible with an honest explanation, reply exactly COMPLETE. Otherwise reply CONTINUE: followed by one concise description of the missing work. Reply with that decision only.\n\nOriginal task:\n{task}\n\nTool evidence:\n{evidence}"
+        "Stop and act as a strict completion checker for your own work above. When a file was written or edited more than once, judge only its latest version. Compare the original task with your candidate final answer and the recorded tool evidence. Do not assume files exist unless the evidence shows them. For change requests, require all requested deliverables plus a post-change inspection, test, build, or other relevant validation. Check every explicit requirement of the task (for example each feature, section, style, interaction or animation it names) against what the written content actually contains: a placeholder, a stub or a single alert does not implement a requirement. The agent can create folders and files, edit files and run commands in this workspace, so a claim that it cannot is not an honest explanation. If the task is fully complete or genuinely impossible for a specific stated reason, reply exactly COMPLETE. Otherwise reply CONTINUE: followed by one concise description of the missing work. Reply with that decision only.\n\nOriginal task:\n{task}\n\nTool evidence:\n{evidence}"
     );
     let mut turns = transcript.to_vec();
     turns.push(ChatTurn::text("user", instruction));
@@ -1826,11 +2389,24 @@ fn read_only_command(command: &str) -> bool {
     ) || matches!(words.as_slice(), [git, sub, ..] if git == "git" && matches!(sub.as_str(), "status" | "diff" | "log" | "show"))
 }
 
+/// What the host must see before a completion claim is even reviewed. It asks
+/// only for evidence every project can produce: a look at what changed, or
+/// the project's own tests or build when it has them. An earlier version
+/// demanded a recognised test or build after any shell command, which a new
+/// folder, a static website or a script task never has: `mkdir` alone made
+/// such runs unfinishable.
 #[derive(Default)]
 struct VerificationState {
-    /// A later mutation re-inserts its path: older reads cannot verify a new revision.
+    /// Files whose latest revision nothing has confirmed. A later mutation
+    /// re-inserts its path: older reads cannot verify a new revision.
     uninspected: HashSet<PathBuf>,
-    unknown_shell_changes: bool,
+    /// Folders a command ran in whose effects the host cannot see (scripts,
+    /// package managers, generators, mkdir). Each needs one look afterwards:
+    /// a listing of that folder (or a read-only listing or git command run
+    /// there), or tests or a build passing from that folder or above.
+    unobserved_dirs: HashSet<PathBuf>,
+    /// How the model named each tracked path, for the remaining-work message.
+    labels: HashMap<PathBuf, String>,
     /// The file type the task explicitly asked for (presentation, spreadsheet,
     /// PDF…): only a produced file fulfils it, never its content in the chat.
     document_kind: Option<&'static str>,
@@ -1847,8 +2423,21 @@ impl VerificationState {
 
     fn needs_evidence(&self) -> bool {
         !self.uninspected.is_empty()
-            || self.unknown_shell_changes
+            || !self.unobserved_dirs.is_empty()
             || (self.document_kind.is_some() && !self.document_created)
+    }
+
+    fn label(&self, path: &Path) -> String {
+        let label = self
+            .labels
+            .get(path)
+            .cloned()
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        if label == "." || label.is_empty() {
+            "\".\" (the workspace root)".into()
+        } else {
+            format!("\"{label}\"")
+        }
     }
 
     fn remaining(&self) -> String {
@@ -1857,11 +2446,32 @@ impl VerificationState {
                 "The task asks for a {kind} file and none has been produced: writing its content into the chat is not the deliverable. Create it now with one create_document call (filename ending in .{kind}, complete content in the spec), then report the result."
             );
         }
-        if self.unknown_shell_changes {
-            "A command may have changed the project. Run a relevant test, build or validation and report its real result; a directory listing or unrelated read is not verification.".into()
-        } else {
-            format!("Inspect the latest contents of the files you changed ({}), or run a relevant test/build. Do not call a read a passing test.", self.uninspected.iter().map(|path| path.to_string_lossy()).collect::<Vec<_>>().join(", "))
+        let mut steps = Vec::new();
+        if !self.unobserved_dirs.is_empty() {
+            let mut dirs: Vec<String> = self.unobserved_dirs.iter().map(|dir| self.label(dir)).collect();
+            dirs.sort();
+            steps.push(format!(
+                "list {} with list_directory to see what your commands left there",
+                dirs.join(" and ")
+            ));
         }
+        if !self.uninspected.is_empty() {
+            let mut files: Vec<String> = self.uninspected.iter().map(|file| self.label(file)).collect();
+            files.sort();
+            steps.push(format!(
+                "read the changed part of {} with read_file to confirm the result",
+                files.join(", ")
+            ));
+        }
+        format!(
+            "Before finishing, {}. If the project has tests or a build, running them successfully also counts. Report what you saw; a listing or a read is not a passing test.",
+            steps.join(", and ")
+        )
+    }
+
+    /// A listing of `dir` shows what commands that ran there left behind.
+    fn observe_listing(&mut self, dir: &Path) {
+        self.unobserved_dirs.remove(dir);
     }
 
     fn observe(
@@ -1873,20 +2483,31 @@ impl VerificationState {
     ) {
         if call.name == "execute_command" {
             let command = arg_str(call, "command").unwrap_or_default();
+            let cwd_label = arg_str(call, "cwd").unwrap_or(".");
+            let Ok(cwd) = ws.resolve(cwd_label) else {
+                return;
+            };
             if verification_command(command) {
                 // The full host-produced result includes its real process exit.
                 // Failed validation cannot discharge earlier mutation evidence.
                 if !failed && command_exit_code(output) == Some(0) {
-                    if let Ok(cwd) = ws.resolve(arg_str(call, "cwd").unwrap_or(".")) {
-                        self.uninspected.retain(|path| !path.starts_with(&cwd));
-                        if ws.resolve(".").ok().as_ref() == Some(&cwd) {
-                            self.unknown_shell_changes = false;
-                        }
+                    self.uninspected.retain(|path| !path.starts_with(&cwd));
+                    self.unobserved_dirs.retain(|dir| !dir.starts_with(&cwd));
+                }
+            } else if read_only_command(command) {
+                if !failed {
+                    if let Some(listed) = listing_target(command, cwd_label, ws) {
+                        self.observe_listing(&listed);
+                    }
+                    if git_overview_command(command) {
+                        // git status/diff report changes anywhere below.
+                        self.unobserved_dirs.retain(|dir| !dir.starts_with(&cwd));
                     }
                 }
-            } else if !read_only_command(command) {
+            } else {
                 // A command may partially mutate files even with nonzero exit.
-                self.unknown_shell_changes = true;
+                self.labels.entry(cwd.clone()).or_insert_with(|| cwd_label.to_string());
+                self.unobserved_dirs.insert(cwd);
             }
             return;
         }
@@ -1897,17 +2518,27 @@ impl VerificationState {
             self.document_created = true;
             return;
         }
-        let path = arg_str(call, "path").and_then(|path| ws.resolve(path).ok());
+        let path_label = arg_str(call, "path");
+        let path = path_label.and_then(|path| ws.resolve(path).ok());
+        if let (Some(path), Some(label)) = (&path, path_label) {
+            self.labels.entry(path.clone()).or_insert_with(|| label.to_string());
+        }
         match call.name.as_str() {
             "write_file" | "edit_file" => {
                 // A file written with the requested extension is the deliverable too.
-                if let (Some(kind), Some(path)) = (self.document_kind, arg_str(call, "path")) {
-                    if path.to_ascii_lowercase().ends_with(&format!(".{kind}")) {
+                if let (Some(kind), Some(label)) = (self.document_kind, path_label) {
+                    if label.to_ascii_lowercase().ends_with(&format!(".{kind}")) {
                         self.document_created = true;
                     }
                 }
                 if let Some(path) = path {
-                    self.uninspected.insert(path);
+                    // A write the host read back byte for byte is confirmed;
+                    // an edit's surroundings still deserve a look.
+                    if call.name == "write_file" && output.contains(crate::tools::WRITE_VERIFIED) {
+                        self.uninspected.remove(&path);
+                    } else {
+                        self.uninspected.insert(path);
+                    }
                 }
             }
             "delete_file" => {
@@ -1925,9 +2556,50 @@ impl VerificationState {
                     self.uninspected.remove(&path);
                 }
             }
+            "list_directory" => {
+                let listed = ws.resolve(path_label.unwrap_or(".")).ok();
+                if let Some(listed) = listed {
+                    self.observe_listing(&listed);
+                }
+            }
             _ => {}
         }
     }
+}
+
+/// The folder a read-only listing command shows: its working directory, or
+/// the single plain path it names (`dir energy-drink`, `ls src`).
+fn listing_target(
+    command: &str,
+    cwd_label: &str,
+    ws: &crate::workspace::WorkspaceManager,
+) -> Option<PathBuf> {
+    let words = simple_command_words(command);
+    if !matches!(
+        words.first().map(String::as_str),
+        Some("ls" | "dir" | "get-childitem")
+    ) {
+        return None;
+    }
+    // Same shape check as above, but paths keep their case.
+    let original: Vec<&str> = command.split_whitespace().collect();
+    let paths: Vec<&str> = original[1..]
+        .iter()
+        .copied()
+        .filter(|word| !word.starts_with('-') && !word.starts_with('/'))
+        .collect();
+    match paths.as_slice() {
+        [] => ws.resolve(cwd_label).ok(),
+        [path] => ws.resolve(&format!("{cwd_label}/{path}")).ok(),
+        _ => None,
+    }
+}
+
+fn git_overview_command(command: &str) -> bool {
+    matches!(
+        simple_command_words(command).as_slice(),
+        [git, sub, ..] if git == "git" && matches!(sub.as_str(), "status" | "diff")
+    )
 }
 
 #[derive(Default)]
@@ -2292,7 +2964,7 @@ mod tests {
     async fn local_model_action_format_probe() {
         let url = std::env::var("COMPANION_ACTION_PROBE_URL").expect("explicit probe URL required");
         assert!(url.starts_with("http://127.0.0.1:"), "local probe only");
-        let prompt = system_prompt("C:/isolated-fixture", &crate::tools::registry(), false);
+        let prompt = system_prompt("C:/isolated-fixture", &crate::tools::registry(), false, false);
         let task = std::env::var("COMPANION_ACTION_PROBE_TASK").unwrap_or_else(|_| "In this isolated evaluation fixture, inspect calculator.cjs and verify.cjs. Fix add(a,b) so it returns the sum, delete only disposable.txt, then execute node verify.cjs and report its actual result. Do not change verify.cjs, install packages, or use the network. Keep the change minimal.".into());
         let mut turns = vec![ChatTurn::text("system", prompt), ChatTurn::text("user", format!("Task: {task}\n\nAddress this request within its scope. Use the complete tool envelope shown in the system instructions if an action is necessary; otherwise answer directly. Do not invent a new task or mutate files for a question."))];
         let structured = std::env::var("COMPANION_ACTION_PROBE_STRUCTURED").is_ok();
@@ -2960,7 +3632,7 @@ mod tests {
 
     #[test]
     fn prompt_contains_a_complete_parseable_action_example() {
-        let prompt = system_prompt("C:/fixture", &crate::tools::registry(), false);
+        let prompt = system_prompt("C:/fixture", &crate::tools::registry(), false, false);
         let start = prompt.find("```tool\n").unwrap();
         let end = prompt[start + 8..].find("\n```").unwrap() + start + 8 + 4;
         let example = &prompt[start..end];
@@ -3063,6 +3735,46 @@ mod tests {
         ] {
             assert!(parse_tool_block(text).is_none(), "accepted quoted/example markup: {text}");
         }
+    }
+
+    #[test]
+    fn javascript_escapes_inside_json_are_repaired_to_what_the_file_needs() {
+        // The reply the rerun rejected: quotes and backticks escaped for
+        // JavaScript inside a JSON string.
+        let reply = "Now the script.\n```tool\n{\"name\":\"write_file\",\"args\":{\"path\":\"energy-drink/script.js\",\"content\":\"const hero = document.querySelector(\\'.hero-section\\');\\nstyle.textContent = \\`\\n.animate h1 { animation: fadeIn 2s; }\\n\\`;\\nconst re = /\\d+\\.\\d+/;\"}}\n```";
+        let call = parse_tool_block(reply).expect("repaired");
+        assert_eq!(
+            call.args["content"],
+            "const hero = document.querySelector('.hero-section');\nstyle.textContent = `\n.animate h1 { animation: fadeIn 2s; }\n`;\nconst re = /\\d+\\.\\d+/;"
+        );
+        assert!(action_problem(reply).is_none());
+        // Valid escapes are untouched.
+        let valid = "{\"a\":\"quote \\\" slash \\\\ tab \\t unicode \\u00e9\"}";
+        assert_eq!(repair_json_strings(valid), valid);
+    }
+
+    #[test]
+    fn repaired_multi_line_writes_keep_their_positions_in_the_original_reply() {
+        // Raw newlines inside the content make the repaired copy longer than
+        // the reply; slicing the reply with repaired offsets crashed a run.
+        let html = "<!DOCTYPE html>\n<html>\n<body>\n<h1>Feel the Surge!</h1>\n</body>\n</html>";
+        let object = format!("{{\"name\":\"write_file\",\"args\":{{\"path\":\"energy-drink/index.html\",\"content\":\"{html}\"}}}}");
+        let open = format!("Creating the page.\n```tool\n{object}");
+        let call = parse_tool_block(&open).expect("parsed after repair");
+        assert_eq!(call.args["content"], html);
+        assert_eq!(transcript_reply(&open), format!("{open}\n```"));
+        assert_eq!(visible_progress(&open), "Creating the page.");
+        let chatty = format!("{open}\nThe page is ready.");
+        assert_eq!(transcript_reply(&chatty), format!("{open}\n```\nThe page is ready."));
+        assert_eq!(visible_progress(&chatty), "Creating the page.\n\nThe page is ready.");
+        let closed = format!("{open}\n```\nNext I will style it.");
+        assert_eq!(parse_tool_block(&closed).unwrap().name, "write_file");
+        assert_eq!(visible_progress(&closed), "Creating the page.\n\nNext I will style it.");
+        let tagged = format!("<tool_call>\n{object}\n</tool_call>\nDone.");
+        assert_eq!(visible_progress(&tagged), "Done.");
+        let nested = "  {\"a\":\"}\n{\",\"b\":[1,{\"c\":2}]} tail";
+        assert_eq!(&nested[..json_value_end(nested).unwrap()], "  {\"a\":\"}\n{\",\"b\":[1,{\"c\":2}]}");
+        assert_eq!(json_value_end("prose {\"a\":1}"), None);
     }
 
     #[test]
@@ -3232,15 +3944,41 @@ mod tests {
     }
 
     #[test]
+    fn instructions_leave_a_small_window_most_of_its_history_room() {
+        // On a 4K window the instructions are the part compaction can never
+        // shrink; they must stay well under half of the room history gets.
+        let prompt = system_prompt("C:/Users/someone/Code", &crate::tools::registry(), false, false);
+        let tokens = estimated_tokens(&[ChatTurn::text("system", prompt)]);
+        let room = history_room(4096, pruning_reserve(4096, 8192));
+        assert!(tokens * 100 / room < 45, "{tokens} instruction tokens of {room}");
+    }
+
+    #[test]
     fn system_prompt_names_workspace_and_tools() {
-        let p = system_prompt("C:/ws", &crate::tools::registry(), true);
+        let p = system_prompt("C:/ws", &crate::tools::registry(), true, true);
         assert!(p.contains("C:/ws"));
         assert!(p.contains("read_file"));
         assert!(p.contains("```tool"));
         assert!(p.contains("web_search"));
+        assert!(p.contains("create_document"));
         assert!(p.contains("unrelated sibling projects"));
-        let q = system_prompt("C:/ws", &crate::tools::registry(), false);
+        let q = system_prompt("C:/ws", &crate::tools::registry(), false, false);
         assert!(!q.contains("web_search"));
+        // A coding task is not offered the document tool: a model used it to
+        // "create a project" and to park page copy outside the site.
+        assert!(!q.contains("create_document"));
+        // Nor open_path, unless the user asked for something to be opened.
+        assert!(!q.contains("open_path"));
+        assert!(system_prompt_for("C:/ws", &crate::tools::registry(), false, false, true).contains("open_path"));
+        for command in ["start energy-drink/index.html", "explorer .", "cmd /c start site.html", "Start-Process chrome", "xdg-open index.html", "powershell Start-Process index.html"] {
+            assert!(launches_window(command), "{command}");
+        }
+        for command in ["npm start", "node server.js", "python -m http.server", "cargo run", "git status", "npm run start"] {
+            assert!(!launches_window(command), "{command}");
+        }
+        assert!(opening_requested("build the page and open it in my browser"));
+        assert!(opening_requested("Launch the dev server"));
+        assert!(!opening_requested("create a modern looking website for an imaginary energy drink"));
     }
 
     #[test]
@@ -3374,7 +4112,7 @@ mod tests {
         }
         let ws = crate::workspace::WorkspaceManager::new(std::env::temp_dir());
         let mut evidence = VerificationState {
-            unknown_shell_changes: true,
+            unobserved_dirs: [ws.resolve(".").unwrap()].into_iter().collect(),
             ..Default::default()
         };
         let call = ToolCall {
@@ -3433,7 +4171,7 @@ mod tests {
             true,
         );
         assert!(
-            state.unknown_shell_changes,
+            !state.unobserved_dirs.is_empty(),
             "even a failed process may partially write"
         );
         state.observe(
@@ -3445,7 +4183,261 @@ mod tests {
             "contents",
             false,
         );
+        assert!(state.needs_evidence(), "an unrelated read does not show what a command did");
+    }
+
+    /// The sequence of the run that got stuck: `mkdir` plus two page files
+    /// for a static website, which has no test or build to run. Completion
+    /// must be reachable by looking at what was made.
+    #[test]
+    fn a_project_without_tests_can_finish_after_looking_at_what_changed() {
+        let root = std::env::temp_dir().join(format!("verification-site-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("energy-drink")).unwrap();
+        let ws = crate::workspace::WorkspaceManager::new(root.clone());
+        let mut state = VerificationState::default();
+        let call = |name: &str, args: serde_json::Value| ToolCall { name: name.into(), args };
+        state.observe(&ws, &call("execute_command", serde_json::json!({"command":"mkdir energy-drink","cwd":"."})), "Command:\nmkdir energy-drink\n\nExit code:\n0\n", false);
+        state.observe(&ws, &call("write_file", serde_json::json!({"path":"energy-drink/index.html"})), &format!("wrote 1275 bytes (40 lines) to energy-drink/index.html {}", crate::tools::WRITE_VERIFIED), false);
+        state.observe(&ws, &call("write_file", serde_json::json!({"path":"energy-drink/style.css"})), &format!("wrote 758 bytes (30 lines) to energy-drink/style.css {}", crate::tools::WRITE_VERIFIED), false);
+        assert!(state.needs_evidence(), "the command's folder has not been looked at");
+        let remaining = state.remaining();
+        assert!(remaining.contains("list \".\" (the workspace root)"), "{remaining}");
+        assert!(!remaining.contains("index.html"), "host-confirmed writes need no read-back: {remaining}");
+        // Listing a different folder does not show what ran in the root.
+        state.observe(&ws, &call("list_directory", serde_json::json!({"path":"energy-drink"})), "index.html\nstyle.css", false);
         assert!(state.needs_evidence());
+        state.observe(&ws, &call("list_directory", serde_json::json!({"path":"."})), "energy-drink", false);
+        assert!(!state.needs_evidence(), "{}", state.remaining());
+
+        // An unconfirmed write (a result without the marker) still needs a read,
+        // an edit always does, and a shell listing counts like list_directory.
+        let mut state = VerificationState::default();
+        state.observe(&ws, &call("write_file", serde_json::json!({"path":"energy-drink/app.js"})), "wrote 10 bytes to energy-drink/app.js", false);
+        state.observe(&ws, &call("edit_file", serde_json::json!({"path":"energy-drink/style.css"})), "patched energy-drink/style.css: 758 -> 790 bytes", false);
+        state.observe(&ws, &call("execute_command", serde_json::json!({"command":"npm init -y","cwd":"energy-drink"})), "Command:\nnpm init -y\n\nExit code:\n0\n", false);
+        let remaining = state.remaining();
+        assert!(remaining.contains("\"energy-drink\""), "{remaining}");
+        assert!(remaining.contains("energy-drink/app.js") && remaining.contains("energy-drink/style.css"), "{remaining}");
+        state.observe(&ws, &call("execute_command", serde_json::json!({"command":"dir","cwd":"energy-drink"})), "Command:\ndir\n\nExit code:\n0\n", false);
+        state.observe(&ws, &call("read_file", serde_json::json!({"path":"energy-drink/app.js"})), "x", false);
+        state.observe(&ws, &call("read_file", serde_json::json!({"path":"energy-drink/style.css"})), "x", false);
+        assert!(!state.needs_evidence(), "{}", state.remaining());
+
+        // A script run in the root is observed by `git status` there too.
+        let mut state = VerificationState::default();
+        state.observe(&ws, &call("execute_command", serde_json::json!({"command":"python build_site.py"})), "Command:\npython build_site.py\n\nExit code:\n0\n", false);
+        assert!(state.needs_evidence());
+        state.observe(&ws, &call("execute_command", serde_json::json!({"command":"git status"})), "Command:\ngit status\n\nExit code:\n0\n", false);
+        assert!(!state.needs_evidence());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn small_windows_keep_room_for_history_instead_of_reserving_all_of_it() {
+        // The run that got stuck: a 4K window and the 8K cap used with thinking off.
+        assert_eq!(pruning_reserve(4096, 8192), 1024);
+        assert_eq!(pruning_reserve(4096, 4096), 1024);
+        assert_eq!(pruning_reserve(8192, 8192), 2048);
+        assert_eq!(pruning_reserve(32768, 4096), 4096, "large windows keep the full cap");
+        assert_eq!(pruning_reserve(2048, 8192), 1024);
+        // A 1.1K-token instruction block, the task and six short steps fit a
+        // 4K window: nothing is dropped. Reserving the whole cap dropped all
+        // but the latest exchange.
+        let mut transcript = vec![
+            ChatTurn::text("system", "r".repeat(4400)),
+            ChatTurn::text("user", "Task: build the site"),
+        ];
+        for step in 0..6 {
+            transcript.push(ChatTurn::text("assistant", format!("```tool\n{{\"name\":\"list_directory\",\"args\":{{\"path\":\"step{step}\"}}}}\n```")));
+            transcript.push(ChatTurn::text("user", "Result of list_directory:\nindex.html"));
+        }
+        let before = transcript.len();
+        let mut task_index = 1;
+        assert_eq!(prune_transcript(&mut transcript, &mut task_index, 4096, pruning_reserve(4096, 8192)), 0);
+        assert_eq!(transcript.len(), before);
+        let mut old = transcript.clone();
+        let mut old_index = 1;
+        prune_transcript(&mut old, &mut old_index, 4096, 8192);
+        assert_eq!(old.len(), 4, "the old reserve kept only the rules, the task and one exchange");
+    }
+
+    #[test]
+    fn compaction_is_due_at_the_threshold_between_steps_only_when_there_is_history() {
+        let policy = CompactionPolicy { enabled: true, threshold_pct: 90 };
+        let room = history_room(4096, pruning_reserve(4096, 8192));
+        assert_eq!(room, 2560);
+        let mut transcript = vec![
+            ChatTurn::text("system", "r".repeat(4000)),
+            ChatTurn::text("user", "Task: build the site"),
+        ];
+        assert_eq!(policy.due(&transcript, 1, room, None), None, "nothing to summarize yet");
+        while estimated_tokens(&transcript) * 100 < room * 90 {
+            transcript.push(ChatTurn::text("assistant", "a".repeat(400)));
+            transcript.push(ChatTurn::text("user", "Result of read_file:\nb"));
+        }
+        let used = estimated_tokens(&transcript);
+        let pct = policy.due(&transcript, 1, room, None).expect("due at 90%");
+        assert!(pct >= 90);
+        // Right after a compaction that left the transcript this large, the
+        // next one waits for a sixth of the room of growth.
+        assert_eq!(policy.due(&transcript, 1, room, Some(used - 100)), None, "not grown enough since the last compaction");
+        assert!(policy.due(&transcript, 1, room, Some(used - room / 6)).is_some());
+        assert_eq!(CompactionPolicy { enabled: false, threshold_pct: 90 }.due(&transcript, 1, room, None), None);
+        assert_eq!(CompactionPolicy { enabled: true, threshold_pct: 98 }.due(&transcript[..transcript.len() - 2], 1, room, None), None);
+    }
+
+    async fn note_sidecar(reply: &'static str) -> (String, Arc<Mutex<Vec<serde_json::Value>>>, JoinHandle<()>) {
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let captured = bodies.clone();
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let captured = captured.clone();
+                async move {
+                    captured.lock().unwrap().push(body);
+                    axum::Json(serde_json::json!({
+                        "choices": [{"message": {"content": reply}, "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 900, "completion_tokens": 60}
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://127.0.0.1:{port}"), bodies, server)
+    }
+
+    fn site_transcript(content_chars: usize) -> Vec<ChatTurn> {
+        let mut transcript = vec![
+            ChatTurn::text("system", "rules ".repeat(700)),
+            ChatTurn::text("user", "Task: create a website"),
+        ];
+        for file in ["index.html", "style.css", "script.js"] {
+            push_write(&mut transcript, file, content_chars);
+        }
+        transcript
+    }
+
+    fn push_write(transcript: &mut Vec<ChatTurn>, file: &str, content_chars: usize) {
+        transcript.push(ChatTurn::text("assistant", format!("```tool\n{{\"name\":\"write_file\",\"args\":{{\"path\":\"site/{file}\",\"content\":\"{}\"}}}}\n```", "x".repeat(content_chars))));
+        transcript.push(ChatTurn::text("user", format!("Result of write_file:\nwrote {content_chars} bytes (1 lines) to site/{file} (verified on disk)")));
+    }
+
+    #[tokio::test]
+    async fn compaction_replaces_earlier_steps_with_a_note_and_the_host_record() {
+        let (url, bodies, server) = note_sidecar("- Created site/index.html, site/style.css and site/script.js.\n- Next: list the site folder, then finish.").await;
+        let client = SidecarClient::new(url).unwrap();
+        // An 8K window, where the latest exchange fits and is kept verbatim.
+        let cfg = crate::inference::InferenceConfig { n_ctx: 8192, ..Default::default() };
+        let mut transcript = site_transcript(3000);
+        let original_task = transcript[1].content.clone();
+        let mut task_index = 1;
+        let work_log = vec![
+            "ran `mkdir site` in .: exit code 0".to_string(),
+            "wrote 900 bytes (1 lines) to site/index.html (verified on disk)".to_string(),
+        ];
+        let required = vec!["Still required before finishing: Before finishing, list \".\" (the workspace root) with list_directory to see what your commands left there.".to_string()];
+        let room = history_room(8192, pruning_reserve(8192, 8192));
+        let outcome = compact_run_transcript(&client, &cfg, &mut transcript, &mut task_index, &original_task, &work_log, &required, room).await;
+        let bodies = bodies.lock().unwrap().clone();
+        server.abort();
+
+        // The note request rides on the existing transcript, ends with the
+        // instruction, and asks for no thinking.
+        assert_eq!(bodies.len(), 1);
+        let messages = bodies[0]["messages"].as_array().unwrap();
+        assert_eq!(messages.last().unwrap()["content"], COMPACTION_INSTRUCTION);
+        assert_eq!(bodies[0]["chat_template_kwargs"]["enable_thinking"], false);
+
+        assert!(outcome.model_note);
+        assert_eq!(outcome.summarized_turns, 4, "two older exchanges summarized, the latest kept");
+        assert!(outcome.tokens_after < outcome.tokens_before);
+        assert_eq!(task_index, 1);
+        assert_eq!(transcript.len(), 4, "system, task with the note, and the latest exchange");
+        assert_eq!(transcript[2].role, "assistant");
+        assert!(transcript[3].content.contains("site/script.js"));
+        let task = &transcript[1].content;
+        assert!(task.starts_with(&original_task));
+        assert!(task.contains("Context compacted between steps: 4 earlier turn(s)"));
+        assert!(task.contains("Created site/index.html"));
+        assert!(task.contains("- ran `mkdir site` in .: exit code 0"));
+        assert!(task.contains("Still required before finishing"));
+        assert!(task.contains("do not redo completed actions"));
+
+        // A second compaction rebuilds the block instead of stacking notes.
+        transcript.push(ChatTurn::text("assistant", "```tool\n{\"name\":\"list_directory\",\"args\":{\"path\":\".\"}}\n```"));
+        transcript.push(ChatTurn::text("user", "Result of list_directory:\nsite"));
+        push_write(&mut transcript, "about.html", 3000);
+        push_write(&mut transcript, "extra.css", 3000);
+        let (url, _, server) = note_sidecar("Site created and listed.").await;
+        let client = SidecarClient::new(url).unwrap();
+        compact_run_transcript(&client, &cfg, &mut transcript, &mut task_index, &original_task, &work_log, &[], room).await;
+        server.abort();
+        assert_eq!(transcript[1].content.matches("Context compacted between steps").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_completion_check_judges_the_work_without_its_earlier_verdicts() {
+        let (url, bodies, server) = note_sidecar("COMPLETE").await;
+        let client = SidecarClient::new(url).unwrap();
+        let cfg = crate::inference::InferenceConfig { n_ctx: 8192, ..Default::default() };
+        let mut transcript = site_transcript(300);
+        transcript.push(ChatTurn::text("user", format!("{REVIEW_FINDING_PREFIX} the page has no hype line\nContinue executing now.")));
+        transcript.push(ChatTurn::text("assistant", "```tool\n{\"name\":\"write_file\",\"args\":{\"path\":\"site/index.html\",\"content\":\"<p class='hype'>Unleash it</p>\"}}\n```"));
+        transcript.push(ChatTurn::text("user", format!("{REVIEW_UNAVAILABLE_PREFIX} (timeout). Inspect the workspace.")));
+        let evidence: Vec<String> = (0..40).map(|i| format!("- FILE CHANGE (not verification): write_file [site/page{i}.html] => wrote {} bytes", "9".repeat(300))).collect();
+        let review = review_completion(&client, &cfg, &transcript, "create a website", &evidence).await;
+        server.abort();
+        assert!(matches!(review, CompletionReview::Complete));
+        let bodies = bodies.lock().unwrap().clone();
+        let messages = bodies[0]["messages"].as_array().unwrap();
+        let contents: Vec<&str> = messages.iter().filter_map(|m| m["content"].as_str()).collect();
+        assert!(!contents.iter().any(|c| c.starts_with(REVIEW_FINDING_PREFIX)), "earlier verdict leaked into the check");
+        assert!(!contents.iter().any(|c| c.starts_with(REVIEW_UNAVAILABLE_PREFIX)));
+        let instruction = contents.last().unwrap();
+        assert!(instruction.contains("judge only its latest version"));
+        assert!(instruction.contains("earlier actions omitted to fit the context window"), "evidence must be sized to the window");
+    }
+
+    #[tokio::test]
+    async fn compaction_without_a_usable_note_still_keeps_the_host_record() {
+        // A small model that answers the note request with an action.
+        let (url, _, server) = note_sidecar("```tool\n{\"name\":\"list_directory\",\"args\":{\"path\":\".\"}}\n```").await;
+        let client = SidecarClient::new(url).unwrap();
+        let cfg = crate::inference::InferenceConfig { n_ctx: 4096, ..Default::default() };
+        let mut transcript = site_transcript(900);
+        let original_task = transcript[1].content.clone();
+        let mut task_index = 1;
+        let work_log = vec!["wrote 900 bytes (1 lines) to site/index.html (verified on disk)".to_string()];
+        let room = history_room(4096, pruning_reserve(4096, 8192));
+        let outcome = compact_run_transcript(&client, &cfg, &mut transcript, &mut task_index, &original_task, &work_log, &[], room).await;
+        server.abort();
+        assert!(!outcome.model_note);
+        // On the incident's 4K window the instructions are close to half the
+        // room, so even the latest exchange is summarized to land well under
+        // the threshold.
+        assert_eq!(outcome.summarized_turns, 6);
+        assert_eq!(transcript.len(), 2);
+        assert!(!transcript[1].content.contains("list_directory"));
+        assert!(transcript[1].content.contains("site/index.html (verified on disk)"));
+    }
+
+    #[test]
+    fn the_action_record_keeps_changes_and_commands_but_not_reads() {
+        let call = |name: &str, args: serde_json::Value| ToolCall { name: name.into(), args };
+        assert_eq!(
+            work_log_entry(&call("execute_command", serde_json::json!({"command":"mkdir energy-drink","cwd":"."})), "Command:\nmkdir energy-drink\n\nExit code:\n0\n", false).as_deref(),
+            Some("ran `mkdir energy-drink` in .: exit code 0")
+        );
+        assert_eq!(
+            work_log_entry(&call("write_file", serde_json::json!({"path":"site/index.html"})), "wrote 12 bytes (1 lines) to site/index.html (verified on disk)", false).as_deref(),
+            Some("wrote 12 bytes (1 lines) to site/index.html (verified on disk)")
+        );
+        assert_eq!(work_log_entry(&call("edit_file", serde_json::json!({"path":"a.css"})), "patched", false).as_deref(), Some("edited a.css"));
+        assert!(work_log_entry(&call("edit_file", serde_json::json!({"path":"a.css"})), "(tool error, do not retry identically)\nold text was not found", true).unwrap().contains("failed: old text was not found"));
+        assert_eq!(work_log_entry(&call("read_file", serde_json::json!({"path":"a.css"})), "x", false), None);
+        assert_eq!(work_log_entry(&call("list_directory", serde_json::json!({"path":"."})), "x", false), None);
     }
 
     #[test]

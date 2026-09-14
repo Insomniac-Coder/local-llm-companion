@@ -39,7 +39,11 @@ const MAX_TITLE_CHARS: usize = 200;
 const CHAT_TOOL_ROUNDS: u32 = 24;
 /// Stage 6: history window fed to the model (§21). Older turns are dropped,
 /// newest kept; the context endpoint reports exactly what was dropped.
-const HISTORY_TURNS: usize = 20;
+/// A backstop on message count only. The character budget derived from the
+/// context window decides what travels, and automatic compaction summarizes
+/// older messages before that budget drops any; a count cap of 20 used to
+/// drop messages silently long before the window was full.
+const HISTORY_TURNS: usize = 200;
 const HISTORY_CHARS: usize = 60_000;
 const ATTACH_CHARS_PER_TURN: usize = 20_000;
 
@@ -114,7 +118,8 @@ impl AppState {
                 tracing::warn!("Stored settings could not be read; using safe defaults: {error}");
                 None
             })
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .normalized();
         // Only the explicit global preference is durable. Temporary grants and
         // one-time approvals belong to the old process and are never restored.
         let permissions = PermissionManager::new(if settings.agent.autonomous_enabled {
@@ -718,13 +723,7 @@ async fn guard_agent_running(s: &AppState, force: bool) -> Result<(), ApiError> 
         .summaries()
         .into_iter()
         .filter(|r| {
-            matches!(
-                r.state,
-                crate::agent::AgentState::Planning
-                    | crate::agent::AgentState::ExecutingTool
-                    | crate::agent::AgentState::WaitingPermission
-                    | crate::agent::AgentState::Observing
-            )
+            r.state.is_active()
         })
         .map(|r| r.id)
         .collect();
@@ -1184,6 +1183,18 @@ pub(crate) struct RequestContext {
     pub chat_workspace: Option<(String, String, std::path::PathBuf)>,
     pub reasoning_default: bool,
     pub search_default: bool,
+    /// Characters of saved history (summary included) before any trimming.
+    pub history_chars: usize,
+    /// Characters the request gives history: the window minus the system
+    /// prompt, the reply, a margin and attachment excerpts.
+    pub history_room_chars: usize,
+}
+
+impl RequestContext {
+    /// How full saved history is against the room a request gives it.
+    pub fn history_usage_pct(&self) -> u32 {
+        (self.history_chars.saturating_mul(100) / self.history_room_chars.max(1)).min(999) as u32
+    }
 }
 
 /// Bounded history in characters for a given context window: leave room for
@@ -1207,6 +1218,18 @@ pub(crate) async fn assemble_request_context(
     pending_message: Option<&str>,
     n_ctx: u32,
 ) -> Result<RequestContext, ApiError> {
+    assemble_request_context_with(s, conv_id, pending_message, n_ctx, true).await
+}
+
+/// `load_images: false` measures the context without preparing image
+/// attachments, for the context gauge.
+pub(crate) async fn assemble_request_context_with(
+    s: &AppState,
+    conv_id: Option<&str>,
+    pending_message: Option<&str>,
+    n_ctx: u32,
+    load_images: bool,
+) -> Result<RequestContext, ApiError> {
     let model_name = s
         .models
         .read()
@@ -1225,10 +1248,14 @@ pub(crate) async fn assemble_request_context(
         let turns = pending_message
             .map(|message| vec![ChatTurn::text("user", message)])
             .unwrap_or_default();
+        let sys_prompt = build_system_prompt("chat", "", &model_name);
+        let history_room_chars = history_char_budget(n_ctx, sys_prompt.len());
         return Ok(RequestContext {
-            sys_prompt: build_system_prompt("chat", "", &model_name),
+            sys_prompt,
             sys_mode: "chat".into(),
             model_name,
+            history_chars: pending_message.map(str::len).unwrap_or(0),
+            history_room_chars,
             turns,
             images_skipped: 0,
             chat_workspace: None,
@@ -1287,9 +1314,11 @@ pub(crate) async fn assemble_request_context(
             .text,
     );
     let budget = history_char_budget(n_ctx, sys_prompt.len());
+    let history_chars: usize = history.iter().map(|message| message.content.len()).sum();
+    let history_room_chars = history_room_for(budget, &attachments);
     let mut turns = build_turns_budgeted(&history, &attachments, budget);
     let mut images_skipped = 0usize;
-    if vision_ok {
+    if vision_ok && load_images {
         let mut urls = vec![];
         for a in attachments.iter().filter(|a| a.kind == "image").take(4) {
             let p = s.attachments_dir.join(cid).join(&a.filename);
@@ -1321,6 +1350,8 @@ pub(crate) async fn assemble_request_context(
         chat_workspace,
         reasoning_default: conv.reasoning_default,
         search_default: conv.search_default,
+        history_chars,
+        history_room_chars,
     })
 }
 
@@ -2204,6 +2235,14 @@ async fn chat_sse(
     let persisted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // A new turn supersedes any running one: cancel it (partial kept) first.
     s.generations.write().await.cancel_current(&s.storage).await;
+    // Automatic compaction is decided before this reply and runs before it is
+    // generated, never during it: saved history at the threshold share of the
+    // room a request gives history would otherwise start losing old messages.
+    let compaction_due = conv_id.as_ref().and_then(|_| {
+        let pct = context.history_usage_pct();
+        (settings.memory.auto_compaction() && pct >= settings.memory.compact_threshold_pct())
+            .then_some((pct, context.history_room_chars))
+    });
     let RequestContext {
         mut sys_prompt,
         sys_mode,
@@ -2212,9 +2251,10 @@ async fn chat_sse(
         chat_workspace,
         ..
     } = context;
-    if let Some(task) = resumed_task {
-        sys_prompt.push_str(&format!("\nThe user's continuation refers only to this saved unfinished task in this same project: {task}\nThis Ask reply remains read-only; continue inspection or explanation, never implement changes."));
-    }
+    let resumed_note = resumed_task
+        .map(|task| format!("\nThe user's continuation refers only to this saved unfinished task in this same project: {task}\nThis Ask reply remains read-only; continue inspection or explanation, never implement changes."))
+        .unwrap_or_default();
+    sys_prompt.push_str(&resumed_note);
     let bg_state = s.clone();
     let bg_conv = conv_id.clone();
     let bg_sys = sys_prompt;
@@ -2232,6 +2272,56 @@ async fn chat_sse(
         let status = |msg: &str| {
             let _ = tx_status.send(Ok(Event::default().event("status").data(msg.to_string())));
         };
+        let phase = |name: &str| {
+            let _ = tx_status.send(Ok(Event::default()
+                .event("phase")
+                .data(serde_json::json!({ "phase": name }).to_string())));
+        };
+        let mut bg_turns = bg_turns;
+        let mut bg_sys = bg_sys;
+        if let (Some((pct, room_chars)), Some(cid)) = (compaction_due, bg_conv.clone()) {
+            phase("compacting");
+            status(&format!(
+                "Compacting the conversation: {pct}% of the usable context is in use (automatic compaction starts at {}%). The reply starts when the summary is ready…",
+                settings.memory.compact_threshold_pct()
+            ));
+            // Keep what fits in two fifths of the room verbatim, so the
+            // compacted context lands well under the threshold.
+            let keep = recent_messages_within(
+                &bg_state,
+                &cid,
+                room_chars * 2 / 5,
+                settings.memory.compaction_keep_turns,
+            )
+            .await;
+            match compact_conversation_keeping(&bg_state, &cid, keep).await {
+                Ok(stats) if stats.status == "compacted" => {
+                    match assemble_request_context(&bg_state, Some(&cid), None, cfg.n_ctx).await {
+                        Ok(fresh) => {
+                            bg_turns = fresh.turns;
+                            bg_sys = fresh.sys_prompt + &resumed_note;
+                        }
+                        Err(error) => tracing::warn!(
+                            "context re-assembly after compaction failed: {}",
+                            error.message
+                        ),
+                    }
+                    status(&format!(
+                        "Conversation compacted: {} older messages summarized ({} → {} characters). Writing the reply…",
+                        stats.messages, stats.before_chars, stats.after_chars
+                    ));
+                }
+                Ok(_) => status("Nothing older could be compacted; replying with the current context…"),
+                Err(error) => {
+                    tracing::warn!("automatic compaction failed: {}", error.message);
+                    status(&format!(
+                        "Automatic compaction failed ({}); replying with the most recent messages that fit.",
+                        error.message
+                    ));
+                }
+            }
+            phase("processing");
+        }
         // Stage 11: explicit web search runs BEFORE generation (§120). The
         // query is the user's message; results become model context plus
         // persisted citations (§121). Nothing external happens unless the
@@ -2983,6 +3073,20 @@ pub(crate) fn build_turns(
     build_turns_budgeted(history, attachments, HISTORY_CHARS)
 }
 
+/// Characters left for messages once attachment excerpts, which ride on the
+/// latest turn, take their share of a request's history budget.
+pub(crate) fn history_room_for(
+    max_chars: usize,
+    attachments: &[crate::storage::Attachment],
+) -> usize {
+    let attach_reserved: usize = attachments
+        .iter()
+        .map(|a| a.text_excerpt.len())
+        .sum::<usize>()
+        .min(ATTACH_CHARS_PER_TURN);
+    max_chars.saturating_sub(attach_reserved).max(2_000)
+}
+
 /// Same as `build_turns` with an explicit character budget derived from the
 /// loaded context window, so an 8K CPU context and a 128K GPU context each
 /// carry as much history as they can actually hold.
@@ -3007,12 +3111,7 @@ pub(crate) fn build_turns_budgeted(
     // Attachment excerpts ride on the latest turn and count against the same
     // budget, so a big attachment on a small context displaces old history
     // rather than overflowing the window.
-    let attach_reserved: usize = attachments
-        .iter()
-        .map(|a| a.text_excerpt.len())
-        .sum::<usize>()
-        .min(ATTACH_CHARS_PER_TURN);
-    let history_budget = max_chars.saturating_sub(attach_reserved).max(2_000);
+    let history_budget = history_room_for(max_chars, attachments);
     // Drop oldest until within budget (never drop the final turn).
     let mut chars: usize = window.iter().map(|m| m.content.len()).sum();
     while window.len() > 1 && chars > history_budget {
@@ -3203,17 +3302,29 @@ async fn conversation_context(
         .saturating_sub(tool_tok)
         .saturating_sub(memory_tok);
     let used = tok + output_reserve;
-    // This percentage is a saved-text estimate, not runtime/KV occupancy.
-    let pct = if limit > 0 {
-        (tok as f64 / limit as f64 * 100.0) as u32
+    // This percentage is a saved-text estimate, not runtime/KV occupancy. It
+    // is measured against the room a request gives history (the window minus
+    // instructions, the reply and a margin), the same measure automatic
+    // compaction uses, so the gauge reads the threshold when compaction runs.
+    let room = if limit > 0 {
+        assemble_request_context_with(&s, Some(&id), None, limit, false)
+            .await
+            .ok()
+            .map(|context| (context.history_usage_pct(), context.history_room_chars))
     } else {
-        0
+        None
     };
-    let health_pct = if limit > 0 {
-        (used as f64 / limit as f64 * 100.0) as u32
-    } else {
-        0
+    let pct = match room {
+        Some((usage, _)) => usage,
+        None if limit > 0 => (tok as f64 / limit as f64 * 100.0) as u32,
+        None => 0,
     };
+    let health_pct = match room {
+        Some((usage, _)) => usage,
+        None if limit > 0 => (used as f64 / limit as f64 * 100.0) as u32,
+        None => 0,
+    };
+    let memory_settings = s.settings.read().await.memory.clone();
     let health = if health_pct < 60 {
         "healthy"
     } else if health_pct < 80 {
@@ -3241,6 +3352,9 @@ async fn conversation_context(
         },
         "used_with_reserve": used,
         "usage_pct": pct,
+        "history_room_tokens": room.map(|(_, chars)| estimate_tokens(chars)),
+        "auto_compact": memory_settings.auto_compaction(),
+        "compact_at_pct": memory_settings.compact_threshold_pct(),
         "health": health,
     })))
 }
@@ -5023,7 +5137,111 @@ async fn compact_conversation(s: &AppState, cid: &str) -> Result<CompactStats, A
         .memory
         .compaction_keep_turns
         .clamp(2, 200);
-    let (ids, before_chars, source_contents): (Vec<String>, usize, Vec<String>) = {
+    compact_conversation_keeping(s, cid, keep_recent).await
+}
+
+const CONVERSATION_COMPACTION_PROMPT: &str = "Update the running summary of a conversation between a user and an assistant so that it can replace the messages it covers. Keep the user's goals, constraints and preferences, decisions made, facts and figures, names of files and commands with their results, and every open question or unfinished task. Drop greetings and repetition. Write plain sentences or bullets, at most 250 words, and output only the updated summary.";
+
+const COMPACTION_HEADER: &str = "[Compacted context — summary of";
+
+/// Newest messages to keep verbatim when compacting automatically: as many as
+/// fit in `max_chars`, at least two (the new message and the reply before
+/// it), at most `max_keep`.
+async fn recent_messages_within(s: &AppState, cid: &str, max_chars: usize, max_keep: usize) -> usize {
+    let history = s.storage.lock().await.messages_for(cid).unwrap_or_default();
+    let mut chars = 0usize;
+    let mut keep = 0usize;
+    for message in history.iter().rev() {
+        chars += message.content.len();
+        if keep >= 2 && (chars > max_chars || keep >= max_keep) {
+            break;
+        }
+        keep += 1;
+    }
+    keep.max(2)
+}
+
+async fn summarize_conversation_chunk(
+    client: &SidecarClient,
+    cfg: &InferenceConfig,
+    summary: &str,
+    chunk: &str,
+    max_tokens: u32,
+) -> Result<String, ApiError> {
+    let prompt = format!(
+        "{CONVERSATION_COMPACTION_PROMPT}\n\nCurrent summary:\n{}\n\nNew messages:\n{chunk}",
+        if summary.trim().is_empty() { "(none yet)" } else { summary.trim() }
+    );
+    let (text, _) = client
+        .chat_turns_without_reasoning(&[ChatTurn::text("user", prompt)], max_tokens, cfg)
+        .await
+        .map_err(|e| ApiError::internal(format!("summarization failed: {e}")))?;
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(ApiError::bad(
+            "the model returned an empty context summary",
+            "Your transcript and existing context are unchanged. Retry with another model or a smaller conversation.",
+        ));
+    }
+    Ok(text.to_owned())
+}
+
+/// Fold `messages` into `summary`, one window-sized chunk per request.
+/// Returns the new summary and the characters it replaces.
+async fn fold_conversation_summary(
+    client: &SidecarClient,
+    cfg: &InferenceConfig,
+    mut summary: String,
+    messages: &[Message],
+) -> Result<(String, usize), ApiError> {
+    // One summarization prompt, in characters at a conservative 3 per token,
+    // after the room for the summary it writes and a margin.
+    let summary_tokens = (cfg.n_ctx / 6).clamp(256, 1024);
+    let prompt_chars = (cfg.n_ctx.saturating_sub(summary_tokens).saturating_sub(512) as usize * 3)
+        .clamp(3_000, 180_000);
+    let excerpt_chars = (prompt_chars / 3).clamp(600, 3_200);
+    let excerpt = |content: &str| -> String {
+        let total = content.chars().count();
+        if total <= excerpt_chars {
+            return content.to_owned();
+        }
+        let head: String = content.chars().take(excerpt_chars * 3 / 4).collect();
+        let tail: String = content.chars().skip(total - excerpt_chars / 4).collect();
+        format!("{head} […] {tail}")
+    };
+    let mut before_chars = summary.len();
+    let mut chunk = String::new();
+    for message in messages {
+        before_chars += message.content.len();
+        let line = format!("[{}] {}\n", message.role, excerpt(&message.content));
+        if !chunk.is_empty()
+            && CONVERSATION_COMPACTION_PROMPT.len() + summary.len() + chunk.len() + line.len() > prompt_chars
+        {
+            summary = summarize_conversation_chunk(client, cfg, &summary, &chunk, summary_tokens).await?;
+            chunk.clear();
+        }
+        chunk.push_str(&line);
+    }
+    if !chunk.is_empty() {
+        summary = summarize_conversation_chunk(client, cfg, &summary, &chunk, summary_tokens).await?;
+    }
+    Ok((summary, before_chars))
+}
+
+/// Summarize a conversation's older messages into its context summary and
+/// keep the newest `keep_recent` messages verbatim. Safe to run automatically
+/// on any window: messages are folded into the running summary in chunks
+/// that fit the loaded context (one prompt holding every old message
+/// overflowed long conversations), and an existing summary is the starting
+/// point rather than being rebuilt from the first message. Original messages
+/// are never modified; the summary is a derived view of their prefix.
+async fn compact_conversation_keeping(
+    s: &AppState,
+    cid: &str,
+    keep_recent: usize,
+) -> Result<CompactStats, ApiError> {
+    let keep_recent = keep_recent.clamp(1, 200);
+    let (history, previous_summary, covered) = {
         let st = s.storage.lock().await;
         if matches!(st.get_conversation(cid), Ok(None)) {
             return Err(ApiError::not_found("conversation not found"));
@@ -5031,24 +5249,33 @@ async fn compact_conversation(s: &AppState, cid: &str) -> Result<CompactStats, A
         let history = st
             .messages_for(cid)
             .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
-        if history.len() <= keep_recent {
-            let n = history.len();
-            return Ok(CompactStats {
-                text: format!("Nothing to compact: only {n} messages."),
-                before_chars: 0,
-                after_chars: 0,
-                saved_pct: 0,
-                messages: n,
-                status: "noop".into(),
-            });
-        }
-        let old = &history[..history.len() - keep_recent];
-        (
-            old.iter().map(|m| m.id.clone()).collect(),
-            old.iter().map(|m| m.content.len()).sum(),
-            old.iter().map(|m| m.content.clone()).collect(),
-        )
+        let view = st
+            .context_messages_for(cid)
+            .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
+        let summary = view
+            .first()
+            .filter(|message| message.id.starts_with("context-summary:"))
+            .map(|message| message.content.clone());
+        // The view is [summary] + the messages it does not cover.
+        let covered = if summary.is_some() {
+            history.len().saturating_sub(view.len().saturating_sub(1))
+        } else {
+            0
+        };
+        (history, summary, covered)
     };
+    let end = history.len().saturating_sub(keep_recent);
+    if end <= covered {
+        let n = history.len();
+        return Ok(CompactStats {
+            text: format!("Nothing to compact: {n} messages, and everything older than the newest {keep_recent} is already summarized."),
+            before_chars: 0,
+            after_chars: 0,
+            saved_pct: 0,
+            messages: n,
+            status: "noop".into(),
+        });
+    }
     let sidecar = {
         let mut llama = s.llama.write().await;
         if llama.is_running() {
@@ -5066,40 +5293,23 @@ async fn compact_conversation(s: &AppState, cid: &str) -> Result<CompactStats, A
             "Start inference first, then /compact.",
         ));
     };
-    let digest: String = {
-        let st = s.storage.lock().await;
-        st.messages_for(cid)
-            .map_err(|e| ApiError::internal(format!("storage error: {e}")))?
-            .iter()
-            .take(ids.len())
-            .map(|m| {
-                format!(
-                    "[{}] {}",
-                    m.role,
-                    m.content.chars().take(2000).collect::<String>()
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
     let client = SidecarClient::new(base_url).map_err(|e| ApiError::internal(e.to_string()))?;
-    let (summary, _) = client.chat_turns(
-        &[ChatTurn::text(
-            "user",
-            format!(
-                "Summarize this conversation prefix for context compaction. Preserve: decisions, constraints, unresolved tasks, key facts and tool results. Be compact.\n\n{digest}"
-            ),
-        )],
-        1024, &cfg,
-    ).await.map_err(|e| ApiError::internal(format!("summarization failed: {e}")))?;
-    if summary.trim().is_empty() {
-        return Err(ApiError::bad("the model returned an empty context summary", "Your transcript and existing context are unchanged. Retry with another model or a smaller conversation."));
-    }
+    let previous = previous_summary
+        .map(|text| {
+            if text.starts_with(COMPACTION_HEADER) {
+                text.split_once('\n').map(|(_, body)| body.to_owned()).unwrap_or_default()
+            } else {
+                text
+            }
+        })
+        .unwrap_or_default();
+    let (summary, before_chars) =
+        fold_conversation_summary(&client, &cfg, previous, &history[covered..end]).await?;
     let after_chars = summary.len();
     if after_chars >= before_chars {
         return Ok(CompactStats {
             text: "The generated summary would not save context, so nothing was changed. Original history is intact.".into(),
-            before_chars, after_chars: before_chars, saved_pct: 0, messages: ids.len(), status: "noop".into(),
+            before_chars, after_chars: before_chars, saved_pct: 0, messages: end, status: "noop".into(),
         });
     }
     {
@@ -5109,20 +5319,20 @@ async fn compact_conversation(s: &AppState, cid: &str) -> Result<CompactStats, A
         let all = st
             .messages_for(cid)
             .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
-        if all.len() < ids.len()
+        if all.len() < end
             || !all
                 .iter()
-                .zip(&ids)
-                .zip(&source_contents)
-                .all(|((message, id), content)| message.id == *id && message.content == *content)
+                .zip(&history[..end])
+                .all(|(current, original)| current.id == original.id && current.content == original.content)
         {
             return Err(ApiError::bad(
                 "conversation changed during compaction",
                 "Retry compaction on the current transcript.",
             ));
         }
+        let ids: Vec<String> = history[..end].iter().map(|message| message.id.clone()).collect();
         st.save_context_summary(cid, &ids, &format!(
-            "[Compacted context — summary of {} older messages; original history preserved]\n{summary}", ids.len()
+            "{COMPACTION_HEADER} {end} older messages; original history preserved]\n{summary}"
         )).map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
     }
     let saved = before_chars.saturating_sub(after_chars);
@@ -5131,10 +5341,9 @@ async fn compact_conversation(s: &AppState, cid: &str) -> Result<CompactStats, A
     } else {
         0
     };
-    let n = ids.len();
     Ok(CompactStats {
-        text: format!("✓ Context compacted\nBefore {before_chars} chars\nAfter {after_chars} chars\nSaved {pct}% ({n} messages → 1 context summary). Original messages, timestamps and tool history are preserved."),
-        before_chars, after_chars, saved_pct: pct, messages: n, status: "compacted".into(),
+        text: format!("✓ Context compacted\nBefore {before_chars} chars\nAfter {after_chars} chars\nSaved {pct}% ({end} messages → 1 context summary). Original messages, timestamps and tool history are preserved."),
+        before_chars, after_chars, saved_pct: pct, messages: end, status: "compacted".into(),
     })
 }
 // ---- Stage 17 model switching + prepare-context (§§170–180) ----
@@ -6666,13 +6875,7 @@ async fn list_sessions(State(s): State<AppState>) -> Result<Json<serde_json::Val
             }
         }
         for r in s.agents.read().await.summaries() {
-            if matches!(
-                r.state,
-                crate::agent::AgentState::Planning
-                    | crate::agent::AgentState::ExecutingTool
-                    | crate::agent::AgentState::WaitingPermission
-                    | crate::agent::AgentState::Observing
-            ) && !r.conversation_id.is_empty()
+            if r.state.is_active() && !r.conversation_id.is_empty()
             {
                 set.insert(r.conversation_id);
             }
@@ -6691,9 +6894,9 @@ async fn list_sessions(State(s): State<AppState>) -> Result<Json<serde_json::Val
                 continue;
             }
             let cls = match r.state {
-                crate::agent::AgentState::Planning | crate::agent::AgentState::Observing => {
-                    "thinking"
-                }
+                crate::agent::AgentState::Planning
+                | crate::agent::AgentState::Observing
+                | crate::agent::AgentState::Compacting => "thinking",
                 crate::agent::AgentState::ExecutingTool => "tool",
                 crate::agent::AgentState::WaitingPermission => "waiting",
                 crate::agent::AgentState::Failed => "error",
@@ -6897,13 +7100,7 @@ async fn session_action(
                 if r.conversation_id != id {
                     continue;
                 }
-                if matches!(
-                    r.state,
-                    crate::agent::AgentState::Planning
-                        | crate::agent::AgentState::ExecutingTool
-                        | crate::agent::AgentState::WaitingPermission
-                        | crate::agent::AgentState::Observing
-                ) {
+                if r.state.is_active() {
                     if let Some(run) = s.agents.read().await.get(&r.id) {
                         run.cancel.cancel();
                         if let Some(h) = run.handle.lock().expect("lock").take() {
@@ -7136,6 +7333,7 @@ async fn put_settings(
     State(s): State<AppState>,
     Json(next): Json<AppSettings>,
 ) -> Result<Json<AppSettings>, ApiError> {
+    let next = next.normalized();
     if next.inference.context_size == 0 || next.inference.context_size > 1_048_576 {
         return Err(ApiError::bad(
             "context_size must be > 0",
@@ -7171,6 +7369,18 @@ async fn put_settings(
         return Err(ApiError::bad(
             "Invalid recent message count.",
             "Keep between 2 and 200 recent messages when compacting.",
+        ));
+    }
+    if !["automatic", "off", "ask"].contains(&next.memory.auto_compact.as_str()) {
+        return Err(ApiError::bad(
+            "unknown automatic compaction setting",
+            "Use automatic or off.",
+        ));
+    }
+    if !(50..=98).contains(&next.memory.compact_at_pct) {
+        return Err(ApiError::bad(
+            "Invalid compaction threshold.",
+            "Compact at between 50% and 98% of the usable context.",
         ));
     }
     if !["auto", "off"].contains(&next.runtime.speculative.as_str()) {
@@ -7304,13 +7514,7 @@ async fn system_overview(State(s): State<AppState>) -> Json<serde_json::Value> {
         }
     }
     for r in s.agents.read().await.summaries() {
-        if matches!(
-            r.state,
-            crate::agent::AgentState::Planning
-                | crate::agent::AgentState::ExecutingTool
-                | crate::agent::AgentState::WaitingPermission
-                | crate::agent::AgentState::Observing
-        ) && !r.conversation_id.is_empty()
+        if r.state.is_active() && !r.conversation_id.is_empty()
         {
             active.insert(r.conversation_id);
         }
@@ -7846,13 +8050,7 @@ async fn model_optimize(
             .summaries()
             .iter()
             .filter(|r| {
-                matches!(
-                    r.state,
-                    crate::agent::AgentState::Planning
-                        | crate::agent::AgentState::ExecutingTool
-                        | crate::agent::AgentState::WaitingPermission
-                        | crate::agent::AgentState::Observing
-                )
+                r.state.is_active()
             })
             .count();
         n.max(1)
@@ -7891,6 +8089,96 @@ async fn calibrate(State(s): State<AppState>) -> Result<Json<serde_json::Value>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fake runtime that records every summarization prompt and answers
+    /// with a numbered summary.
+    async fn summarizing_sidecar() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = prompts.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let captured = captured.clone();
+                async move {
+                    let prompt = body["messages"][0]["content"].as_str().unwrap_or("").to_string();
+                    let n = {
+                        let mut prompts = captured.lock().unwrap();
+                        prompts.push(prompt);
+                        prompts.len()
+                    };
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"content": format!("Summary {n}: the user is building a site.")}, "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 100, "completion_tokens": 12}
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://127.0.0.1:{port}"), prompts, server)
+    }
+
+    #[tokio::test]
+    async fn long_conversations_are_summarized_in_window_sized_chunks() {
+        let (url, prompts, server) = summarizing_sidecar().await;
+        let client = SidecarClient::new(url).unwrap();
+        let cfg = InferenceConfig { n_ctx: 2048, ..InferenceConfig::default() };
+        let messages: Vec<Message> = (0..40)
+            .map(|i| Message {
+                id: format!("m{i}"),
+                conversation_id: "c".into(),
+                role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+                content: format!("message {i} ").repeat(120),
+                created_at: String::new(),
+            })
+            .collect();
+        let (summary, before) = fold_conversation_summary(&client, &cfg, "Earlier: hello.".into(), &messages)
+            .await
+            .unwrap();
+        let prompts = prompts.lock().unwrap().clone();
+        server.abort();
+        // One prompt holding all 40 messages (about 50K characters) could never
+        // fit a 2K window; the fold splits the work instead.
+        assert!(prompts.len() > 5, "{} requests", prompts.len());
+        let limit = (2048 - 341 - 512) * 3;
+        for prompt in &prompts {
+            assert!(prompt.len() <= limit + 200, "a prompt of {} characters overflows", prompt.len());
+        }
+        assert!(prompts[0].contains("Earlier: hello."), "an existing summary is the starting point");
+        assert!(prompts[1].contains("Summary 1:"), "each chunk updates the running summary");
+        assert_eq!(summary, format!("Summary {}: the user is building a site.", prompts.len()));
+        assert_eq!(before, "Earlier: hello.".len() + messages.iter().map(|m| m.content.len()).sum::<usize>());
+    }
+
+    #[test]
+    fn saved_settings_from_before_automatic_compaction_are_read_with_it_on() {
+        let mut stored = serde_json::to_value(AppSettings::default()).unwrap();
+        stored["memory"]["auto_compact"] = serde_json::json!("ask");
+        stored["memory"].as_object_mut().unwrap().remove("compact_at_pct");
+        let loaded: AppSettings = serde_json::from_value(stored).unwrap();
+        let loaded = loaded.normalized();
+        assert_eq!(loaded.memory.auto_compact, "automatic");
+        assert_eq!(loaded.memory.compact_at_pct, 90);
+        assert!(loaded.memory.auto_compaction());
+        assert_eq!(AppSettings::default().memory.compact_threshold_pct(), 90);
+    }
+
+    #[tokio::test]
+    async fn compaction_settings_are_validated() {
+        let a = app();
+        let mut next = serde_json::to_value(AppSettings::default()).unwrap();
+        next["memory"]["compact_at_pct"] = serde_json::json!(40);
+        let r = a.clone().oneshot(json_req("PUT", "/api/settings", next.clone())).await.unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        next["memory"]["compact_at_pct"] = serde_json::json!(85);
+        next["memory"]["auto_compact"] = serde_json::json!("off");
+        let r = a.oneshot(json_req("PUT", "/api/settings", next)).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let saved = body_json(r).await;
+        assert_eq!(saved["memory"]["compact_at_pct"], 85);
+        assert_eq!(saved["memory"]["auto_compact"], "off");
+    }
 
     async fn pending_approval_fixture(
         state: &AppState,

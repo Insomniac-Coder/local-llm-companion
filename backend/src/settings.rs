@@ -61,9 +61,42 @@ pub struct WorkspaceSettings {
 /// Stage 23 memory policy (§§82–88).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemorySettings {
-    pub auto_compact: String, // off | ask | automatic
+    /// automatic | off. The legacy "ask" was never implemented and reads as
+    /// automatic (see `AppSettings::normalized`).
+    pub auto_compact: String,
     pub compaction_keep_turns: usize,
     pub share_across_modes: bool,
+    /// Compact when this share of the usable context is in use: the model's
+    /// window minus the room kept for its next reply. Checked between steps
+    /// of an agent run and before a chat reply, never during either.
+    #[serde(default = "default_compact_at_pct")]
+    pub compact_at_pct: u8,
+}
+
+fn default_compact_at_pct() -> u8 {
+    90
+}
+
+impl MemorySettings {
+    pub fn auto_compaction(&self) -> bool {
+        self.auto_compact != "off"
+    }
+
+    /// The configured threshold, clamped to the range settings validation
+    /// accepts, so a hand-edited value can never disable or thrash compaction.
+    pub fn compact_threshold_pct(&self) -> u32 {
+        u32::from(self.compact_at_pct).clamp(50, 98)
+    }
+}
+
+impl AppSettings {
+    /// Values written by older versions, mapped to what they mean now.
+    pub fn normalized(mut self) -> Self {
+        if self.memory.auto_compact == "ask" {
+            self.memory.auto_compact = "automatic".into();
+        }
+        self
+    }
 }
 
 /// Stage 23 files + documents (§§67–69, §§36–38).
@@ -236,9 +269,10 @@ fn default_workspace_settings() -> WorkspaceSettings {
 }
 fn default_memory_settings() -> MemorySettings {
     MemorySettings {
-        auto_compact: "ask".into(),
+        auto_compact: "automatic".into(),
         compaction_keep_turns: 10,
         share_across_modes: false,
+        compact_at_pct: default_compact_at_pct(),
     }
 }
 fn default_files_settings() -> FilesSettings {

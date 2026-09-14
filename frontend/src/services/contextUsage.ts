@@ -8,10 +8,16 @@ export function contextDisplay(ctx: ContextInfo) {
   const tokens = pending ? null : usage ? (reported ? usage.prompt_tokens! : usage.estimated_tokens) : ctx.estimated_tokens;
   const limit = usage?.context_limit || ctx.limit || 0;
   const reserve = usage?.output_reserve ?? ctx.breakdown?.output_reserve ?? 0;
-  const percent = tokens != null && limit > 0 ? tokens / limit * 100 : 0;
-  const healthPercent = tokens != null && limit > 0 ? (tokens + reserve) / limit * 100 : 0;
+  // Measured against the room history may occupy (the window minus the
+  // reply's reserve), the same measure automatic compaction uses, so the
+  // gauge reads the threshold when compaction runs.
+  const room = usage ? usage.history_room ?? 0 : ctx.history_room_tokens ?? 0;
+  const percent = tokens == null ? 0 : !usage && ctx.usage_pct != null && room > 0 ? ctx.usage_pct : room > 0 ? tokens / room * 100 : limit > 0 ? tokens / limit * 100 : 0;
+  const healthPercent = room > 0 ? percent : tokens != null && limit > 0 ? (tokens + reserve) / limit * 100 : 0;
+  const compactAt = usage ? usage.compact_at_pct ?? 0 : ctx.auto_compact === false ? 0 : ctx.compact_at_pct ?? 0;
   return {
-    tokens, limit, reserve, pending, estimated: !reported,
+    tokens, limit, reserve, pending, estimated: !reported, room, compactAt,
+    compactions: usage?.compactions ?? 0,
     label: agent?.active ? 'Agent input' : usage ? 'Last agent input' : 'Saved context',
     percent: Math.min(100, Math.max(0, percent)),
     percentLabel: percent > 0 && percent < 1 ? '<1%' : `${Math.round(percent)}%`,

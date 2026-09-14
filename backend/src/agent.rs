@@ -13,9 +13,26 @@ pub enum AgentState {
     ExecutingTool,
     WaitingPermission,
     Observing,
+    /// Paused between steps while earlier turns are summarized to fit the
+    /// model's context window; the run resumes on its own afterwards.
+    Compacting,
     Completed,
     Failed,
     Cancelled,
+}
+
+impl AgentState {
+    /// A run in this state is still working (a paused compaction included).
+    pub fn is_active(self) -> bool {
+        matches!(
+            self,
+            Self::Planning
+                | Self::ExecutingTool
+                | Self::WaitingPermission
+                | Self::Observing
+                | Self::Compacting
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +96,16 @@ pub struct AgentContextUsage {
     pub images: u32,
     /// request = assembled input; response = runtime replied (usage optional).
     pub phase: String,
+    /// Times this run summarized earlier turns to stay within the window.
+    #[serde(default)]
+    pub compactions: u32,
+    /// Tokens the transcript may occupy (window minus the reply's reserve
+    /// and a margin): the room automatic compaction measures against.
+    #[serde(default)]
+    pub history_room: u32,
+    /// Automatic compaction threshold as a share of `history_room`; 0 = off.
+    #[serde(default)]
+    pub compact_at_pct: u32,
 }
 
 impl AgentContextUsage {
@@ -107,7 +134,17 @@ impl AgentContextUsage {
                 .sum::<usize>()
                 .min(u32::MAX as usize) as u32,
             phase: "request".into(),
+            compactions: 0,
+            history_room: 0,
+            compact_at_pct: 0,
         }
+    }
+
+    pub fn with_compaction(mut self, compactions: u32, history_room: u32, compact_at_pct: u32) -> Self {
+        self.compactions = compactions;
+        self.history_room = history_room;
+        self.compact_at_pct = compact_at_pct;
+        self
     }
 
     pub fn reported(mut self, prompt_tokens: u32, generated_tokens: u32) -> Self {

@@ -670,10 +670,12 @@ pub async fn execute_create_document(
         .record_artifact(&row)
         .map_err(|e| ToolError::Io(std::io::Error::other(e.to_string())))?;
     // Say what was produced, not only that something was: a model that meant
-    // three slides and sent one can see the shortfall in this result.
+    // three slides and sent one can see the shortfall in this result. Say
+    // where it went too: the file is not in the workspace, and an earlier
+    // wording ("open/reveal actions") read to a model as an instruction to
+    // call open_path on a path that does not exist.
     Ok(ToolResult::ok(format!(
-        "artifact {}: {} ({size_kb} KB) containing {}. Tell the user it is ready with Open/Reveal actions.",
-        row.id,
+        "saved {} ({size_kb} KB, {}) to this conversation's Artifacts panel, outside the workspace. The user opens or saves it from that panel; no tool call is needed to show it.",
         row.filename,
         content_summary(&kind, &spec),
     )))

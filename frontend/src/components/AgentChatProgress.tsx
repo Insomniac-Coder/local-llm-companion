@@ -84,6 +84,7 @@ function phaseLabel(state: string | undefined, event: AgentEvent | undefined) {
   if (state === 'FAILED') return 'Work needs attention';
   if (state === 'CANCELLED') return 'Work stopped';
   if (state === 'WAITING_PERMISSION') return 'Waiting for approval';
+  if (state === 'COMPACTING') return 'Compacting context · paused';
   if (event?.kind === 'status' && /checking|verif/i.test(event.message)) return 'Checking…';
   if (state === 'EXECUTING_TOOL') {
     const command = arg(event ?? { state: '', message: '', iteration: 0 }, 'command').toLowerCase();

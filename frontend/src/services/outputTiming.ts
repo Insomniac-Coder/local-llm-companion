@@ -1,4 +1,5 @@
-export type GenerationPhase = 'processing' | 'thinking' | 'responding';
+/** `compacting`: older messages are being summarized before the reply starts. */
+export type GenerationPhase = 'processing' | 'thinking' | 'responding' | 'compacting';
 
 export interface OutputTiming {
   basis: 'visible_output_v1';

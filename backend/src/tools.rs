@@ -186,6 +186,9 @@ pub fn chat_safe(name: &str) -> bool {
 }
 
 const MAX_FILE_BYTES: u64 = 5_000_000;
+
+/// Marks a write the host read back and found identical to what was sent.
+pub const WRITE_VERIFIED: &str = "(verified on disk)";
 const MAX_SEARCH_MATCHES: usize = 50;
 
 fn require_approved(req: &ToolRequest, approved: bool, what: &str) -> Result<(), ToolError> {
@@ -242,7 +245,23 @@ pub fn execute(
                 std::fs::create_dir_all(parent).map_err(ToolError::Io)?;
             }
             std::fs::write(&p, content).map_err(ToolError::Io)?;
-            Ok(ToolResult::ok(format!("wrote {} bytes to {rel}", content.len())))
+            // Read the file back: the host can establish byte for byte that
+            // the requested content is what is on disk, which is stronger
+            // evidence than asking the model to read its own text again (and
+            // costs no context on a small window).
+            let on_disk = std::fs::read(&p).map_err(ToolError::Io)?;
+            if on_disk != content.as_bytes() {
+                return Err(ToolError::Io(std::io::Error::other(format!(
+                    "{rel} was written but reads back as {} bytes instead of the {} sent; check the path and disk space",
+                    on_disk.len(),
+                    content.len()
+                ))));
+            }
+            Ok(ToolResult::ok(format!(
+                "wrote {} bytes ({} lines) to {rel} {WRITE_VERIFIED}",
+                content.len(),
+                content.lines().count()
+            )))
         }
         "edit_file" => {
             require_approved(req, approved, "File modifications need explicit approval.")?;
@@ -366,6 +385,17 @@ pub fn execute(
             require_approved(req, approved, "Opening apps/files needs explicit approval.")?;
             let rel = req.args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
             let p = ws.resolve(rel).map_err(ToolError::Workspace)?;
+            // The OS handler is fed only paths that exist. Given a missing
+            // path, Windows Explorer opens an unrelated folder window over
+            // the app and the call would still have looked successful.
+            if !p.exists() {
+                return Err(ToolError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "nothing exists at {rel} in the workspace, so nothing was opened. open_path opens an existing file or folder of the project; documents made with create_document live in the chat's Artifacts panel, where the user opens them."
+                    ),
+                )));
+            }
             let target = p.to_string_lossy().into_owned();
             let mut cmd = match std::env::consts::OS {
                 "windows" => {
@@ -1022,6 +1052,30 @@ mod tests {
             execute(&bad, &w, false).unwrap_err(),
             ToolError::InvalidArgs(_)
         ));
+    }
+
+    #[test]
+    fn writes_are_read_back_by_the_host_and_missing_paths_are_not_opened() {
+        let w = wsfresh("verify");
+        let req = ToolRequest {
+            name: "write_file".into(),
+            args: serde_json::json!({"path": "site/index.html", "content": "<h1>Hi</h1>\n<p>Energy</p>\n"}),
+            approved: true,
+        };
+        let result = execute(&req, &w, false).unwrap();
+        assert!(result.output.contains(WRITE_VERIFIED), "{}", result.output);
+        assert!(result.output.contains("(2 lines)"), "{}", result.output);
+        assert_eq!(std::fs::read_to_string(w.root().join("site/index.html")).unwrap(), "<h1>Hi</h1>\n<p>Energy</p>\n");
+        // open_path never hands the OS a path that does not exist (Explorer
+        // would open an unrelated window and the call would look successful).
+        let open = ToolRequest {
+            name: "open_path".into(),
+            args: serde_json::json!({"path": "energy-drink.txt"}),
+            approved: true,
+        };
+        let error = execute(&open, &w, false).unwrap_err().to_string();
+        assert!(error.contains("nothing exists at energy-drink.txt"), "{error}");
+        assert!(error.contains("Artifacts panel"), "{error}");
     }
 
     #[test]
