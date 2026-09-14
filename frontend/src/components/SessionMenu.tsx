@@ -1,7 +1,10 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { IconButton, PopDivider, PopItem, Popover } from '../ui/primitives';
 
 // Row actions for a session in the sidebar. Right-click opens the same menu.
+// The menu is layered on the page against its button: rendered inside the
+// scrolling session list, it was clipped at the list's edge and the rows
+// below the list (Models, Resources) appeared to cover it.
 export default function SessionMenu({
   pinned,
   onRename,
@@ -18,6 +21,7 @@ export default function SessionMenu({
   onClose: () => void;
 }) {
   const [open, setOpen] = useState(false);
+  const button = useRef<HTMLElement | null>(null);
   const act = (fn: () => void) => () => { setOpen(false); fn(); };
   return (
     <>
@@ -29,13 +33,14 @@ export default function SessionMenu({
         tip={false}
         aria-haspopup="menu"
         aria-expanded={open}
-        onClick={(event) => { event.stopPropagation(); setOpen((v) => !v); }}
+        onClick={(event) => { event.stopPropagation(); button.current = event.currentTarget; setOpen((v) => !v); }}
         onContextMenu={(e) => {
           e.preventDefault();
+          button.current = e.currentTarget;
           setOpen(true);
         }}
       />
-      <Popover open={open} onClose={() => setOpen(false)} label="Session actions">
+      <Popover open={open} onClose={() => setOpen(false)} label="Session actions" anchor={button}>
         <PopItem icon="pencil" onClick={act(onRename)}>Rename</PopItem>
         <PopItem icon="pin" onClick={act(onTogglePin)}>{pinned ? 'Unpin' : 'Pin to top'}</PopItem>
         <PopItem icon="fork" onClick={act(onDuplicate)}>Duplicate</PopItem>

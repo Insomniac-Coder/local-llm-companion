@@ -1,4 +1,5 @@
-import { useEffect, useId, useRef, useState, type ButtonHTMLAttributes, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from 'react';
+import { useEffect, useId, useLayoutEffect, useRef, useState, type ButtonHTMLAttributes, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from 'react';
+import { createPortal } from 'react-dom';
 import { Icon, type IconName } from './Icon';
 
 // Primitives compose tokens only. Feature components use these rather than
@@ -163,6 +164,7 @@ export function Popover({
   align = 'end',
   className,
   autoFocus = true,
+  anchor,
 }: {
   open: boolean;
   onClose: () => void;
@@ -172,10 +174,47 @@ export function Popover({
   align?: 'start' | 'end';
   className?: string;
   autoFocus?: boolean;
+  /** Render on the page layer, placed against this element. Needed inside a
+   *  scrolling container (the sidebar's session list): an absolutely
+   *  positioned menu there is clipped at the list's edge. */
+  anchor?: { current: HTMLElement | null };
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const close = useRef(onClose);
   close.current = onClose;
+  const [placed, setPlaced] = useState<{ top: number; left: number } | null>(null);
+  useLayoutEffect(() => {
+    if (!open || !anchor) {
+      setPlaced(null);
+      return;
+    }
+    const place = () => {
+      const target = anchor.current?.getBoundingClientRect();
+      // Layout size, not the on-screen box: the opening animation scales the
+      // menu, and measuring mid-animation placed it over its own button.
+      const menu = ref.current ? { width: ref.current.offsetWidth, height: ref.current.offsetHeight } : null;
+      if (!target || !menu) return;
+      const gap = 4;
+      const margin = 8;
+      const below = target.bottom + gap;
+      const above = target.top - gap - menu.height;
+      // Open on the requested side, flip when the window has no room there.
+      let top = side === 'top' ? above : below;
+      if (side !== 'top' && below + menu.height > window.innerHeight - margin && above >= margin) top = above;
+      if (side === 'top' && above < margin && below + menu.height <= window.innerHeight - margin) top = below;
+      top = Math.max(margin, Math.min(top, window.innerHeight - margin - menu.height));
+      const start = align === 'end' ? target.right - menu.width : target.left;
+      const left = Math.max(margin, Math.min(start, window.innerWidth - margin - menu.width));
+      setPlaced((current) => current && current.top === top && current.left === left ? current : { top, left });
+    };
+    place();
+    window.addEventListener('resize', place);
+    window.addEventListener('scroll', place, true);
+    return () => {
+      window.removeEventListener('resize', place);
+      window.removeEventListener('scroll', place, true);
+    };
+  }, [open, anchor, side, align]);
   useEffect(() => {
     if (!open) return;
     const opener = document.activeElement as HTMLElement | null;
@@ -205,11 +244,16 @@ export function Popover({
     else if (event.key === 'End') focusItem(ref.current, 'last');
     else focusItem(ref.current, current + (event.key === 'ArrowDown' ? 1 : -1));
   };
-  return (
-    <div ref={ref} className={`pop side-${side} align-${align}${className ? ` ${className}` : ''}`} role="menu" aria-label={label} onKeyDown={onKeyDown}>
+  // Hidden until measured, so a layered menu never flashes at the corner.
+  const layered: CSSProperties | undefined = anchor
+    ? { position: 'fixed', top: placed?.top ?? 0, left: placed?.left ?? 0, right: 'auto', bottom: 'auto', visibility: placed ? 'visible' : 'hidden' }
+    : undefined;
+  const menu = (
+    <div ref={ref} className={`pop side-${side} align-${align}${anchor ? ' layered' : ''}${className ? ` ${className}` : ''}`} style={layered} role="menu" aria-label={label} onKeyDown={onKeyDown}>
       {children}
     </div>
   );
+  return anchor && typeof document !== 'undefined' ? createPortal(menu, document.body) : menu;
 }
 
 export function PopItem({
