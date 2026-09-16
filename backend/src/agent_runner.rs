@@ -18,6 +18,23 @@ use tokio::task::JoinHandle;
 /// bound. Prefix caching makes a long unchanged transcript nearly free.
 const TRANSCRIPT_TURNS: usize = 60;
 const TOOL_OUTPUT_CHARS: usize = 16_000;
+
+/// Characters of one tool result kept in the transcript.
+///
+/// The ceiling alone was a third of the usable room on a 16K window and more
+/// than all of it on a 5K one, so a single directory listing or file read
+/// could take the transcript from below the compaction threshold to past the
+/// room in one step: the threshold was then met only after it had been
+/// overshot, and the user saw 112% where the limit was 90%. Bounding a result
+/// to a fifth of the room bounds that overshoot instead.
+///
+/// The floor keeps a result readable on the smallest windows; a result is cut
+/// at the end and the model can read the file again for the rest. Four
+/// characters per token matches the transcript estimate this bounds.
+fn tool_output_chars(room_tokens: u32) -> usize {
+    let room_chars = room_tokens as usize * 4;
+    TOOL_OUTPUT_CHARS.min((room_chars / 5).max(1_200))
+}
 const RELEASED_MARKER: &str = "[Released:";
 
 #[derive(Default)]
@@ -399,6 +416,174 @@ fn json_value_end(text: &str) -> Option<usize> {
     None
 }
 
+/// Argument names that may arrive as raw text instead of a JSON string.
+/// Only the long ones: a path or a regex costs nothing to escape correctly.
+const RAW_ARGS: &[&str] = &["CONTENT", "OLD", "NEW"];
+
+/// Read raw argument blocks that follow the action object:
+///
+/// ```text
+/// <<<CONTENT
+/// the exact file text, no escaping of any kind
+/// CONTENT>>>
+/// ```
+///
+/// A file body written this way never passes through JSON string escaping,
+/// which is where long writes were lost: in a real run one stray character
+/// inside 10 KB of JavaScript failed the parse at column 4221 and discarded
+/// the entire 12,000-character action, and the model's shorter replacement
+/// was broken in a way that cost five more steps.
+///
+/// Returns the bytes consumed (0 when there are none), or `None` when a block
+/// was opened and not terminated. `None` must keep the action unreadable: the
+/// streaming loop stops as soon as an action is complete, so a block still
+/// arriving cannot be allowed to look finished.
+fn attach_raw_args(call: &mut ToolCall, tail: &str) -> Option<usize> {
+    let mut consumed = 0usize;
+    loop {
+        let rest = &tail[consumed..];
+        let lead = rest.len() - rest.trim_start().len();
+        let after_space = &rest[lead..];
+        let Some(open) = after_space.strip_prefix("<<<") else {
+            return Some(consumed);
+        };
+        let Some(name_line) = open.split_inclusive('\n').next() else {
+            return None; // the marker line itself is still arriving
+        };
+        let name = name_line.trim_end();
+        if !RAW_ARGS.contains(&name) {
+            return if consumed == 0 { Some(0) } else { None };
+        }
+        if !name_line.ends_with('\n') {
+            return None;
+        }
+        let body_start = consumed + lead + 3 + name_line.len();
+        let terminator = format!("{name}>>>");
+        let mut offset = body_start;
+        let body_end = loop {
+            let Some(line) = tail[offset..].split_inclusive('\n').next() else {
+                return None; // no terminator yet
+            };
+            if line.trim_end() == terminator {
+                break offset;
+            }
+            offset += line.len();
+            if offset >= tail.len() {
+                return None;
+            }
+        };
+        let text = &tail[body_start..body_end];
+        let key = name.to_ascii_lowercase();
+        match call.args.as_object_mut() {
+            Some(args) => {
+                args.insert(key, serde_json::Value::String(text.to_owned()));
+            }
+            None => return None,
+        }
+        // Stop at the end of the terminator text and leave its newline: a
+        // closing fence must be preceded by one to stand on its own line.
+        let line = tail[body_end..].split_inclusive('\n').next().unwrap_or("");
+        consumed = body_end + line.trim_end().len();
+    }
+}
+
+/// The action object plus any raw argument blocks after it.
+fn parse_action_with_raw(body: &str) -> Option<(ToolCall, usize, bool)> {
+    let (mut call, consumed, enveloped) = parse_action_object_in(body)?;
+    let extra = attach_raw_args(&mut call, &body[consumed..])?;
+    Some((call, consumed + extra, enveloped))
+}
+
+/// JSON string escapes, decoded leniently: an escape JSON does not define
+/// keeps its backslash instead of failing, because the file wanted it.
+fn lenient_unescape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('b') => out.push('\u{8}'),
+            Some('f') => out.push('\u{c}'),
+            Some(ch @ ('"' | '\\' | '/')) => out.push(ch),
+            Some('u') => {
+                let hex: String = chars.clone().take(4).collect();
+                match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                    Some(decoded) => {
+                        out.push(decoded);
+                        for _ in 0..4 {
+                            chars.next();
+                        }
+                    }
+                    None => out.push_str("\\u"),
+                }
+            }
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Recover a complete-but-unparseable action whose damage is inside one long
+/// string value. The model wrote the whole thing and closed the envelope; a
+/// single bad character in the middle is no reason to discard the rest.
+///
+/// Only the last long argument is recovered, and only by anchoring on the
+/// envelope's own end, so the value's interior is never interpreted: whatever
+/// lies between the opening quote and the object's final quote is the file.
+/// Everything else in the object must still parse, and the tool must be a
+/// registered one, so this widens no permission and invents no arguments.
+///
+/// Never used while a reply is still streaming: a truncated action would be
+/// "recovered" as a half file.
+pub fn salvage_action(text: &str) -> Option<ToolCall> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')? + 1;
+    let json = text.get(start..end)?;
+    let (key, at) = RAW_ARGS
+        .iter()
+        .filter_map(|name| {
+            let key = name.to_ascii_lowercase();
+            let pattern = format!("{QUOTE}{key}{QUOTE}:{QUOTE}", QUOTE = '"');
+            json.rfind(&pattern).map(|at| (key, at + pattern.len()))
+        })
+        .max_by_key(|(_, at)| *at)?;
+    // The value ends at the last quote with nothing but closing brackets
+    // after it. That is the envelope's own shape, not the string's contents.
+    let closing = json[at..]
+        .char_indices()
+        .rev()
+        .find(|(index, ch)| {
+            *ch == '"'
+                && json[at + index + 1..]
+                    .trim()
+                    .chars()
+                    .all(|rest| matches!(rest, '}' | ']'))
+        })
+        .map(|(index, _)| at + index)?;
+    let value = lenient_unescape(&json[at..closing]);
+    if value.trim().is_empty() {
+        return None;
+    }
+    // The same object with that value emptied has to parse on its own.
+    let skeleton = format!("{}{}", &json[..at], &json[closing..]);
+    let (mut call, consumed, _) = parse_action_object_in(&skeleton)?;
+    if !known_tool(&call.name) || skeleton[consumed..].trim() != "" {
+        return None;
+    }
+    call.args.as_object_mut()?.insert(key, value.into());
+    Some(call)
+}
+
 fn has_action_marker(text: &str) -> bool {
     text.contains("```") || text.contains("<tool_call>") || text.contains("<|tool_call>")
 }
@@ -453,7 +638,7 @@ fn locate_fenced_action(text: &str) -> Option<LocatedAction> {
         let body_start = offset;
         let body = &text[body_start..];
         let candidate = if action_label {
-            parse_action_object_in(body)
+            parse_action_with_raw(body)
                 .filter(|(call, _, enveloped)| labelled_tool || *enveloped || known_tool(&call.name))
                 .map(|(call, consumed, _)| (call, consumed))
         } else {
@@ -501,7 +686,7 @@ fn locate_tagged_action(text: &str) -> Option<LocatedAction> {
     }
     let body_start = start + OPEN.len();
     let body = &text[body_start..];
-    let (call, consumed, _) = parse_action_object_in(body)?;
+    let (call, consumed, _) = parse_action_with_raw(body)?;
     match action_closing(&body[consumed..], CLOSE) {
         Ok(Some(closing_len)) => Some(LocatedAction {
             call,
@@ -554,12 +739,11 @@ fn locate_gemma_action(text: &str) -> Option<LocatedAction> {
 fn locate_action(text: &str) -> Option<LocatedAction> {
     let trimmed = text.trim();
     if trimmed.starts_with('{') {
-        let body = repair_json_strings(trimmed);
-        let (call, consumed, enveloped) = parse_action_object(&body)?;
+        let (call, consumed, enveloped) = parse_action_with_raw(trimmed)?;
         if !enveloped && !known_tool(&call.name) {
             return None;
         }
-        if !body[consumed..].trim().is_empty() {
+        if !trimmed[consumed..].trim().is_empty() {
             return None;
         }
         return Some(LocatedAction {
@@ -656,6 +840,50 @@ pub fn looks_like_action_attempt(text: &str) -> bool {
 
 /// The reply as it should appear in the transcript: an unterminated action
 /// gets its closing marker so later turns imitate a well-formed example.
+/// Bodies below this stay verbatim: a small edit is cheap to keep, and full
+/// fidelity is worth more than the tokens.
+const CONDENSE_BODY_CHARS: usize = 1_500;
+
+/// The transcript copy of a reply that carried a file body, with the body
+/// replaced by a note once the host has confirmed the bytes on disk.
+///
+/// The reply used to be stored whole, so a 9,000-character page occupied a
+/// fifth of the usable room on a 16K window and stayed there until the next
+/// compaction. Keeping it buys nothing: the file is on disk, the host read it
+/// back, and the tool result below says so. The progress note, the tool name
+/// and the path all remain, so the model can still see what it did and read
+/// the file if it needs the text again.
+///
+/// `None` leaves the reply untouched.
+fn condensed_reply(reply: &str, call: &ToolCall, verified: bool) -> Option<String> {
+    if !verified || !matches!(call.name.as_str(), "write_file" | "append_file" | "edit_file") {
+        return None;
+    }
+    let located = locate_action(reply)?;
+    let body_chars: usize = RAW_ARGS
+        .iter()
+        .filter_map(|name| call.args.get(name.to_ascii_lowercase().as_str()))
+        .filter_map(|value| value.as_str())
+        .map(|value| value.chars().count())
+        .sum();
+    if body_chars < CONDENSE_BODY_CHARS {
+        return None;
+    }
+    let path = arg_str(call, "path").unwrap_or("the file");
+    let note = visible_progress(reply);
+    let mut out = String::new();
+    if !note.trim().is_empty() {
+        out.push_str(note.trim());
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "[{} {path}: {body_chars} characters, written and verified on disk. The text is not repeated here; read the file if it is needed again.]",
+        call.name
+    ));
+    // Only worth it if it actually frees room.
+    (out.chars().count() + 200 < reply[located.span.clone()].chars().count()).then_some(out)
+}
+
 fn transcript_reply(reply: &str) -> String {
     match locate_action(reply) {
         Some(LocatedAction {
@@ -695,6 +923,15 @@ pub fn visible_progress(text: &str) -> String {
 /// so the model forgot finished work and repeated it. A quarter of the
 /// window (at least 1,024 tokens) covers a typical action; a request still
 /// uses whatever room is free.
+/// Characters one reply can hold, for the model to plan against. Three per
+/// token is deliberately short of the four the transcript estimate uses:
+/// code is denser than prose, and a model that splits one part too early
+/// loses a step, where one that overruns loses the whole action.
+fn reply_char_budget(n_ctx: u32, output_cap: u32) -> usize {
+    let tokens = output_cap.min(n_ctx / 3).max(256);
+    tokens as usize * 3
+}
+
 fn pruning_reserve(n_ctx: u32, output_cap: u32) -> u32 {
     output_cap.min((n_ctx / 4).max(1024)).min(n_ctx / 2)
 }
@@ -799,7 +1036,7 @@ fn work_log_entry(call: &ToolCall, output: &str, failed: bool) -> Option<String>
                 None => format!("ran `{command}` in {cwd}: {}", first_line(output)),
             }
         }
-        ("write_file", false) => first_line(output),
+        ("write_file" | "append_file", false) => first_line(output),
         ("edit_file", false) => format!("edited {path}"),
         ("delete_file", false) => format!("deleted {path}"),
         ("create_document", false) => format!(
@@ -807,7 +1044,11 @@ fn work_log_entry(call: &ToolCall, output: &str, failed: bool) -> Option<String>
             arg_str(call, "filename").unwrap_or("")
         ),
         ("git_commit", false) => format!("committed: {}", arg_str(call, "message").unwrap_or("")),
-        ("write_file" | "edit_file" | "delete_file" | "create_document" | "git_commit", true) => {
+        (
+            "write_file" | "append_file" | "edit_file" | "delete_file" | "create_document"
+            | "git_commit",
+            true,
+        ) => {
             format!("{} {path} failed: {}", call.name, first_line(output))
         }
         _ => return None,
@@ -998,7 +1239,14 @@ pub fn system_prompt(
     search_enabled: bool,
     documents_enabled: bool,
 ) -> String {
-    system_prompt_for(workspace, tools, search_enabled, documents_enabled, false)
+    system_prompt_for(
+        workspace,
+        tools,
+        search_enabled,
+        documents_enabled,
+        false,
+        reply_char_budget(8192, ActionResponsePolicy::default().output_cap()),
+    )
 }
 
 /// Shell commands whose purpose is to open a window (a file in its default
@@ -1026,12 +1274,24 @@ pub fn opening_requested(task: &str) -> bool {
         .any(|phrase| task.contains(phrase))
 }
 
+/// The shell `execute_command` runs a command through, named so the model
+/// writes commands that exist. A model reached for `ls -la` and `echo '---'`
+/// on Windows because the prompt named the operating system and not the
+/// shell, and lost two steps of a run discovering it.
+fn command_shell() -> &'static str {
+    match std::env::consts::OS {
+        "windows" => "cmd.exe (`cmd /C`), so use its commands: dir, type, copy, del, `&` between commands",
+        _ => "sh (`sh -c`)",
+    }
+}
+
 pub fn system_prompt_for(
     workspace: &str,
     tools: &[crate::tools::ToolDescriptor],
     search_enabled: bool,
     documents_enabled: bool,
     opening_enabled: bool,
+    reply_chars: usize,
 ) -> String {
     let mut tool_docs = String::new();
     for t in tools {
@@ -1055,9 +1315,10 @@ pub fn system_prompt_for(
             "list_directory" => r#"{"path":"."}"#,
             "read_file" => r#"{"path":"relative/path","start_line":1,"end_line":200}"#,
             "delete_file" | "open_path" => r#"{"path":"relative/path"}"#,
-            "write_file" => r#"{"path":"relative/file","content":"full file text"}"#,
+            "write_file" => r#"{"path":"relative/file"} (the file text follows in a <<<CONTENT block, rule 2b)"#,
+            "append_file" => r#"{"path":"relative/file"} (the added text follows in a <<<CONTENT block, rule 2b)"#,
             "edit_file" => {
-                r#"{"path":"relative/file","old":"  return a + b; // BUG","new":"  return a - b;"} (old = exact existing lines without the line-number labels, unique in the file; new = their replacement)"#
+                r#"{"path":"relative/file"} (old and new follow in <<<OLD and <<<NEW blocks, rule 2b)"#
             }
             "search_text" => r#"{"query":"regex pattern","path":"."}"#,
             "execute_command" => r#"{"command":"command text","cwd":".","timeout_secs":60}"#,
@@ -1082,7 +1343,7 @@ pub fn system_prompt_for(
     }
     format!(
         "You are a local coding assistant operating inside one workspace.\n\
-         Operating system: {os}\nWorkspace root: {workspace}\n\
+         Operating system: {os}\nCommands run through: {shell}\nWorkspace root: {workspace}\n\
          All `path` arguments are relative to the workspace root and cannot escape it.\n\
          Available tools:\n{tool_docs}\n\
          Rules:\n\
@@ -1092,7 +1353,16 @@ pub fn system_prompt_for(
          {{\"name\":\"read_file\",\"args\":{{\"path\":\"README.md\"}}}}\n\
          ```\n\
          Substitute the actual tool and its arguments. Fence markers must be on separate lines. Never escape JSON object delimiters or repeat fence markers.\n\
-         3. Prefer search_text before reading; read before editing; change files with edit_file by giving the exact existing lines as old and their replacement as new (small, targeted edits; write_file only for new files).\n\
+         2b. Never put file text in JSON. Omit content, old and new from args and put each one raw after the object, between markers:\n\
+         ```tool\n\
+         {{\"name\":\"write_file\",\"args\":{{\"path\":\"src/app.js\"}}}}\n\
+         <<<CONTENT\n\
+         const pattern = /\\d+/;\n\
+         CONTENT>>>\n\
+         ```\n\
+         Between the markers the text is written exactly as it stands, so quotes, backslashes and backticks need no escaping: this is the reliable way to write code. edit_file takes <<<OLD ... OLD>>> then <<<NEW ... NEW>>>. Each marker stands alone on its line.\n\
+         2c. One response holds about {reply_chars} characters. Write a longer file in parts: write_file for the first, append_file for each next. Never shorten or simplify the work to fit, or leave a file half-written.\n\
+         3. Prefer search_text before reading; read before editing; make small targeted changes with edit_file and use write_file for new files.\n\
          4. For requested implementation work, run relevant builds/tests with execute_command and iterate on failures. Do not claim that reading a file is a passing test.\n\
          5. Never invent file contents you have not read; never redo a failed identical call.\n\
          6. For build, fix, or change requests, use the tools and complete the work; do not stop at a plan or paste code for the user to apply.\n\
@@ -1101,8 +1371,10 @@ pub fn system_prompt_for(
          9. Each turn must EITHER emit exactly one tool call OR, only when the task is done or impossible, give the final summary with NO tool block.\n\
          10. Conversation history defines follow-up references such as 'this project', 'those tasks', and 'it'. If the workspace contains multiple sibling projects and history identifies one of them, confine searches and reads to that project. Do not inspect unrelated sibling projects merely because they are present.\n",
         os = std::env::consts::OS,
+        shell = command_shell(),
         workspace = workspace,
         tool_docs = tool_docs,
+        reply_chars = reply_chars,
     )
 }
 
@@ -1405,6 +1677,7 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
         spec.search_enabled,
         documents_enabled,
         opening_enabled,
+        reply_char_budget(cfg.n_ctx, ActionResponsePolicy::default().output_cap()),
     );
     if matches!(spec.mode, AgentMode::Plan | AgentMode::CodeAssist) {
         prompt.push_str("\nThis run is READ ONLY. Only safe inspection tools are permitted. Do not write, edit, delete, create documents, execute commands or change Git state. Finish with findings or a plan, not implementation.");
@@ -1702,7 +1975,43 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
             false
         };
         let reply = completion.text.clone();
-        let parsed_call = parse_action_response(&reply);
+        let mut parsed_call = parse_action_response(&reply);
+        // A finished action whose JSON broke inside one long value is
+        // recovered rather than thrown away. In a real run a 12,084-character
+        // file write failed to parse at column 4221 and was discarded whole;
+        // the model's shorter replacement was broken in a way that cost five
+        // further steps. Never attempted on a cut-off reply, which would
+        // "recover" half a file.
+        if parsed_call.is_none()
+            && !continuation_failed
+            && !completion.is_truncated()
+            && looks_like_action_attempt(&reply)
+        {
+            if let Some(call) = salvage_action(&reply) {
+                run.emit(AgentEvent::activity(
+                    "status",
+                    S::Planning,
+                    format!(
+                        "The action's JSON was malformed, but it was complete: recovered the {} call and its {} characters of content by reading the envelope's own boundaries. {}",
+                        call.name,
+                        call.args
+                            .as_object()
+                            .and_then(|args| RAW_ARGS
+                                .iter()
+                                .filter_map(|name| args.get(name.to_ascii_lowercase().as_str()))
+                                .filter_map(|value| value.as_str())
+                                .map(|value| value.chars().count())
+                                .max())
+                            .unwrap_or(0),
+                        action_problem(&reply)
+                            .map(|problem| format!("The parser had reported: {problem}."))
+                            .unwrap_or_default(),
+                    ),
+                    it,
+                ));
+                parsed_call = Some(call);
+            }
+        }
         let invalid_reason = if continuation_failed {
             Some("The continuation returned no usable extension of the partial response.".into())
         } else {
@@ -2132,12 +2441,12 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
         if let Some(path) = arg_str(&call, "path").filter(|path| !path.trim().is_empty()) {
             if matches!(
                 call.name.as_str(),
-                "read_file" | "edit_file" | "write_file" | "search_text"
+                "read_file" | "edit_file" | "write_file" | "append_file" | "search_text"
             ) {
                 last_file = Some(path.to_string());
             }
         }
-        let shown: String = output.chars().take(TOOL_OUTPUT_CHARS).collect();
+        let shown: String = output.chars().take(tool_output_chars(room)).collect();
         let tool_failed = tool_output_failed(&output);
         if let Some(entry) = work_log_entry(&call, &output, tool_failed) {
             work_log.push(entry);
@@ -2168,6 +2477,17 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
         tool_evidence.push(tool_evidence_line(&call, &shown));
         if tool_evidence.len() > 20 {
             tool_evidence.remove(0);
+        }
+        if !tool_failed && output.contains(crate::tools::WRITE_VERIFIED) {
+            if let Some(condensed) = condensed_reply(&reply, &call, true) {
+                if let Some(turn) = transcript
+                    .iter_mut()
+                    .rev()
+                    .find(|turn| turn.role == "assistant")
+                {
+                    turn.content = condensed;
+                }
+            }
         }
         transcript.push(ChatTurn::text(
             "user",
@@ -2524,7 +2844,7 @@ impl VerificationState {
             self.labels.entry(path.clone()).or_insert_with(|| label.to_string());
         }
         match call.name.as_str() {
-            "write_file" | "edit_file" => {
+            "write_file" | "append_file" | "edit_file" => {
                 // A file written with the requested extension is the deliverable too.
                 if let (Some(kind), Some(label)) = (self.document_kind, path_label) {
                     if label.to_ascii_lowercase().ends_with(&format!(".{kind}")) {
@@ -2534,7 +2854,7 @@ impl VerificationState {
                 if let Some(path) = path {
                     // A write the host read back byte for byte is confirmed;
                     // an edit's surroundings still deserve a look.
-                    if call.name == "write_file" && output.contains(crate::tools::WRITE_VERIFIED) {
+                    if call.name != "edit_file" && output.contains(crate::tools::WRITE_VERIFIED) {
                         self.uninspected.remove(&path);
                     } else {
                         self.uninspected.insert(path);
@@ -2634,7 +2954,9 @@ fn tool_evidence_line(call: &ToolCall, output: &str) -> String {
             "VALIDATION COMMAND (check actual exit)"
         }
         "execute_command" => "COMMAND (not verification; may mutate)",
-        "write_file" | "edit_file" | "delete_file" => "FILE CHANGE (not verification)",
+        "write_file" | "append_file" | "edit_file" | "delete_file" => {
+            "FILE CHANGE (not verification)"
+        }
         _ => "ACTION",
     };
     format!(
@@ -2852,6 +3174,8 @@ fn tool_action_label(call: &ToolCall, completed: bool) -> String {
         ("edit_file", true) => "Modified file",
         ("write_file", false) => "Writing file",
         ("write_file", true) => "Wrote file",
+        ("append_file", false) => "Adding to file",
+        ("append_file", true) => "Added to file",
         ("delete_file", false) => "Deleting file",
         ("delete_file", true) => "Deleted file",
         ("execute_command", false) => "Running command",
@@ -2874,7 +3198,7 @@ fn mutation_snapshot(
     ws: &crate::workspace::WorkspaceManager,
     call: &ToolCall,
 ) -> Option<Option<String>> {
-    if !["edit_file", "write_file", "delete_file"].contains(&call.name.as_str()) {
+    if !["edit_file", "write_file", "append_file", "delete_file"].contains(&call.name.as_str()) {
         return None;
     }
     let path = ws.resolve(arg_str(call, "path")?).ok()?;
@@ -2956,6 +3280,154 @@ async fn persist_final(state: &crate::api::AppState, run: &LiveRun, content: &st
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_verified_file_body_is_not_kept_a_second_time_in_the_transcript() {
+        let body = "const value = 1;\n".repeat(200);
+        let reply = format!(
+            concat!(
+                "Writing the page.\n```tool\n",
+                r#"{{"name":"write_file","args":{{"path":"site/app.js"}}}}"#,
+                "\n<<<CONTENT\n{body}CONTENT>>>\n```\n"
+            ),
+            body = body
+        );
+        let call = parse_action_response(&reply).expect("action");
+        let condensed = condensed_reply(&reply, &call, true).expect("condensed");
+        // The note and what was done survive; the file text does not.
+        assert!(condensed.contains("Writing the page."));
+        assert!(condensed.contains("site/app.js"));
+        assert!(!condensed.contains("const value = 1;"));
+        assert!(
+            estimated_tokens(&[ChatTurn::text("assistant", condensed.clone())]) * 8
+                < estimated_tokens(&[ChatTurn::text("assistant", reply.clone())]),
+            "must free most of the room it occupied"
+        );
+        // Unverified writes and small edits are left exactly as they were.
+        assert!(condensed_reply(&reply, &call, false).is_none());
+        let small = concat!(
+            "```tool\n",
+            r#"{"name":"edit_file","args":{"path":"a.js"}}"#,
+            "\n<<<OLD\nconst a = 1;\nOLD>>>\n<<<NEW\nconst a = 2;\nNEW>>>\n```"
+        );
+        let small_call = parse_action_response(small).expect("edit");
+        assert!(condensed_reply(small, &small_call, true).is_none());
+    }
+
+    #[test]
+    fn a_complete_action_with_broken_json_is_recovered_not_discarded() {
+        // The shape of the real loss: a long body in a JSON string with one
+        // stray unescaped quote in the middle. serde stops at that quote and
+        // reports "expected `,` or `}`", and every byte after it used to go
+        // in the bin along with the rest of the action.
+        let body = format!(
+            "const a = 1;{}const bad = \"unescaped;{}const z = 2;",
+            "\\n".repeat(1),
+            "\\n".repeat(1)
+        );
+        let reply = format!(
+            "Writing it.\n<tool_call>\n{{\"name\":\"write_file\",\"args\":{{\"path\":\"app.js\",\"content\":\"{body}\"}}}}\n</tool_call>"
+        );
+        assert!(parse_action_response(&reply).is_none(), "must not parse strictly");
+        assert!(action_problem(&reply).is_some(), "the parser states a reason");
+
+        let call = salvage_action(&reply).expect("recovered");
+        assert_eq!(call.name, "write_file");
+        assert_eq!(call.args["path"], "app.js");
+        let content = call.args["content"].as_str().unwrap();
+        // Everything the model wrote is present, the stray quote included,
+        // and the escapes it did write correctly became real characters.
+        assert!(content.starts_with("const a = 1;\n"));
+        assert!(content.contains("const bad = \"unescaped;"));
+        assert!(content.ends_with("const z = 2;"));
+    }
+
+    #[test]
+    fn salvage_never_invents_an_action_or_rescues_a_cut_off_one() {
+        // No closing envelope: the reply stopped mid-string, so there is no
+        // end to anchor on and half a file must not be written.
+        let truncated = "```tool\n{\"name\":\"write_file\",\"args\":{\"path\":\"a.js\",\"content\":\"half a fi";
+        assert!(salvage_action(truncated).is_none());
+        // An unregistered tool is never conjured out of malformed text.
+        let unknown = "```tool\n{\"name\":\"rm_rf\",\"args\":{\"path\":\"a\",\"content\":\"x\"unquoted\"}}\n```";
+        assert!(salvage_action(unknown).is_none());
+        // Prose that merely mentions a tool is not an action.
+        assert!(salvage_action("I would use write_file with content here.").is_none());
+    }
+
+    /// The failure this envelope exists for: a file body carrying exactly the
+    /// characters JSON escaping gets wrong. Written raw, none of them matter.
+    const HOSTILE_JS: &str = r#"const re = /\d+\.\d+/;
+const msg = "it's \"quoted\"";
+const tpl = `line ${a}`;
+"#;
+
+    #[test]
+    fn a_file_body_can_arrive_raw_instead_of_as_a_json_string() {
+        let reply = format!(
+            concat!(
+                "Writing the script.\n",
+                "```tool\n",
+                r#"{{"name":"write_file","args":{{"path":"app.js"}}}}"#,
+                "\n<<<CONTENT\n{body}CONTENT>>>\n```\n"
+            ),
+            body = HOSTILE_JS,
+        );
+        let call = parse_action_response(&reply).expect("raw content action");
+        assert_eq!(call.name, "write_file");
+        assert_eq!(call.args["path"], "app.js");
+        // Byte for byte, trailing newline included.
+        assert_eq!(call.args["content"], HOSTILE_JS);
+    }
+
+    #[test]
+    fn a_raw_block_still_arriving_is_not_a_complete_action() {
+        // The stream stops the moment an action reads as complete, so a block
+        // that has opened and not closed must read as unfinished. Otherwise
+        // the file body is cut off mid-write.
+        let opening = concat!(
+            "```tool\n",
+            r#"{"name":"write_file","args":{"path":"app.js"}}"#,
+            "\n<<<CONTENT\nhalf a fi"
+        );
+        assert!(!action_complete(opening));
+        assert!(parse_action_response(opening).is_none());
+        let finished = format!("{opening}le\nCONTENT>>>\n```\n");
+        assert!(action_complete(&finished));
+        assert_eq!(
+            parse_action_response(&finished).unwrap().args["content"],
+            "half a file\n"
+        );
+    }
+
+    #[test]
+    fn an_edit_takes_both_halves_raw() {
+        let reply = concat!(
+            "<tool_call>\n",
+            r#"{"name":"edit_file","args":{"path":"a.js"}}"#,
+            "\n<<<OLD\n",
+            r#"const a = "x";"#,
+            "\nOLD>>>\n<<<NEW\n",
+            r#"const a = "y";"#,
+            "\nNEW>>>\n</tool_call>"
+        );
+        let call = parse_action_response(reply).expect("raw edit");
+        assert_eq!(call.name, "edit_file");
+        assert_eq!(call.args["old"], "const a = \"x\";\n");
+        assert_eq!(call.args["new"], "const a = \"y\";\n");
+    }
+
+    #[test]
+    fn json_arguments_are_unaffected_by_the_raw_form() {
+        let reply = concat!(
+            "```tool\n",
+            r#"{"name":"write_file","args":{"path":"a.txt","content":"plain"}}"#,
+            "\n```"
+        );
+        let call = parse_action_response(reply).expect("json action");
+        assert_eq!(call.args["content"], "plain");
+    }
+
     use super::*;
 
     /// Explicit opt-in diagnostic: generates text only, never executes tools.
@@ -3641,9 +4113,18 @@ mod tests {
         assert_eq!(call.args["path"], "README.md");
         assert_eq!(
             prompt.matches("```").count(),
-            2,
-            "the prompt has one balanced example only"
+            4,
+            "the prompt has two balanced examples"
         );
+        // The second example teaches the raw-body form, so it has to parse
+        // as one: a prompt that demonstrates an unreadable action is worse
+        // than one that demonstrates nothing.
+        let raw_start = prompt[end..].find("```tool\n").unwrap() + end;
+        let raw_end = prompt[raw_start + 8..].find("\n```").unwrap() + raw_start + 8 + 4;
+        let raw = parse_tool_block(&prompt[raw_start..raw_end]).unwrap();
+        assert_eq!(raw.name, "write_file");
+        assert_eq!(raw.args["path"], "src/app.js");
+        assert_eq!(raw.args["content"], "const pattern = /\\d+/;\n");
     }
 
     #[test]
@@ -3946,11 +4427,18 @@ mod tests {
     #[test]
     fn instructions_leave_a_small_window_most_of_its_history_room() {
         // On a 4K window the instructions are the part compaction can never
-        // shrink; they must stay well under half of the room history gets.
+        // shrink, so they must stay under half of the room history gets.
+        //
+        // The bar was 45% until the raw-body form (rule 2b) and the shell
+        // line were added. Both buy more room than they cost: without 2b a
+        // small window cannot write a file at all, because the body has to
+        // survive JSON escaping, and the shell line stops a run spending
+        // steps on commands the host does not have. Everything redundant with
+        // them was removed from the tool descriptions and rule 3 first.
         let prompt = system_prompt("C:/Users/someone/Code", &crate::tools::registry(), false, false);
         let tokens = estimated_tokens(&[ChatTurn::text("system", prompt)]);
         let room = history_room(4096, pruning_reserve(4096, 8192));
-        assert!(tokens * 100 / room < 45, "{tokens} instruction tokens of {room}");
+        assert!(tokens * 100 / room < 50, "{tokens} instruction tokens of {room}");
     }
 
     #[test]
@@ -3969,7 +4457,10 @@ mod tests {
         assert!(!q.contains("create_document"));
         // Nor open_path, unless the user asked for something to be opened.
         assert!(!q.contains("open_path"));
-        assert!(system_prompt_for("C:/ws", &crate::tools::registry(), false, false, true).contains("open_path"));
+        assert!(
+            system_prompt_for("C:/ws", &crate::tools::registry(), false, false, true, 12_000)
+                .contains("open_path")
+        );
         for command in ["start energy-drink/index.html", "explorer .", "cmd /c start site.html", "Start-Process chrome", "xdg-open index.html", "powershell Start-Process index.html"] {
             assert!(launches_window(command), "{command}");
         }

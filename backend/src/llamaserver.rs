@@ -11,7 +11,9 @@
 //! `llama-server` speaks an OpenAI-compatible HTTP API on 127.0.0.1:
 //! `GET /health`, `POST /v1/chat/completions`, `POST /tokenize`.
 
-use crate::inference::{thiserror_stub::InferenceError, InferenceConfig, Metrics, OutputTiming};
+use crate::inference::{
+    thiserror_stub::InferenceError, ChatTemplateShape, InferenceConfig, Metrics, OutputTiming,
+};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -490,6 +492,121 @@ impl ChatTurn {
     }
 }
 
+/// Rewrite a turn list into the shape the loaded model's template accepts.
+///
+/// Gemma 2's template raises `System role not supported` on a system turn and
+/// `Conversation roles must alternate user/assistant/...` on anything else,
+/// which llama-server returns as a 400 before a single token is generated: the
+/// model was unusable in this app, not merely degraded. Folding is preferred
+/// to dropping, so the instructions still reach a model that cannot be given
+/// them in their own turn.
+///
+/// Permissive templates (nearly all of them) are returned untouched, so the
+/// prompt prefix stays byte-identical and the KV cache still hits.
+fn template_safe_turns(turns: &[ChatTurn], shape: ChatTemplateShape) -> Vec<ChatTurn> {
+    if !shape.is_restricted() {
+        return turns.to_vec();
+    }
+    let mut out: Vec<ChatTurn> = Vec::with_capacity(turns.len());
+    let mut carried = String::new();
+    for turn in turns {
+        let mut role = turn.role.as_str();
+        // A tool result is an observation for the model to read, so it belongs
+        // with the user side; no restricted template defines a tool turn.
+        if shape.strict_alternation && role == "tool" {
+            role = "user";
+        }
+        if role == "system" && !shape.system_role {
+            if !carried.is_empty() {
+                carried.push_str("\n\n");
+            }
+            carried.push_str(&turn.content);
+            continue;
+        }
+        let mut content = turn.content.clone();
+        if !carried.is_empty() && role == "user" {
+            content = if content.trim().is_empty() {
+                std::mem::take(&mut carried)
+            } else {
+                format!("{}\n\n{}", std::mem::take(&mut carried), content)
+            };
+        }
+        // Merge into the previous turn when the roles would repeat, and open
+        // with a user turn: both are what strict alternation demands.
+        let repeats = out.last().map(|last: &ChatTurn| last.role == role) == Some(true);
+        let leads_with_assistant = out.is_empty() && role != "user";
+        if shape.strict_alternation && (repeats || leads_with_assistant) {
+            if let Some(last) = out.last_mut() {
+                if !last.content.trim().is_empty() && !content.trim().is_empty() {
+                    last.content.push_str("\n\n");
+                }
+                last.content.push_str(&content);
+                last.images.extend(turn.images.iter().cloned());
+                continue;
+            }
+            // An assistant turn with nothing before it becomes the user's.
+            role = "user";
+        }
+        out.push(ChatTurn {
+            role: role.to_string(),
+            content,
+            images: turn.images.clone(),
+        });
+    }
+    // System text with no user turn after it still has to travel.
+    if !carried.is_empty() {
+        match out.iter_mut().find(|turn| turn.role == "user") {
+            Some(turn) => turn.content = format!("{carried}\n\n{}", turn.content),
+            None => out.insert(0, ChatTurn::text("user", carried)),
+        }
+    }
+    out
+}
+
+/// Whether a rejected request was rejected by the chat template rather than
+/// by its content. The template raises; llama-server reports the raised text.
+fn is_template_refusal(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("must alternate")
+        || lower.contains("role not supported")
+        || lower.contains("unable to generate parser for this template")
+        || (lower.contains("template") && lower.contains("jinja"))
+}
+
+/// The same message list under the strictest shape any template demands.
+/// The GGUF template is read at load, but a model can ship without one, or
+/// refuse in wording this host does not recognize; one retry then rescues a
+/// model that would otherwise answer 400 to every request it serves.
+/// None when nothing would change, or when parts (images) cannot be folded.
+fn strictly_shaped_body(body: &serde_json::Value) -> Option<serde_json::Value> {
+    let messages = body.get("messages")?.as_array()?;
+    let mut turns = Vec::with_capacity(messages.len());
+    for message in messages {
+        turns.push(ChatTurn::text(
+            message.get("role")?.as_str()?,
+            message.get("content")?.as_str()?,
+        ));
+    }
+    let strict = template_safe_turns(
+        &turns,
+        ChatTemplateShape {
+            system_role: false,
+            strict_alternation: true,
+        },
+    );
+    if strict.len() == turns.len()
+        && strict
+            .iter()
+            .zip(&turns)
+            .all(|(a, b)| a.role == b.role && a.content == b.content)
+    {
+        return None;
+    }
+    let mut reshaped = body.clone();
+    reshaped["messages"] = strict.iter().map(turn_json).collect::<Vec<_>>().into();
+    Some(reshaped)
+}
+
 fn turn_json(t: &ChatTurn) -> serde_json::Value {
     if t.images.is_empty() {
         return serde_json::json!({"role": t.role, "content": t.content});
@@ -519,6 +636,7 @@ fn sampling_body(
     cfg: &InferenceConfig,
     stream: bool,
 ) -> serde_json::Value {
+    let turns = template_safe_turns(turns, cfg.chat_template);
     serde_json::json!({
         "messages": turns.iter().map(turn_json).collect::<Vec<_>>(),
         "max_tokens": max_tokens,
@@ -877,25 +995,50 @@ impl SidecarClient {
         }
     }
 
+    /// Send one chat request, retrying once under the strictest message shape
+    /// if the template refused the list. Nothing has been generated when a
+    /// template raises, so the retry repeats no visible work.
+    async fn post_chat(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<reqwest::Response, InferenceError> {
+        let url = format!("{}/v1/chat/completions", self.base_url);
+        let r = Self::send_with_retry(self.inner.post(&url).json(body)).await?;
+        if r.status().is_success() {
+            return Ok(r);
+        }
+        let code = r.status();
+        let text = r.text().await.unwrap_or_default();
+        if code == reqwest::StatusCode::BAD_REQUEST && is_template_refusal(&text) {
+            if let Some(reshaped) = strictly_shaped_body(body) {
+                tracing::warn!(
+                    "chat template refused the message list ({}); retrying with system text folded into the first user turn and roles alternating",
+                    text.chars().take(160).collect::<String>()
+                );
+                let retry = Self::send_with_retry(self.inner.post(&url).json(&reshaped)).await?;
+                if retry.status().is_success() {
+                    return Ok(retry);
+                }
+                let code = retry.status();
+                let text = retry.text().await.unwrap_or_default();
+                return Err(InferenceError::Generation(format!(
+                    "llama-server returned {code} for both the original and the template-safe message list: {}",
+                    text.chars().take(300).collect::<String>()
+                )));
+            }
+        }
+        Err(InferenceError::Generation(format!(
+            "llama-server returned {code}: {}. Check context size vs prompt length.",
+            text.chars().take(300).collect::<String>()
+        )))
+    }
+
     async fn complete_detailed(
         &self,
         body: serde_json::Value,
         cfg: &InferenceConfig,
     ) -> Result<AgentCompletion, InferenceError> {
-        let r = Self::send_with_retry(
-            self.inner
-                .post(format!("{}/v1/chat/completions", self.base_url))
-                .json(&body),
-        )
-        .await?;
-        if !r.status().is_success() {
-            let code = r.status();
-            let text = r.text().await.unwrap_or_default();
-            return Err(InferenceError::Generation(format!(
-                "llama-server returned {code}: {}. Check context size vs prompt length.",
-                text.chars().take(300).collect::<String>()
-            )));
-        }
+        let r = self.post_chat(&body).await?;
         let v: serde_json::Value = r
             .json()
             .await
@@ -1038,19 +1181,7 @@ impl SidecarClient {
         apply_options(&mut body, options);
         (handlers.on_phase)("processing");
         let mut phase = "processing";
-        let r = Self::send_with_retry(
-            self.inner
-                .post(format!("{}/v1/chat/completions", self.base_url))
-                .json(&body),
-        )
-        .await?;
-        if !r.status().is_success() {
-            let code = r.status();
-            let text = r.text().await.unwrap_or_default();
-            return Err(InferenceError::Generation(format!(
-                "llama-server returned {code}: {text}"
-            )));
-        }
+        let r = self.post_chat(&body).await?;
         let mut outcome = StreamOutcome {
             metrics: Metrics {
                 kv_cache_limit: cfg.n_ctx,
@@ -1301,6 +1432,79 @@ pub struct InferenceStatus {
     pub context_size: u32,
     pub binary_found: bool,
     pub last_error: Option<String>,
+}
+
+#[cfg(test)]
+mod template_shape_tests {
+    use super::{template_safe_turns, ChatTurn};
+    use crate::inference::ChatTemplateShape;
+
+    const STRICT: ChatTemplateShape = ChatTemplateShape {
+        system_role: false,
+        strict_alternation: true,
+    };
+
+    fn shape(turns: &[ChatTurn]) -> Vec<(String, String)> {
+        turns
+            .iter()
+            .map(|turn| (turn.role.clone(), turn.content.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn a_permissive_template_receives_the_turns_untouched() {
+        let turns = vec![
+            ChatTurn::text("system", "instructions"),
+            ChatTurn::text("user", "first"),
+            ChatTurn::text("user", "second"),
+        ];
+        assert_eq!(
+            shape(&template_safe_turns(&turns, ChatTemplateShape::default())),
+            shape(&turns)
+        );
+    }
+
+    #[test]
+    fn a_strict_template_gets_folded_system_text_and_alternating_roles() {
+        let turns = vec![
+            ChatTurn::text("system", "instructions"),
+            ChatTurn::text("user", "write a linked list"),
+            ChatTurn::text("assistant", "here it is"),
+            ChatTurn::text("tool", "tool output"),
+            ChatTurn::text("user", "now explain it"),
+        ];
+        let safe = template_safe_turns(&turns, STRICT);
+        assert_eq!(
+            shape(&safe),
+            vec![
+                ("user".into(), "instructions\n\nwrite a linked list".into()),
+                ("assistant".into(), "here it is".into()),
+                ("user".into(), "tool output\n\nnow explain it".into()),
+            ]
+        );
+        // What the template actually checks: user turns on even indices.
+        for (index, turn) in safe.iter().enumerate() {
+            assert_eq!(turn.role == "user", index % 2 == 0, "turn {index}");
+        }
+    }
+
+    #[test]
+    fn system_text_still_travels_when_no_user_turn_follows_it() {
+        let turns = vec![ChatTurn::text("system", "instructions")];
+        assert_eq!(
+            shape(&template_safe_turns(&turns, STRICT)),
+            vec![("user".into(), "instructions".into())]
+        );
+        // An assistant preface with nothing before it cannot lead either.
+        let prefaced = vec![
+            ChatTurn::text("assistant", "thinking"),
+            ChatTurn::text("user", "go"),
+        ];
+        assert_eq!(
+            shape(&template_safe_turns(&prefaced, STRICT)),
+            vec![("user".into(), "thinking\n\ngo".into())]
+        );
+    }
 }
 
 #[cfg(test)]

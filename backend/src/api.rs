@@ -34,6 +34,33 @@ use std::sync::Arc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
+/// A carriage return inside an SSE field value aborts the stream: axum
+/// splits `data` on newlines but panics on a \r, taking the worker thread
+/// with it. A sidecar error carrying Windows line endings killed a live
+/// generation that way, and ordinary model output can contain one just as
+/// easily. Every event payload is normalized here rather than trusted.
+fn sse_text(text: impl Into<String>) -> String {
+    let text = text.into();
+    if text.contains('\r') {
+        text.replace("\r\n", "\n")
+            .replace('\r', "\n")
+    } else {
+        text
+    }
+}
+
+/// `Event::data` with that normalization applied. Used in place of `data`
+/// for every event this module sends.
+trait SafeEvent {
+    fn safe_data(self, text: impl Into<String>) -> Event;
+}
+
+impl SafeEvent for Event {
+    fn safe_data(self, text: impl Into<String>) -> Event {
+        self.data(sse_text(text))
+    }
+}
+
 const MAX_MESSAGE_CHARS: usize = 200_000;
 const MAX_TITLE_CHARS: usize = 200;
 const CHAT_TOOL_ROUNDS: u32 = 24;
@@ -786,6 +813,10 @@ async fn start_sidecar(
         top_k: settings.inference.top_k,
         repeat_penalty: settings.inference.repeat_penalty,
         seed: None,
+        // A template that refuses a system turn or demands strict alternation
+        // has to be respected in every request this model serves, or it
+        // answers 400 to all of them.
+        chat_template: model.as_ref().map(|m| m.chat_template).unwrap_or_default(),
         ..InferenceConfig::default()
     };
     let binary = match SidecarBinary::detect(&s.models_dir) {
@@ -1698,7 +1729,7 @@ async fn run_chat_tool_round(
         None => return false,
     };
     let status = |msg: &str| {
-        let _ = tx_status.send(Ok(Event::default().event("status").data(msg.to_string())));
+        let _ = tx_status.send(Ok(Event::default().event("status").safe_data(msg.to_string())));
     };
     // Documents render into the app's artifacts folder, so they need no
     // linked project; every other chat tool inspects the workspace.
@@ -1908,7 +1939,7 @@ async fn emit_chat_activity(
     }
     let _ = tx.send(Ok(Event::default()
         .event("activity")
-        .data(serde_json::to_string(&event).unwrap_or_default())));
+        .safe_data(serde_json::to_string(&event).unwrap_or_default())));
 }
 
 fn reasoning_preface(budget: &str, native: bool) -> String {
@@ -1946,13 +1977,13 @@ fn stream_text(
     let words = full.split_whitespace().count() as u32;
     let mut events: Vec<Result<Event, Infallible>> = full
         .split_whitespace()
-        .map(|w| Ok(Event::default().event("token").data(format!("{w} "))))
+        .map(|w| Ok(Event::default().event("token").safe_data(format!("{w} "))))
         .collect();
     let mut done = serde_json::json!({"prompt_tokens": 0, "generated_tokens": words, "stopped": false, "reasoning": "off", "gen_tps": null});
     if let Some(action) = command {
         done["command"] = action;
     }
-    events.push(Ok(Event::default().event("done").data(done.to_string())));
+    events.push(Ok(Event::default().event("done").safe_data(done.to_string())));
     Sse::new(stream::iter(events).boxed()).keep_alive(KeepAlive::default())
 }
 
@@ -1965,8 +1996,8 @@ fn stream_conversation(
         stream::iter(vec![
             Ok(Event::default()
                 .event("token")
-                .data(reply["message"].as_str().unwrap_or_default())),
-            Ok(Event::default().event("done").data(done.to_string())),
+                .safe_data(reply["message"].as_str().unwrap_or_default())),
+            Ok(Event::default().event("done").safe_data(done.to_string())),
         ])
         .boxed(),
     )
@@ -2191,10 +2222,10 @@ async fn chat_sse(
         }
         let mut events: Vec<Result<Event, Infallible>> = full
             .split_whitespace()
-            .map(|w| Ok(Event::default().event("token").data(format!("{w} "))))
+            .map(|w| Ok(Event::default().event("token").safe_data(format!("{w} "))))
             .collect();
         let words = full.split_whitespace().count() as u32;
-        events.push(Ok(Event::default().event("done").data(
+        events.push(Ok(Event::default().event("done").safe_data(
             serde_json::json!({"prompt_tokens": 0, "generated_tokens": words, "stopped": false, "reasoning": "off", "gen_tps": null}).to_string(),
         )));
         return Ok(Sse::new(stream::iter(events).boxed()).keep_alive(KeepAlive::default()));
@@ -2270,12 +2301,12 @@ async fn chat_sse(
         let tx_status = tx.clone();
         let cancel_cb = bg_cancel.clone();
         let status = |msg: &str| {
-            let _ = tx_status.send(Ok(Event::default().event("status").data(msg.to_string())));
+            let _ = tx_status.send(Ok(Event::default().event("status").safe_data(msg.to_string())));
         };
         let phase = |name: &str| {
             let _ = tx_status.send(Ok(Event::default()
                 .event("phase")
-                .data(serde_json::json!({ "phase": name }).to_string())));
+                .safe_data(serde_json::json!({ "phase": name }).to_string())));
         };
         let mut bg_turns = bg_turns;
         let mut bg_sys = bg_sys;
@@ -2372,7 +2403,7 @@ async fn chat_sse(
                 Err(e) => {
                     // §125: never fabricate; degrade to local knowledge.
                     web_block = "\n\n[Web search failed. Answer from local knowledge and say search was unavailable.]".into();
-                    let _ = tx_status.send(Ok(Event::default().event("error").data(format!(
+                    let _ = tx_status.send(Ok(Event::default().event("error").safe_data(format!(
                         "Internet search failed ({e}). Continuing without web. [Retry]"
                     ))));
                 }
@@ -2545,14 +2576,14 @@ async fn chat_sse(
                 let handlers = crate::llamaserver::StreamHandlers {
                     on_token: Box::new(move |tok: &str| {
                         full_r.lock().expect("lock").push_str(tok);
-                        let _ = tx_r.send(Ok(Event::default().event("token").data(tok.to_string())));
+                        let _ = tx_r.send(Ok(Event::default().event("token").safe_data(tok.to_string())));
                     }),
                     on_reasoning: Box::new(move |text: &str| {
                         let _ = tx_reason
-                            .send(Ok(Event::default().event("reasoning").data(text.to_string())));
+                            .send(Ok(Event::default().event("reasoning").safe_data(text.to_string())));
                     }),
                     on_phase: Box::new(move |phase| {
-                        let _ = tx_phase.send(Ok(Event::default().event("phase").data(
+                        let _ = tx_phase.send(Ok(Event::default().event("phase").safe_data(
                             serde_json::json!({"phase": phase, "round": round}).to_string(),
                         )));
                     }),
@@ -2654,7 +2685,7 @@ async fn chat_sse(
                                     "user",
                                     format!("[System: your tool call could not be read ({problem}). Nothing was executed. Re-emit exactly one tool envelope with valid JSON: every string value in double quotes (a formula such as =SUM(C2:C6) is a string), no comments, no trailing commas.]"),
                                 ));
-                                let _ = tx_status.send(Ok(Event::default().event("status").data(
+                                let _ = tx_status.send(Ok(Event::default().event("status").safe_data(
                                     "The tool call was not valid JSON; asking for a corrected one…",
                                 )));
                                 continue;
@@ -2668,7 +2699,7 @@ async fn chat_sse(
                                 ));
                                 let _ = tx_status.send(Ok(Event::default()
                                     .event("status")
-                                    .data("Producing the requested file…")));
+                                    .safe_data("Producing the requested file…")));
                                 continue;
                             }
                         }
@@ -2750,7 +2781,7 @@ async fn chat_sse(
                         });
                     }
                 }
-                let _ = tx.send(Ok(Event::default().event("done").data(
+                let _ = tx.send(Ok(Event::default().event("done").safe_data(
                     serde_json::json!({
                         "message_id": bg_id,
                         "prompt_tokens": prompt_sum,
@@ -2818,7 +2849,7 @@ async fn chat_sse(
                     tracing::warn!("sidecar chat failed: {e}");
                     let _ = tx.send(Ok(Event::default()
                         .event("error")
-                        .data(format!("Inference failed: {e}"))));
+                        .safe_data(format!("Inference failed: {e}"))));
                 }
             }
         }
@@ -3324,7 +3355,21 @@ async fn conversation_context(
         None if limit > 0 => (used as f64 / limit as f64 * 100.0) as u32,
         None => 0,
     };
-    let memory_settings = s.settings.read().await.memory.clone();
+    let settings = s.settings.read().await.clone();
+    let memory_settings = settings.memory.clone();
+    // The window a request gets is rarely the size that was asked for: the
+    // loader shrinks it to fit GPU memory, and the gauge then measures
+    // against the room left after the reply's reserve. Reporting only the
+    // last of the three made a 32,768 setting read as 11,776 with nothing
+    // to explain either step.
+    let configured_limit = settings.inference.context_size;
+    let fit_note = s.llama.read().await.running.as_ref().and_then(|running| {
+        running
+            .cfg
+            .runtime_policy
+            .as_ref()
+            .and_then(|policy| policy.context_note.clone())
+    });
     let health = if health_pct < 60 {
         "healthy"
     } else if health_pct < 80 {
@@ -3337,6 +3382,9 @@ async fn conversation_context(
     let agent_context = latest_agent_context(&s, &id).await?;
     Ok(Json(serde_json::json!({
         "limit": limit,
+        "configured_limit": configured_limit,
+        "context_fit": settings.runtime.context_fit,
+        "limit_note": fit_note,
         "estimated_tokens": tok,
         "measurement": "saved_history_estimate",
         "agent_context": agent_context,
@@ -4591,7 +4639,7 @@ fn async_stream_like(
             if tx
                 .send(Ok(Event::default()
                     .event("agent")
-                    .data(serde_json::to_string(&ev).unwrap_or_default())))
+                    .safe_data(serde_json::to_string(&ev).unwrap_or_default())))
                 .is_err()
             {
                 return;
@@ -4610,7 +4658,7 @@ fn async_stream_like(
                     if tx
                         .send(Ok(Event::default()
                             .event("agent")
-                            .data(serde_json::to_string(&ev).unwrap_or_default())))
+                            .safe_data(serde_json::to_string(&ev).unwrap_or_default())))
                         .is_err()
                     {
                         return;
@@ -5366,12 +5414,12 @@ async fn prepare_conversation(
     let bg = s.clone();
     tokio::spawn(async move {
         let stage = |name: &str, status: &str, detail: &str| {
-            let _ = tx.send(Ok(Event::default().event("stage").data(
+            let _ = tx.send(Ok(Event::default().event("stage").safe_data(
                 serde_json::json!({"stage": name, "status": status, "detail": detail}).to_string(),
             )));
         };
         let fail = |msg: String| {
-            let _ = tx.send(Ok(Event::default().event("error").data(msg)));
+            let _ = tx.send(Ok(Event::default().event("error").safe_data(msg)));
         };
         // Never interrupt existing work merely to prepare another session.
         if let Err(error) = guard_agent_running(&bg, false).await {
@@ -5507,7 +5555,7 @@ async fn prepare_conversation(
             let st = bg.storage.lock().await;
             let _ = st.set_last_model(&id, &target);
         }
-        let _ = tx.send(Ok(Event::default().event("done").data(
+        let _ = tx.send(Ok(Event::default().event("done").safe_data(
             serde_json::json!({"ready": true, "model": target, "history": history_n, "memory_entries": memory_n,
                 "cache_rebuilt": false, "context_assembly": "next_request"}).to_string(),
         )));
@@ -6987,9 +7035,33 @@ async fn export_conversation(
     let history = st
         .messages_for(&id)
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
-    let tools = st.tool_executions_for(&id, 200).unwrap_or_default();
+    let tools = st.tool_executions_for(&id, 2_000).unwrap_or_default();
+    let activities = st.conversation_activities(&id).unwrap_or_default();
     let artifacts = st.artifacts_for(&id).unwrap_or_default();
     let attachments = st.attachments_for(&id).unwrap_or_default();
+    // What the log was produced on, so a run read on another machine can be
+    // told apart from one produced there: a small window and a template that
+    // refuses a system turn explain failures that look inexplicable without
+    // them.
+    let runtime_snapshot = {
+        let llama = s.llama.read().await;
+        match llama.running.as_ref() {
+            Some(running) => serde_json::json!({
+                "model_path": running.cfg.model_path.file_name().and_then(|name| name.to_str()),
+                "context": running.cfg.n_ctx,
+                "cache_type_k": running.cfg.kv_cache_type_k,
+                "cache_type_v": running.cfg.kv_cache_type_v,
+                "gpu_layers": running.cfg.n_gpu_layers,
+                "chat_template": {
+                    "system_role": running.cfg.chat_template.system_role,
+                    "strict_alternation": running.cfg.chat_template.strict_alternation,
+                },
+                "policy": running.cfg.runtime_policy,
+                "os": std::env::consts::OS,
+            }),
+            None => serde_json::json!({"os": std::env::consts::OS}),
+        }
+    };
     let decisions: Vec<String> = history
         .iter()
         .filter(|m| m.role == "assistant")
@@ -7002,7 +7074,9 @@ async fn export_conversation(
         .collect();
     let files: Vec<String> = tools
         .iter()
-        .filter(|t| ["write_file", "edit_file", "create_document"].contains(&t.tool.as_str()))
+        .filter(|t| {
+            ["write_file", "append_file", "edit_file", "create_document"].contains(&t.tool.as_str())
+        })
         .take(50)
         .map(|t| {
             format!(
@@ -7021,7 +7095,46 @@ async fn export_conversation(
         "tool_calls": tools.len(),
         "artifacts": artifacts.iter().map(|a| &a.filename).collect::<Vec<_>>(),
         "attachments": attachments.iter().map(|a| &a.filename).collect::<Vec<_>>(),
-        "transcript": history.iter().take(400).map(|m| serde_json::json!({"role": m.role, "content": m.content.chars().take(4000).collect::<String>()})).collect::<Vec<_>>(),
+        // The transcript carries its message ids so the journal below can be
+        // matched to the reply it belongs to on another machine.
+        "transcript": history
+            .iter()
+            .map(|m| serde_json::json!({
+                "id": m.id,
+                "role": m.role,
+                "created_at": m.created_at,
+                "content": m.content,
+            }))
+            .collect::<Vec<_>>(),
+        // The execution log: what each action was asked to do and what came
+        // back. Truncated results would defeat the purpose of carrying a
+        // failure to another machine to read, so they travel whole.
+        "executions": tools
+            .iter()
+            .rev()
+            .map(|t| serde_json::json!({
+                "tool": t.tool,
+                "args": t.args,
+                "result": t.result,
+                "approved": t.approved,
+                "created_at": t.created_at,
+            }))
+            .collect::<Vec<_>>(),
+        // The agent's own step-by-step journal, per reply: states, statuses,
+        // thoughts, tool starts and results, and the context measurements.
+        "activity": history
+            .iter()
+            .filter_map(|m| {
+                let events = activities.get(&m.id)?;
+                Some(serde_json::json!({"message_id": m.id, "events": events}))
+            })
+            .collect::<Vec<_>>(),
+        "runtime": runtime_snapshot,
+        // The application log as it stood at export. Not per-conversation:
+        // the failures worth carrying between machines (a model that will not
+        // load, a template that refuses every request) are logged before any
+        // conversation is involved.
+        "app_log": crate::logbuf::global().recent(1_000),
     })))
 }
 

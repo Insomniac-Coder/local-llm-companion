@@ -208,7 +208,14 @@ export async function editMessage(conversationId: string, mid: string, content: 
 }
 
 export interface ContextInfo {
+  /** The window the loaded model actually received. */
   limit: number;
+  /** The context size saved in settings, before the loader fitted it. */
+  configured_limit?: number;
+  /** 'fit' shrinks the context to GPU memory; 'requested' keeps it as saved. */
+  context_fit?: string;
+  /** Why the loaded window differs from the saved one, in the loader's words. */
+  limit_note?: string | null;
   estimated_tokens: number;
   messages_total: number;
   messages_kept: number;

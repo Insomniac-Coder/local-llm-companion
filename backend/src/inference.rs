@@ -57,6 +57,33 @@ pub mod thiserror_stub {
     impl std::error::Error for InferenceError {}
 }
 
+/// Restrictions a chat template places on the message list. Both defaults
+/// mean "no restriction": a template is marked strict only when its own source
+/// says so, never guessed from the model's name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatTemplateShape {
+    /// The template renders a system turn. False means it raises on one.
+    pub system_role: bool,
+    /// The template requires user and assistant turns to alternate strictly,
+    /// beginning with user.
+    pub strict_alternation: bool,
+}
+
+impl Default for ChatTemplateShape {
+    fn default() -> Self {
+        Self {
+            system_role: true,
+            strict_alternation: false,
+        }
+    }
+}
+
+impl ChatTemplateShape {
+    pub fn is_restricted(&self) -> bool {
+        !self.system_role || self.strict_alternation
+    }
+}
+
 /// Sampling / loading parameters (§49 Inference + §13 advanced panel).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceConfig {
@@ -88,6 +115,13 @@ pub struct InferenceConfig {
     /// rewrites and repeated tool envelopes produce. Lossless by construction.
     #[serde(default = "default_speculative")]
     pub speculative: String,
+    /// What the model's own chat template accepts. Gemma 2 and some Llama 2
+    /// derivatives refuse a system role outright and raise unless user and
+    /// assistant turns strictly alternate, so the message list that works
+    /// everywhere else returns 400 for them. Read from the GGUF template at
+    /// load; the default is permissive, as almost every modern template is.
+    #[serde(default)]
+    pub chat_template: ChatTemplateShape,
     pub temperature: f32,
     pub top_p: f32,
     pub top_k: u32,
@@ -112,6 +146,7 @@ impl Default for InferenceConfig {
             runtime_policy: None,
             cache_reuse: default_cache_reuse(),
             speculative: default_speculative(),
+            chat_template: ChatTemplateShape::default(),
             temperature: 0.7,
             top_p: 0.9,
             top_k: 40,
@@ -218,6 +253,11 @@ pub struct ResolvedRuntimePolicy {
     pub placement: String,
     pub cache_rebuild: String,
     pub notes: Vec<String>,
+    /// Why the loaded window differs from the requested one, alone. The full
+    /// note list is runtime detail for the settings page; the context meter
+    /// needs only the sentence that explains the number being read there.
+    #[serde(default)]
+    pub context_note: Option<String>,
 }
 
 fn default_cpu_context_cap() -> u32 {
@@ -512,10 +552,31 @@ pub fn resolve_runtime_policy_for_machine(
                 vram,
                 ram_available_bytes,
             ) {
-                effective_context = plan.context;
-                cache_type = plan.cache_type;
-                placement = plan.placement;
-                fit_note = plan.note;
+                if tuning.keeps_requested_context() && plan.context < effective_context {
+                    // The user's size stands. Say what it costs rather than
+                    // quietly charging them for it: a larger cache takes GPU
+                    // memory the weights would otherwise have used.
+                    let cache = cache_bytes_per_token(
+                        model.kv_bytes_per_token.unwrap_or(0),
+                        &plan.cache_type,
+                    ) * u64::from(effective_context);
+                    cache_type = plan.cache_type;
+                    placement = if plan.placement == "gpu" {
+                        "hybrid"
+                    } else {
+                        plan.placement
+                    };
+                    fit_note = Some(format!(
+                        "Context kept at {effective_context} tokens because the context size is set to be used as written. Fitting it to GPU memory would have given {} tokens instead. Its cache needs {:.1} GB, so more of the model runs on the CPU and replies are slower; switch the setting back to fit it automatically for the faster placement.",
+                        plan.context,
+                        cache as f64 / 1e9
+                    ));
+                } else {
+                    effective_context = plan.context;
+                    cache_type = plan.cache_type;
+                    placement = plan.placement;
+                    fit_note = plan.note;
+                }
             }
         }
     }
@@ -544,10 +605,13 @@ pub fn resolve_runtime_policy_for_machine(
     if cache_reuse > 0 {
         notes.push(format!("Prompt-cache chunk reuse ({cache_reuse}-token minimum) keeps the unchanged tail of a transcript in the KV cache when earlier turns are pruned, so only the changed part is re-prefilled."));
     }
-    if let Some(note) = fit_note {
-        notes.push(note);
-    } else if effective_context < requested_context {
-        notes.push(format!("Context capped at the model's advertised limit of {effective_context} tokens; the configured preference is unchanged."));
+    let context_note = fit_note.or_else(|| {
+        (effective_context < requested_context).then(|| {
+            format!("Context capped at the model's advertised limit of {effective_context} tokens; the configured preference is unchanged.")
+        })
+    });
+    if let Some(note) = &context_note {
+        notes.push(note.clone());
     }
     if let Some(note) = cpu_note {
         notes.push(note);
@@ -607,6 +671,7 @@ pub fn resolve_runtime_policy_for_machine(
         placement: placement.into(),
         cache_rebuild: "fresh_process".into(),
         notes,
+        context_note,
     }
 }
 
@@ -1069,6 +1134,7 @@ mod tests {
             speculative: "off".into(),
             kv_cache: "q8_0".into(),
             cache_reuse: false,
+            ..Default::default()
         };
         let policy = resolve_runtime_policy_with(None, &requested, true, &tuning);
         assert_eq!(policy.cache_type_k, "q8_0");

@@ -96,8 +96,14 @@ pub fn registry() -> Vec<ToolDescriptor> {
             permission_required: "explicit",
         },
         ToolDescriptor {
+            name: "append_file",
+            description: "Add text to the end of a workspace file, creating it if absent",
+            risk: RiskLevel::Moderate,
+            permission_required: "explicit",
+        },
+        ToolDescriptor {
             name: "edit_file",
-            description: "Replace exact existing text in a workspace file: path, old (the exact lines to change, copied from read_file without the line-number labels), new (their replacement). old must occur once; add surrounding lines to make it unique. A unified-diff patch argument is also accepted.",
+            description: "Replace exact existing text: old (copied from read_file, without the line-number labels) becomes new. old must occur once; add surrounding lines to make it unique. A unified-diff patch argument is also accepted.",
             risk: RiskLevel::Moderate,
             permission_required: "explicit",
         },
@@ -161,8 +167,8 @@ pub fn registry() -> Vec<ToolDescriptor> {
 pub fn risk_of(name: &str) -> RiskLevel {
     match name {
         "execute_command" | "delete_file" => RiskLevel::Dangerous,
-        "write_file" | "edit_file" | "web_search" | "create_document" | "git_commit"
-        | "open_path" => RiskLevel::Moderate,
+        "write_file" | "append_file" | "edit_file" | "web_search" | "create_document"
+        | "git_commit" | "open_path" => RiskLevel::Moderate,
         _ => RiskLevel::Safe,
     }
 }
@@ -259,6 +265,62 @@ pub fn execute(
             }
             Ok(ToolResult::ok(format!(
                 "wrote {} bytes ({} lines) to {rel} {WRITE_VERIFIED}",
+                content.len(),
+                content.lines().count()
+            )))
+        }
+        // Writing a long file in parts is the only way to produce one at all
+        // when a reply cannot hold it: a 5K-token window leaves room for a few
+        // thousand characters per step. Appending also costs no context for
+        // an anchor, which edit_file needs and can fail to match.
+        "append_file" => {
+            require_approved(req, approved, "File modifications need explicit approval.")?;
+            const USAGE: &str =
+                "append_file requires {\"path\": \"...\", \"content\": \"text to add at the end\"}";
+            let rel = req
+                .args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| ToolError::InvalidArgs(USAGE.into()))?;
+            let content = req
+                .args
+                .get("content")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| ToolError::InvalidArgs(USAGE.into()))?;
+            let p = ws.resolve(rel).map_err(ToolError::Workspace)?;
+            let existing = match std::fs::metadata(&p) {
+                Ok(meta) => meta.len(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+                Err(e) => return Err(ToolError::Io(e)),
+            };
+            if existing + content.len() as u64 > MAX_FILE_BYTES {
+                return Err(ToolError::InvalidArgs(format!(
+                    "file would exceed {MAX_FILE_BYTES} bytes ({existing} already written)"
+                )));
+            }
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).map_err(ToolError::Io)?;
+            }
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&p)
+                .map_err(ToolError::Io)?;
+            file.write_all(content.as_bytes()).map_err(ToolError::Io)?;
+            file.flush().map_err(ToolError::Io)?;
+            drop(file);
+            // Same read-back as write_file: the host confirms the bytes landed
+            // rather than asking the model to take its own word for it.
+            let on_disk = std::fs::metadata(&p).map(|meta| meta.len()).unwrap_or(0);
+            let expected = existing + content.len() as u64;
+            if on_disk != expected {
+                return Err(ToolError::Io(std::io::Error::other(format!(
+                    "{rel} reads back as {on_disk} bytes instead of the expected {expected}"
+                ))));
+            }
+            Ok(ToolResult::ok(format!(
+                "appended {} bytes ({} lines) to {rel}; it is now {on_disk} bytes {WRITE_VERIFIED}",
                 content.len(),
                 content.lines().count()
             )))
@@ -824,6 +886,65 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.txt"), "hello").unwrap();
         WorkspaceManager::new(dir)
+    }
+
+    /// The whole path a file body travels: the model's reply, parsed as an
+    /// action, executed, read back from disk. The body is the kind that broke
+    /// a real run when it went through JSON escaping.
+    #[test]
+    fn a_raw_file_body_reaches_disk_byte_for_byte_and_appends_in_parts() {
+        let w = ws();
+        let first = r#"(() => {
+  "use strict";
+  const re = /\d+\.\d+/;
+  const msg = "it's \"quoted\"";
+  const tpl = `line ${a}`;
+"#;
+        let second = r#"  const path = "C:\Users\name";
+})();
+"#;
+        let reply = format!(
+            concat!(
+                "Writing the script.\n```tool\n",
+                r#"{{"name":"write_file","args":{{"path":"app.js"}}}}"#,
+                "\n<<<CONTENT\n{first}CONTENT>>>\n```\n"
+            ),
+            first = first
+        );
+        let call = crate::agent_runner::parse_tool_block(&reply).expect("parsed");
+        assert_eq!(call.name, "write_file");
+        let request = ToolRequest {
+            name: call.name.clone(),
+            args: call.args.clone(),
+            approved: true,
+        };
+        let result = execute(&request, &w, true).unwrap();
+        assert!(result.output.contains(WRITE_VERIFIED), "{}", result.output);
+
+        // The second part arrives as its own action, as a small window forces.
+        let appended = format!(
+            concat!(
+                "```tool\n",
+                r#"{{"name":"append_file","args":{{"path":"app.js"}}}}"#,
+                "\n<<<CONTENT\n{second}CONTENT>>>\n```\n"
+            ),
+            second = second
+        );
+        let call = crate::agent_runner::parse_tool_block(&appended).expect("parsed append");
+        let request = ToolRequest {
+            name: call.name.clone(),
+            args: call.args.clone(),
+            approved: true,
+        };
+        execute(&request, &w, true).unwrap();
+
+        let on_disk = std::fs::read_to_string(w.root().join("app.js")).unwrap();
+        assert_eq!(on_disk, format!("{first}{second}"));
+        // The characters that used to be lost survived: an apostrophe, an
+        // escaped quote, a regex backslash, a backtick and a Windows path.
+        assert!(on_disk.contains(r#"const re = /\d+\.\d+/;"#));
+        assert!(on_disk.contains(r#"const msg = "it's \"quoted\"";"#));
+        assert!(on_disk.contains(r#""C:\Users\name""#));
     }
 
     #[test]

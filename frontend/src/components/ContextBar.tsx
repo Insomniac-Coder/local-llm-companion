@@ -18,6 +18,33 @@ function hasLimit(ctx: ContextInfo | null): ctx is ContextInfo {
   return !!ctx && !!(ctx.limit || ctx.agent_context?.usage?.context_limit);
 }
 
+/** Setting -> loaded window -> usable room. Only the last of the three used
+ * to be shown, so a 32,768-token setting read as 11,776 with nothing to say
+ * where the other two steps went. */
+function ContextSizeChain({ ctx, room }: { ctx: ContextInfo; room: number }) {
+  const configured = ctx.configured_limit ?? 0;
+  const limit = ctx.limit || 0;
+  if (!configured || !limit) return null;
+  const fitted = configured !== limit;
+  const note = ctx.limit_note;
+  return (
+    <section className="ctx-section">
+      <div className="ctx-row"><span>Context size in settings</span><span>{fmtK(configured)}</span></div>
+      <div className="ctx-row"><span>Window this model was loaded with</span><span>{fmtK(limit)}</span></div>
+      {room > 0 && <div className="ctx-row"><span>Of that, usable for history</span><span>{fmtK(room)}</span></div>}
+      {fitted && (
+        <p className="ctx-note">
+          {limit < configured
+            ? `The window was reduced from ${fmtK(configured)} to fit the model and its context cache into memory. `
+            : `The model's own trained limit is ${fmtK(limit)}. `}
+          {room > 0 && `The rest of the window is reserved for the reply, which is why the meter counts against ${fmtK(room)}.`}
+        </p>
+      )}
+      {note && <p className="ctx-note">{note}</p>}
+    </section>
+  );
+}
+
 /** The explanation of what the model can see: agent input first, then saved history. */
 function ContextDetails({ ctx, onCompact, compacting, heading }: Props & { ctx: ContextInfo; heading?: boolean }) {
   const display = contextDisplay(ctx);
@@ -35,6 +62,7 @@ function ContextDetails({ ctx, onCompact, compacting, heading }: Props & { ctx: 
         </div>
       )}
       <div className={`ctx-track${trackTone}`} aria-hidden="true"><i style={{ width: `${display.percent}%` }} /></div>
+      <ContextSizeChain ctx={ctx} room={display.room} />
       {!display.pending && display.health !== 'healthy' && <p className="ctx-note">{healthLabel(display.health)}</p>}
       <p className="ctx-note">{display.compactAt > 0 ? `Compacts automatically at ${display.compactAt}% of the usable context (the ${fmtK(display.limit)}-token window minus room for the reply). ${agent?.active ? 'A run pauses between steps while it happens, then resumes.' : 'Older messages are summarized before the next reply; the originals stay saved.'}` : 'Automatic compaction is off. Older context is trimmed when the window is full.'}</p>
       {usage ? (

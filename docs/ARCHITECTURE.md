@@ -234,6 +234,44 @@ Source of truth: `Local_LLM_PC_Companion_Design.md` (§§1–107).
   summary in window-sized chunks (`fold_conversation_summary`), keeping what
   fits in two fifths of the room; the stream shows a `compacting` phase. The
   context gauge reports usage against the same room.
+- File bodies travel outside JSON (2026-09-16). An action may leave
+  `content`, `old` and `new` out of its argument object and put each one raw
+  between markers after it (`<<<CONTENT` … `CONTENT>>>`), in any envelope
+  shape. The text is taken verbatim, so no escaping can damage it; JSON
+  arguments remain accepted and unchanged. A block that has opened and not
+  closed keeps the action incomplete, because the stream stops on the first
+  complete action. When JSON is used anyway and breaks inside one long value,
+  `salvage_action` recovers that value by anchoring on the envelope's own end
+  (registered tools only, never on a truncated reply). The prompt states the
+  reply budget in characters (`reply_char_budget`) and directs longer files to
+  `write_file` then `append_file`, and names the shell commands run through.
+- Transcript growth per step is bounded so the compaction threshold is not
+  crossed before it is checked: a tool result keeps at most a fifth of the
+  room (`tool_output_chars`), and a file body the host verified on disk is
+  replaced in the stored reply by a note naming the path and size
+  (`condensed_reply`, bodies of 1,500 characters and over only).
+- Chat templates that refuse a message list are respected
+  (`ChatTemplateShape`, read from the GGUF's own template by what its
+  `raise_exception` calls say, never from the model's name). For a restricted
+  template the system turn is folded into the first user turn and consecutive
+  same-role turns are merged, so user and assistant alternate; permissive
+  templates are untouched and keep their cached prefix. A 400 whose body
+  reports a template refusal is retried once under that shape, covering
+  templates whose wording is not recognized.
+- Every SSE payload is normalized before it is sent (`sse_text`): axum splits
+  `data` on newlines but panics on a carriage return, which killed a worker
+  thread mid-generation when a sidecar error carried Windows line endings.
+- Context size is reported as the chain it is: the saved setting, the window
+  the model was loaded with, and the room left for history after the reply's
+  reserve, with the loader's one-sentence reason (`context_note`).
+  `settings.runtime.context_fit` = `fit` (default, shrink the window to keep
+  the model on the GPU) or `requested` (keep the saved size and let layers run
+  on the CPU); the note says which happened and what it cost.
+- Session export carries the whole record: full transcript with message ids,
+  every tool execution with its arguments and result, the agent journals per
+  reply, the runtime snapshot (window, cache types, template shape, policy)
+  and the tail of the application log (`logbuf::LogTail`, 2,000 lines), so a
+  failure on one machine can be read on another.
 - Storage: indexes on every conversation/workspace-keyed table, one query for
   all journals of a conversation, `busy_timeout`.
 - Routing (`request_router`, Code sessions only; Chat never routes): the

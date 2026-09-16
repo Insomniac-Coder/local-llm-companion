@@ -21,6 +21,7 @@ mod hardware;
 mod inference;
 mod inspection_context;
 mod llamaserver;
+mod logbuf;
 mod metrics;
 mod models;
 mod permissions;
@@ -47,6 +48,13 @@ async fn main() {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with(tracing_subscriber::fmt::layer())
+        // A second copy of every record, kept in memory so a session export
+        // can carry it to another machine to be read.
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(logbuf::global().clone()),
+        )
         .init();
 
     let cfg = config::AppConfig::from_env();
@@ -100,6 +108,7 @@ async fn main() {
                 vision: false,
                 tool_calling: true,
                 supports_reasoning: false,
+                chat_template: Default::default(),
                 kv_bytes_per_token: None,
                 weights_bytes: None,
                 projector_file: None,

@@ -201,6 +201,23 @@ pub struct RuntimeSettings {
     pub kv_cache: String,
     /// Reuse unchanged KV chunks after a prompt diverges (agent loops).
     pub cache_reuse: bool,
+    /// "fit" (default) lets the loader shrink the context so the model stays
+    /// on the GPU; "requested" keeps the saved context size even when that
+    /// pushes layers onto the CPU. The saved size is never silently ignored:
+    /// this decides which of the two the user meant.
+    #[serde(default = "default_context_fit")]
+    pub context_fit: String,
+}
+
+fn default_context_fit() -> String {
+    "fit".into()
+}
+
+impl RuntimeSettings {
+    /// The user asked for their context size to stand as written.
+    pub fn keeps_requested_context(&self) -> bool {
+        self.context_fit == "requested"
+    }
 }
 
 impl Default for RuntimeSettings {
@@ -209,6 +226,7 @@ impl Default for RuntimeSettings {
             speculative: "auto".into(),
             kv_cache: "f16".into(),
             cache_reuse: true,
+            context_fit: default_context_fit(),
         }
     }
 }

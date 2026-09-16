@@ -50,6 +50,11 @@ pub struct ModelMetadata {
     /// Weight file size in bytes at scan time.
     #[serde(default)]
     pub weights_bytes: Option<u64>,
+    /// Restrictions this model's own chat template places on the message
+    /// list. Always taken from the GGUF, never from metadata.json: it
+    /// describes the template, and the template travels with the weights.
+    #[serde(default, skip_deserializing)]
+    pub chat_template: crate::inference::ChatTemplateShape,
     #[serde(default)]
     pub projector_file: Option<String>,
     /// GGUF filename inside `dir`. Older metadata omits this and continues to
@@ -305,10 +310,43 @@ impl AttentionShape {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TemplateHints {
     thinking: bool,
     tools: bool,
+    /// What the template refuses outright. Default permissive: a template is
+    /// only called strict when it raises on the shape itself.
+    shape: crate::inference::ChatTemplateShape,
+}
+
+impl Default for TemplateHints {
+    fn default() -> Self {
+        Self {
+            thinking: false,
+            tools: false,
+            shape: crate::inference::ChatTemplateShape::default(),
+        }
+    }
+}
+
+/// What a template's own `raise_exception` calls refuse. Gemma 2 raises
+/// "System role not supported" and "Conversation roles must alternate
+/// user/assistant/..."; llama-server turns both into a 400 with no tokens
+/// generated. Reading the refusal text is exact, where guessing from the
+/// model's name is not: repacks and finetunes rename freely.
+fn template_shape(lower: &str) -> crate::inference::ChatTemplateShape {
+    let mut shape = crate::inference::ChatTemplateShape::default();
+    for (index, _) in lower.match_indices("raise_exception") {
+        let message: String = lower[index..].chars().take(160).collect();
+        let message = message.split("')").next().unwrap_or(&message);
+        if message.contains("system") {
+            shape.system_role = false;
+        }
+        if message.contains("alternate") {
+            shape.strict_alternation = true;
+        }
+    }
+    shape
 }
 
 fn template_hints(template: &str) -> TemplateHints {
@@ -319,6 +357,7 @@ fn template_hints(template: &str) -> TemplateHints {
             || lower.contains("reasoning_effort")
             || lower.contains("thinking_mode"),
         tools: lower.contains("tool_call") || lower.contains("tools"),
+        shape: template_shape(&lower),
     }
 }
 
@@ -781,6 +820,7 @@ fn inferred_metadata(
         // filename: a Qwen 3 or Gemma 4 template declares its thinking switch.
         tool_calling: header.template.tools,
         supports_reasoning: header.template.thinking,
+        chat_template: header.template.shape,
         kv_bytes_per_token: header.kv_bytes_per_token,
         weights_bytes: std::fs::metadata(gguf).ok().map(|m| m.len()),
         projector_file: projector_file.clone(),
@@ -907,6 +947,7 @@ pub fn scan_models_dir(dir: &std::path::Path) -> (Vec<ModelMetadata>, Vec<String
                     // omitted; it never removes an explicit declaration.
                     m.supports_reasoning |= header.template.thinking;
                     m.tool_calling |= header.template.tools;
+                    m.chat_template = header.template.shape;
                     m.kv_bytes_per_token = header.kv_bytes_per_token;
                     m.weights_bytes = std::fs::metadata(m.gguf_path()).ok().map(|f| f.len());
                     if m.projector_file.is_none() {
@@ -1002,6 +1043,7 @@ mod tests {
             name: id.into(),
             architecture: "llama".into(),
             quantization: "Q4_K_M".into(),
+            chat_template: Default::default(),
             parameters: "8B".into(),
             context_length: 32768,
             vision: false,
@@ -1246,7 +1288,8 @@ mod tests {
             template_hints(qwen3),
             TemplateHints {
                 thinking: true,
-                tools: true
+                tools: true,
+                shape: Default::default(),
             }
         );
         let chatml = "{% for message in messages %}<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>\n{% endfor %}";
@@ -1267,6 +1310,38 @@ mod tests {
         let plain = found.iter().find(|m| m.id == "plain").unwrap();
         assert!(!plain.supports_reasoning && !plain.tool_calling);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_templates_own_refusals_describe_its_shape() {
+        // Some templates reject the message list itself rather than rendering
+        // it, and llama-server returns 400 before generating a token. The
+        // refusal text is the only evidence, and it is read from whatever
+        // template the GGUF carries -- no template is known to this code.
+        let refuses = "{% if messages[0]['role'] == 'system' %}\
+            {{ raise_exception('System role not supported') }}{% endif %}\
+            {% for message in messages %}{% if (message['role'] == 'user') != (loop.index0 % 2 == 0) %}\
+            {{ raise_exception('Conversation roles must alternate user/assistant/user/assistant/...') }}\
+            {% endif %}{{ message['content'] }}{% endfor %}";
+        assert_eq!(
+            template_hints(refuses).shape,
+            crate::inference::ChatTemplateShape {
+                system_role: false,
+                strict_alternation: true,
+            }
+        );
+        // A template that raises about neither keeps every freedom, and so
+        // does one that never raises at all.
+        let plain = "{% for message in messages %}{{ message['role'] }}{% endfor %}";
+        assert_eq!(
+            template_hints(plain).shape,
+            crate::inference::ChatTemplateShape::default()
+        );
+        let unrelated = "{% if not tools %}{{ raise_exception('Tools are required') }}{% endif %}";
+        assert_eq!(
+            template_hints(unrelated).shape,
+            crate::inference::ChatTemplateShape::default()
+        );
     }
 
     #[test]
