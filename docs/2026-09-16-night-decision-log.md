@@ -1187,6 +1187,56 @@ Updated continuously so it survives context compaction. Read this after `docs/HA
     - **Commit:** everything, with the model's four parts through Git LFS (`.gitignore` exception for
       `models/gemma-4-e4b-it-qat/`) and the executable bit on `run.sh` and `scripts/build-runtime.sh`. After
       the push, the single-file copy in `build/model-hold/` goes to the Recycle Bin.
+    - Pushed as `45b1656` (LFS 4/4, 4.2 GB); the single-file copy went to the Recycle Bin.
+
+57. **17:30 Owner: split Gemma 4 E2B IT the way the E4B was split and push it; remove `scripts/split-model.sh`.**
+    - **Pulled first:** `1d37014` (owner's later commit) added `scripts/split-model.sh`, a split-and-track helper.
+    - **Defect found before using it (reproduced on a 30-byte fake GGUF in the scratchpad):**
+      - The script's own help says to pass `--name` matching the repository folder, i.e. the folder the model
+        already sits in. The script then stops with "move them aside or pass --force".
+      - `--force` removes every `.gguf` in the output folder with `rm -f`, including the file being split,
+        before the split runs: the model is gone (not in the Recycle Bin) and the split fails.
+      - **Owner chose:** remove the script ("I don't want it"). It went to the Recycle Bin; history keeps it.
+    - **Model:** `models/gemma-4-e2b-it/gemma-4-E2B-it-Q4_K_M.gguf` (unsloth/gemma-4-E2B-it-GGUF, checksum-verified
+      at download), 3,106,738,272 bytes, SHA-256 `740185b2…34b8`.
+    - **Split, same way as the E4B:**
+      - The single file moved to `build/model-hold/gemma-4-e2b-it/` (git-ignored, not scanned).
+      - `runtime/bin/llama-gguf-split --split --split-max-size 1500M` took 4 s: three parts of 43,316,608,
+        1,614,807,232 and 1,448,614,752 bytes (largest 1.61 GB, under GitHub LFS's 2 GB). Part 2 is one
+        tensor, the per-layer embedding table, which gguf-split cannot divide.
+      - The parts total 320 bytes more than the source (the `split.*` keys).
+    - **Lossless check:** reading source and parts with gguf-py, all 56 metadata keys match (the `split.*` keys
+      aside), and all 601 tensors match in order, type, shape and bytes (3,090,917,516 bytes, one SHA-256 over
+      all tensor bytes identical). The check caught a single flipped bit in a scratch copy of part 1.
+    - **App check (verify data, one model at a time, on AC), before and after the split:**
+
+      | | single file | split |
+      |---|---|---|
+      | listed | one model, id `gemma-4-e2b-it` | same; only `model_file` and size (+320 bytes) differ |
+      | runtime opened | `…-Q4_K_M.gguf` | `…-Q4_K_M-00001-of-00003.gguf` |
+      | load | 4.7 s, GPU, 32K | 4.3 s, GPU, 32K |
+      | chat, one-line answer | 132.8 tok/s | 146.7 tok/s |
+      | chat, 141–143 tokens | 154.6 tok/s | 174.5 tok/s |
+
+      Output speed, higher is faster; one run each, so the split is not claimed to be faster. Both answers
+      were correct.
+    - **Found, not caused by the split (same before and after):** in a code session the E2B answers the
+      question "what does the project do…" with the text `list_directory\n{"path":"."}` (10 tokens). That is
+      not a format the parser reads; the app pushes back once ("Nothing in the project has been read yet"),
+      the model repeats it, and the run completes with that text as the answer in 0.5 s. The E2B code suite
+      was never run (code tests were the 4B–30B). Not fixed here.
+    - **Git LFS:** `git lfs track "models/gemma-4-e2b-it/*.gguf"`, `.gitignore` exception for the folder.
+      - Storage: E4B 3.93 GiB + E2B 2.89 GiB = 6.82 GiB of the 10 GiB GitHub Free/Pro include (per account;
+        uploads count toward storage only, not bandwidth). LFS objects can only be removed by deleting and
+        recreating the repository (GitHub docs).
+      - Bandwidth: a clone that fetches both now pays 6.82 GiB of the 10 GiB a month; when it runs out, LFS
+        is disabled on the account until the next month.
+      - Fetching one model, tested in a throwaway repository with a local LFS remote: `git clone -c
+        "lfs.fetchinclude=<folder>/*"` fetched only that folder (the other stayed a pointer, also after a later
+        `git pull`); `git config lfs.fetchinclude` before `git pull` in an existing clone did the same; `git lfs
+        pull --include` fetched the skipped one later. README, HANDOFF and the rehearsal checklist say so.
+    - **Commits:** the script removal on its own, then the model with its docs. After the push, the single-file
+      copy in `build/model-hold/` goes to the Recycle Bin.
 
 ## Blocked / needs the owner
 

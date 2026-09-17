@@ -146,6 +146,11 @@ Compiled and tested (backend 333 tests, frontend 64 tests at that point):
     `INCOMPATIBLE.txt`. **Verified live**: downloaded `unsloth/gemma-4-E2B-it-GGUF`
     `gemma-4-E2B-it-Q4_K_M.gguf` into `models/gemma-4-e2b-it/`, checksum ok, 601 tensors, template
     present (probe deferred).
+  - **Committed models (Git LFS):** `models/gemma-4-e4b-it-qat/` (4 parts, night decisions 51, 55) and
+    `models/gemma-4-e2b-it/` (3 parts, decision 57), each split with the runtime's
+    `llama-gguf-split --split --split-max-size 1500M`, tracked in `.gitattributes`, with a `.gitignore`
+    exception per folder. Every clone that fetches both pays 6.8 GiB of the owner's 10 GiB monthly LFS
+    bandwidth; the README shows `lfs.fetchinclude` for fetching one.
   - `scripts/bench/*.mjs`: runtime/bin default, no default model.
   - `.gitignore`: `/build/`, `/runtime/*` except the lock file, downloader exception.
 - Docs: the three audit documents above; this handoff.

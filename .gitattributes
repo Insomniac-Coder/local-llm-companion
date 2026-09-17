@@ -5,3 +5,4 @@
 *.bat text eol=crlf
 *.cmd text eol=crlf
 models/gemma-4-e4b-it-qat/*.gguf filter=lfs diff=lfs merge=lfs -text
+models/gemma-4-e2b-it/*.gguf filter=lfs diff=lfs merge=lfs -text

@@ -19,7 +19,7 @@ local-llm-companion/
   frontend/   React + TypeScript + Vite UI, served by the backend
   runtime/    llama.cpp.lock.json (the pinned commit); bin/ is built here (not in Git)
   scripts/    build-runtime.ps1 / build-runtime.sh, benchmarks, backups, end-to-end checks
-  models/     your GGUF models, one folder per model (not in Git); modeldownloader.py
+  models/     your GGUF models, one folder per model; two come with the repository (Git LFS); modeldownloader.py
   plugins/    plugin manifests
   docs/       architecture, performance, research and validation records
   run.ps1     build (first run) and start the app on Windows (PowerShell)
@@ -122,6 +122,21 @@ To use a llama.cpp you built or installed elsewhere, set `COMPANION_LLAMA_SERVER
 `llama-server` executable; the app looks there first, then `runtime/bin/`, then `PATH`.
 
 ## 4. Add models
+
+Two models come with the repository, split into parts under 2 GB and stored with Git LFS: Gemma 4 E4B
+(`models/gemma-4-e4b-it-qat/`, 4.2 GB) and Gemma 4 E2B (`models/gemma-4-e2b-it/`, 3.1 GB). Install
+[Git LFS](https://git-lfs.com) (`git lfs install`) before cloning, or Git fetches small placeholder files
+instead of the models. Every download counts against the repository owner's monthly Git LFS bandwidth, so
+fetch only the model you need:
+
+```
+git clone -c "lfs.fetchinclude=models/gemma-4-e4b-it-qat/*" <repository URL>
+git lfs pull --include "models/gemma-4-e2b-it/*"
+```
+
+The first line clones with only the E4B; the second, run later inside the clone, fetches the E2B. In an
+existing clone, `git config lfs.fetchinclude "models/gemma-4-e4b-it-qat/*"` before `git pull` does the
+same. The app does not list a model whose folder holds only placeholders.
 
 Put each model in its own folder under `models/`, e.g. `models/my-model/my-model-Q4_K_M.gguf`.
 Split GGUF files need all their parts in the same folder; a vision model's projector (`mmproj-*.gguf`)

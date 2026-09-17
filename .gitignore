@@ -52,7 +52,9 @@ Desktop.ini
 *.swp
 *.swo
 
-# The showcase model is committed, split into parts under 2 GB and stored with Git LFS
-# (night decisions 51 and 55). Other models stay local.
+# Two models are committed, split into parts under 2 GB and stored with Git LFS: the showcase
+# E4B (night decisions 51 and 55) and the E2B (decision 57). Other models stay local.
 !/models/gemma-4-e4b-it-qat/
 !/models/gemma-4-e4b-it-qat/*.gguf
+!/models/gemma-4-e2b-it/
+!/models/gemma-4-e2b-it/*.gguf
