@@ -1237,6 +1237,61 @@ Updated continuously so it survives context compaction. Read this after `docs/HA
         pull --include` fetched the skipped one later. README, HANDOFF and the rehearsal checklist say so.
     - **Commits:** the script removal on its own, then the model with its docs. After the push, the single-file
       copy in `build/model-hold/` goes to the Recycle Bin.
+    - Pushed as `3a8f37a` and `d6d69c2` (LFS 3/3, 3.1 GB); the single-file copy went to the Recycle Bin.
+    - The code-session problem above was handed to its own session (owner started it).
+
+58. **18:00 Owner: a code session must stay in its project ("I switched the project and went back to an old chat
+    … it started operating in a different folder"); owner approved grouping sessions by project.**
+    - **Cause:**
+      - Choosing a project in the sidebar picker while a code session was open re-linked that session to the new
+        project; the only trace was a toast, "Linked this session to …".
+      - Its next task then ran in the new folder. The backend checked only that the run's folder matched the
+        session's link, and the link had already been changed.
+      - Seen in the verify data: "develop a website…" (created in Test Python) and "UI check: routing" (created in
+        ui-check) were both linked to showcase-rehearsal.
+    - **Rule:**
+      - A code session keeps its project once it has a message: its history names files in that folder.
+      - Before its first message, or when it has no registered project (an older session, or its project was
+        removed), a project can still be set.
+    - **Frontend (first line):**
+      - `services/projectSessions.ts` (11 tests): `sessionProject`, `canChangeSessionProject`, `projectPick`,
+        `groupSessionsByProject`, `groupActivity`, `projectGroupOpen`.
+      - The picker switches project instead of moving the session. It opens the session last used in that
+        project (or its newest), or the project's new-task screen. It moves the open session only if nothing
+        has been asked in it yet, or if it has no project.
+      - Picks from a new-task screen (the project shortcuts, "Open or create a project…") never reopen an old
+        session.
+      - Opening a session sets the picker to its project, or to "Choose a project" for a session without one.
+      - Sidebar "Tasks by project": the current project first and expanded, the others collapsed, each with a
+        task count, a lamp when a task in it is working or waiting for approval, and a + for a new task there.
+        Expanded/collapsed is remembered per browser. Sessions without a project form a last group.
+      - Deleting the open session opens another in the same project, or its new-task screen.
+    - **Backend (second line):** `PATCH /api/conversations/:id` answers 409 "this session already works in another
+      project" when the workspace would change, or be cleared, on a session with messages whose project still
+      exists, including via a hop through chat mode (`Storage::message_count`). Two tests. With the check
+      switched off, the first test fails.
+    - **Found and fixed on the way:**
+      - `send` reloaded the session list from an older render (decision 56's refresh), where the session it had
+        just created was not open. The list refresh then reopened that session (a history reload) and put the
+        sent text back in the new-task draft, which came back on the next new-task screen.
+        - `refreshConvs` now reads the open session from the ref and opens a session only on the first load, or
+          when the open one is gone.
+        - Sending from the new-task screen clears its draft.
+      - The group's + button tooltip extended past the list, which scrolled the sidebar sideways by 120 px
+        (scrollWidth 473 vs 289). It now uses a native tooltip; scrollWidth equals the list width.
+    - **Live check** (verify data, two scratch projects with distinct files, E4B only, Ask mode):
+      1. A task in proj-one listed `alpha.py` and `alpha_notes.md`.
+      2. Picking proj-two left that session in proj-one and opened proj-two's new-task screen; a task there
+         created a second session in proj-two.
+      3. Reopening the proj-one session and asking again read `alpha.py` (answer: `alpha` returns 1). The
+         session is still linked to proj-one.
+      4. A PATCH moving it to proj-two returned 409 with the hint.
+      5. An empty task created with proj-one's + moved to proj-two when proj-two was picked.
+      - The model was unloaded before step 4, and the app was stopped afterwards.
+    - **Tests:** backend 446 passed, 4 ignored; frontend 103 pass; tsc clean.
+    - Not changed: the verify data holds two registered projects with the same name and path, which show as two
+      groups. Registering a project does not deduplicate by path.
+    - **Not committed (owner commits when asked).**
 
 ## Blocked / needs the owner
 

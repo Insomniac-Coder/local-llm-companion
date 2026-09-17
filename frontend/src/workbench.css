@@ -829,6 +829,32 @@ a.chip:hover { border-color: var(--line-3); color: var(--text); background: var(
 .sb-row .pop { top: calc(100% + 2px); right: 0; }
 .sb-rename { width: 100%; height: 32px; font-size: 13px; }
 .sb-empty { padding: 10px; font-size: 12.5px; color: var(--text-3); line-height: 1.5; }
+/* Code sessions grouped under their project. */
+.sb-project + .sb-project { margin-top: 4px; }
+.sb-project-head { display: flex; align-items: center; border-radius: 8px; transition: background-color 0.12s; }
+.sb-project-head:hover { background: var(--hover); }
+.sb-project-toggle {
+  flex: 1;
+  min-width: 0;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 6px 0 4px;
+  color: var(--text-3);
+  font-size: 12.5px;
+  font-weight: 600;
+  text-align: left;
+}
+.sb-project.current .sb-project-toggle { color: var(--text-2); }
+.sb-project-toggle .icon { flex: none; }
+.sb-project-name { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.sb-project-toggle .lamp { width: 6px; height: 6px; box-shadow: none; flex: none; }
+.sb-project-count { font-size: 11.5px; font-weight: 400; }
+.sb-project-new { margin-right: 3px; opacity: 0; }
+.sb-project-head:hover .sb-project-new, .sb-project-head:focus-within .sb-project-new, .sb-project.current .sb-project-new { opacity: 1; }
+.sb-project .sb-row-main { padding-left: 23px; }
+.sb-project .sb-empty { padding: 4px 10px 6px 23px; }
 
 .sb-utility { display: flex; flex-direction: column; gap: 1px; padding: 8px; border-top: 1px solid var(--line); }
 .sb-link {

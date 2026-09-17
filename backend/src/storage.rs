@@ -512,6 +512,14 @@ impl Storage {
         Ok(())
     }
 
+    pub fn message_count(&self, conv: &str) -> rusqlite::Result<u64> {
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE conversation_id=?",
+            [conv],
+            |r| r.get(0),
+        )
+    }
+
     pub fn messages_for(&self, conv: &str) -> rusqlite::Result<Vec<Message>> {
         // rowid order = insertion order, stable even when timestamps collide.
         let mut stmt = self.conn.prepare(

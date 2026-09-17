@@ -7998,6 +7998,22 @@ async fn patch_conversation(
         }
     }
     if let Some(w) = req.workspace {
+        // A session keeps the project its history belongs to: its messages name
+        // files in that folder. A session moved by the project picker once ran
+        // its next task in another folder (owner report, 2026-09-17). A project
+        // can still be set before the first message, or when the session has no
+        // registered project to keep.
+        if w != c.workspace && !c.workspace.trim().is_empty() {
+            let storage_error = |e: rusqlite::Error| ApiError::internal(format!("storage error: {e}"));
+            let project_kept = st.get_workspace(&c.workspace).map_err(storage_error)?.is_some();
+            if project_kept && st.message_count(&c.id).map_err(storage_error)? > 0 {
+                return Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    "this session already works in another project",
+                    "A session stays in the project it started in. Start a new task in the other project.",
+                ));
+            }
+        }
         if !w.is_empty() {
             match st.get_workspace(&w) {
                 Ok(Some(_)) => c.workspace = w,
@@ -13036,6 +13052,75 @@ Would you like me to fix it?")]));
     }
 
     // ---- Stages 32–38 endpoint tests ----
+
+    async fn patch_workspace(a: &Router, conversation: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        let response = a.clone().oneshot(json_req("PATCH", &format!("/api/conversations/{conversation}"), body)).await.unwrap();
+        (response.status(), body_json(response).await)
+    }
+
+    async fn add_test_message(state: &AppState, conversation: &str) {
+        state.storage.lock().await.add_message(&Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            conversation_id: conversation.to_string(),
+            role: "user".into(),
+            content: "Inspect this project".into(),
+            created_at: "now".into(),
+        }).unwrap();
+    }
+
+    #[tokio::test]
+    async fn code_session_keeps_its_project_once_it_has_messages() {
+        let state = AppState::new_stub();
+        let (a, first) = seed_workspace(router(state.clone()), "First").await;
+        let (a, second) = seed_workspace(a, "Second").await;
+        let response = a.clone().oneshot(json_req("POST", "/api/conversations",
+            serde_json::json!({"title": "Scoped", "model_id": "", "mode": "code", "workspace": first}))).await.unwrap();
+        let conversation = body_json(response).await["id"].as_str().unwrap().to_string();
+
+        // Before the first message the session can still be pointed elsewhere.
+        let (status, body) = patch_workspace(&a, &conversation, serde_json::json!({"workspace": second})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["workspace"], second.as_str());
+
+        add_test_message(&state, &conversation).await;
+        let (status, body) = patch_workspace(&a, &conversation, serde_json::json!({"workspace": first})).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body["error"].as_str().unwrap().contains("another project"), "{body}");
+        // Clearing the link, or leaving code mode and coming back, does not get around it.
+        let (status, _) = patch_workspace(&a, &conversation, serde_json::json!({"workspace": ""})).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let (status, _) = patch_workspace(&a, &conversation, serde_json::json!({"mode": "chat"})).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = patch_workspace(&a, &conversation, serde_json::json!({"mode": "code", "workspace": first})).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        // Naming the project it already has is not a move.
+        let (status, body) = patch_workspace(&a, &conversation, serde_json::json!({"mode": "code", "workspace": second, "title": "Renamed"})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let kept = state.storage.lock().await.get_conversation(&conversation).unwrap().unwrap();
+        assert_eq!(kept.workspace, second);
+        assert_eq!(kept.title, "Renamed");
+    }
+
+    #[tokio::test]
+    async fn session_without_a_registered_project_can_be_given_one() {
+        let state = AppState::new_stub();
+        let (a, first) = seed_workspace(router(state.clone()), "First").await;
+        let (a, second) = seed_workspace(a, "Second").await;
+        // A chat with history becomes a code session: it had no project to keep.
+        let response = a.clone().oneshot(json_req("POST", "/api/conversations",
+            serde_json::json!({"title": "Older", "model_id": ""}))).await.unwrap();
+        let conversation = body_json(response).await["id"].as_str().unwrap().to_string();
+        add_test_message(&state, &conversation).await;
+        let (status, body) = patch_workspace(&a, &conversation, serde_json::json!({"mode": "code", "workspace": first})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        // Its project is removed: choosing another is the only way to use it again.
+        let deleted = a.clone().oneshot(Request::builder().method("DELETE").uri(format!("/api/workspaces/{first}")).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(deleted.status(), StatusCode::OK);
+        let (status, body) = patch_workspace(&a, &conversation, serde_json::json!({"workspace": second})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["workspace"], second.as_str());
+    }
 
     #[tokio::test]
     async fn stale_code_workspace_never_falls_back_to_another_project() {

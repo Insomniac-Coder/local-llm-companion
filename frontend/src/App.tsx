@@ -28,6 +28,7 @@ import { PERMISSION_MODE_DESCRIPTIONS, PERMISSION_MODE_LABELS, PROJECT_BOUNDARY_
 import { VisibleOutputMeter, type GenerationPhase, type OutputTiming } from './services/outputTiming';
 import { applyAgentContext } from './services/contextUsage';
 import { currentActivitySnapshot, parseActivityStart, visibleWorkActivity } from './services/workElapsed';
+import { groupActivity, groupSessionsByProject, lastSessionKey, projectGroupOpen, projectPick, type ProjectGroup } from './services/projectSessions';
 import { APPROVE_PLAN_MESSAGE, autoTitle, matchesShortcut, nextPermissionMode, PERMISSION_MODE_SETTLE_MS, PERMISSION_MODES, PermissionModeSaver, selectAvailableModel, shouldStartAgent, updateMessage, WORKBENCH_DESTINATIONS } from './services/workbench';
 import { Button, Dialog, IconButton, Kbd, Lamp, Notice, PopDivider, PopItem, PopLabel, Popover, Toggle } from './ui/primitives';
 import { Icon, type IconName } from './ui/Icon';
@@ -116,6 +117,11 @@ export default function App() {
   const [cmdSel, setCmdSel] = useState(0);
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [wsId, setWsId] = useState(() => localStorage.getItem('companion.workspace') ?? '');
+  const [workspacesLoaded, setWorkspacesLoaded] = useState(false);
+  // Which project groups in the code sidebar are expanded, as the user left them.
+  const [projectGroups, setProjectGroups] = useState<Record<string, boolean>>(() => {
+    try { return JSON.parse(localStorage.getItem('companion.projectGroups') ?? '{}') ?? {}; } catch { return {}; }
+  });
   const [projectLauncherOpen, setProjectLauncherOpen] = useState(false);
   const [projectMenuOpen, setProjectMenuOpen] = useState(false);
   const [showShare, setShowShare] = useState(false);
@@ -185,6 +191,8 @@ export default function App() {
   const dockRef = useRef<HTMLDivElement>(null);
   const followOutput = useRef(true);
   const drafts = useRef<Record<string, string>>({});
+  // Whether the session list has loaded once (the first load opens the last session).
+  const listLoaded = useRef(false);
 
   const notify = useCallback((kind: Toast['kind'], text: string) => pushToast(setToasts, kind, text), []);
   const dismissToast = useCallback((id: number) => setToasts((items) => items.filter((toast) => toast.id !== id)), []);
@@ -254,17 +262,35 @@ export default function App() {
     } catch { /* backend offline */ }
   }
 
-  async function refreshConvs(select?: string) {
+  /** Reloads the session list. A session is opened only on the first load, or
+   *  when the open one is gone. `deletedOpen`: the open session was just
+   *  deleted; in code mode another session of the same project opens, or its
+   *  new-task screen, never another project's. */
+  async function refreshConvs(select?: string, deletedOpen = false) {
     try {
       const c = await listConversations();
       setConvs(c);
+      // The ref, not state: callers such as `send` hold an older render, where
+      // the session it just created was not open yet. Reopening it from there
+      // reloaded its history and put the sent text back in the new-task draft.
+      const open = conversationRef.current;
       if (select) void selectConv(select, c);
-      else if (!convId || !c.some((conversation) => conversation.id === convId)) {
+      else if (deletedOpen && mode === 'code') {
+        const pick = projectPick({
+          picked: wsId,
+          sessions: c.filter((conversation) => conversation.mode === 'code'),
+          projectIds: new Set(workspaces.map((workspace) => workspace.id)),
+          remembered: localStorage.getItem(lastSessionKey(wsId)),
+        });
+        if (pick.kind === 'open') void selectConv(pick.session, c);
+      }
+      else if (deletedOpen || (open ? !c.some((conversation) => conversation.id === open) : !listLoaded.current)) {
         const remembered = localStorage.getItem(`companion.last.${mode}`);
         const next = c.find((conversation) => conversation.id === remembered && (conversation.mode || 'chat') === mode)
           ?? c.find((conversation) => (conversation.mode || 'chat') === mode);
         if (next) void selectConv(next.id, c);
       }
+      listLoaded.current = true;
     } catch {
       setConvs([]);
     }
@@ -280,25 +306,57 @@ export default function App() {
   async function refreshWorkspaces() {
     try {
       setWorkspaces(await listWorkspaces());
+      setWorkspacesLoaded(true);
     } catch { /* ignore */ }
   }
 
-  async function changeWorkspace(nextId: string) {
-    if (busy || agentBusy) { notify('warning', 'Stop the current work before changing its project.'); return; }
-    const active = convs.find((conversation) => conversation.id === convId);
-    if (active?.mode === 'code' && active.workspace !== nextId) {
-      if (!nextId) { notify('warning', 'A code session must stay linked to a project.'); return; }
+  /** Choosing a project switches to it. A code session keeps the project it
+   *  started in: its history names files in that folder. The open session moves
+   *  only before its first message, or when it has no project to keep.
+   *  `startNew`: the pick came from a new-task screen. */
+  async function changeWorkspace(nextId: string, startNew = false) {
+    if (busy || agentBusy) { notify('warning', 'Stop the current work before changing project.'); return; }
+    if (!nextId) return;
+    const projectIds = new Set([...workspaces.map((workspace) => workspace.id), nextId]);
+    const active = mode === 'code' ? convs.find((conversation) => conversation.id === convId && conversation.mode === 'code') : undefined;
+    const started = historyLoading || msgs.length > 0;
+    const pick = projectPick({
+      picked: nextId,
+      open: active ? { ...active, hasMessages: started } : null,
+      sessions: convs.filter((conversation) => conversation.mode === 'code'),
+      projectIds,
+      remembered: localStorage.getItem(lastSessionKey(nextId)),
+      startNew,
+    });
+    if (pick.kind === 'move') {
       try {
-        const updated = await patchConversation(active.id, { workspace: nextId }) as Conversation;
+        const updated = await patchConversation(pick.session, { workspace: nextId }) as Conversation;
         setConvs((items) => items.map((conversation) => conversation.id === updated.id ? updated : conversation));
-        notify('success', `Linked this session to ${workspaces.find((workspace) => workspace.id === nextId)?.name ?? 'the selected project'}.`);
+        localStorage.setItem(lastSessionKey(nextId), pick.session);
+        if (started) notify('success', `This session now works in ${workspaces.find((workspace) => workspace.id === nextId)?.name ?? 'the selected project'}.`);
       } catch (error: any) {
-        notify('error', error?.message ?? 'Could not link the project.');
+        notify('error', error?.message ?? 'Could not set the project.');
         return;
       }
     }
     setWsId(nextId);
     localStorage.setItem('companion.workspace', nextId);
+    openProjectGroup(nextId);
+    if (pick.kind === 'open') void selectConv(pick.session);
+    else if (pick.kind === 'new') showNewTask();
+  }
+
+  function toggleProjectGroup(project: string, open: boolean) {
+    setProjectGroups((saved) => {
+      const next = { ...saved, [project || 'none']: open };
+      try { localStorage.setItem('companion.projectGroups', JSON.stringify(next)); } catch { /* a per-browser convenience */ }
+      return next;
+    });
+  }
+
+  /** A project the user switches to shows its tasks, even if its group was collapsed. */
+  function openProjectGroup(project: string) {
+    if (projectGroups[project || 'none'] === false) toggleProjectGroup(project, true);
   }
 
   async function refreshRegistry() {
@@ -491,9 +549,15 @@ export default function App() {
       if (nextMode !== mode) setRightTab(nextMode === 'code' ? 'activity' : 'context');
       setTab('chat');
       localStorage.setItem(`companion.last.${nextMode}`, id);
-      if (conv?.mode === 'code' && conv.workspace) {
-        setWsId(conv.workspace);
-        localStorage.setItem('companion.workspace', conv.workspace);
+      if (conv?.mode === 'code') {
+        // The picker follows the session: its own project, or none for a session without one.
+        const project = conv.workspace ?? '';
+        setWsId(project);
+        if (project) {
+          localStorage.setItem('companion.workspace', project);
+          localStorage.setItem(lastSessionKey(project), id);
+        }
+        openProjectGroup(project);
       }
       const h = await getMessages(id);
       if (conversationRef.current !== id) return;
@@ -518,14 +582,22 @@ export default function App() {
     const next = convs.find((conversation) => conversation.id === remembered && (conversation.mode || 'chat') === nextMode)
       ?? convs.find((conversation) => (conversation.mode || 'chat') === nextMode);
     if (next) void selectConv(next.id);
-    else {
-      conversationRef.current = null;
-      setConvId(null);
-      setHistoryLoading(false);
-      setInput(drafts.current['new'] ?? '');
-      setMsgs([]);
-      setCtx(null);
-    }
+    else showNewTask();
+  }
+
+  /** No session open: the new-task screen, for the current project in code mode. */
+  function showNewTask() {
+    drafts.current[convId ?? 'new'] = input;
+    conversationRef.current = null;
+    setConvId(null);
+    setHistoryLoading(false);
+    setInput(drafts.current['new'] ?? '');
+    setMsgs([]);
+    setCtx(null);
+    setUsage(null);
+    setEditing(null);
+    setFocusRun(null);
+    setShowLatest(false);
   }
 
   async function reloadMsgs(cid: string) {
@@ -538,10 +610,11 @@ export default function App() {
     } catch { /* keep optimistic view */ }
   }
 
-  async function newChat() {
+  /** `project`: the project a new code task starts in (a project group's + button). */
+  async function newChat(project = wsId) {
     try {
-      const extra = mode === 'code' ? { mode, workspace: wsId } : { mode };
-      if (mode === 'code' && !workspaces.some((workspace) => workspace.id === wsId)) {
+      const extra = mode === 'code' ? { mode, workspace: project } : { mode };
+      if (mode === 'code' && !workspaces.some((workspace) => workspace.id === project)) {
         notify('warning', 'Choose a project before starting a code session.');
         setProjectLauncherOpen(true);
         return;
@@ -556,6 +629,12 @@ export default function App() {
       setMobileNav(false);
       setInput('');
       localStorage.setItem(`companion.last.${mode}`, c.id);
+      if (mode === 'code') {
+        setWsId(project);
+        localStorage.setItem('companion.workspace', project);
+        localStorage.setItem(lastSessionKey(project), c.id);
+        openProjectGroup(project);
+      }
       setMsgs([]);
       setCtx(null);
       refreshSessions();
@@ -591,6 +670,9 @@ export default function App() {
         conversationRef.current = cid;
         setConvId(cid);
         localStorage.setItem(`companion.last.${mode}`, cid);
+        if (mode === 'code') localStorage.setItem(lastSessionKey(wsId), cid);
+        // Sent from the new-task screen: its draft is now this message.
+        drafts.current['new'] = '';
       } catch (e: any) {
         setMsgs((m) => [...m, { id: `tmp-${Date.now()}`, role: 'tool', text: `Error: ${e?.message ?? e}`, time: '' }]);
         return false;
@@ -958,8 +1040,9 @@ export default function App() {
         void (async () => {
           try {
             await deleteConversation(id);
-            if (conversationRef.current === id) { conversationRef.current = null; setConvId(null); setMsgs([]); setCtx(null); }
-            refreshConvs();
+            const wasOpen = conversationRef.current === id;
+            if (wasOpen) { conversationRef.current = null; setConvId(null); setMsgs([]); setCtx(null); }
+            refreshConvs(undefined, wasOpen);
             refreshSessions();
             notify('success', 'Conversation deleted.');
           } catch (e: any) {
@@ -1246,6 +1329,39 @@ export default function App() {
     );
   };
 
+  // Code sessions under their project: the picker's project first, then the others.
+  const projectGroupList = mode === 'code' && workspacesLoaded
+    ? groupSessionsByProject(listConvs, workspaces, wsId, { hideEmpty: !!filterText })
+    : [];
+  const sessionActivity = new Map(sessions.map((session) => [session.id, session.activity]));
+  const renderProjectGroup = (group: ProjectGroup<Conversation>) => {
+    const open = projectGroupOpen(group, projectGroups, !!filterText);
+    const activity = groupActivity(group.sessions, sessionActivity);
+    return (
+      <section key={group.project || 'none'} className={`sb-project${group.current ? ' current' : ''}`} aria-label={`${group.name}: tasks`}>
+        <div className="sb-project-head">
+          <button
+            type="button"
+            className="sb-project-toggle"
+            aria-expanded={open}
+            aria-label={`${group.name}, ${group.sessions.length} ${group.sessions.length === 1 ? 'task' : 'tasks'}${activity === 'waiting' ? ', a task is waiting for approval' : activity === 'working' ? ', a task is working' : ''}`}
+            title={group.path || 'Tasks whose project is not set or was removed. Opening one asks for a project.'}
+            onClick={() => toggleProjectGroup(group.project, !open)}
+          >
+            <Icon name={open ? 'chevronDown' : 'chevronRight'} size={13} />
+            <span className="sb-project-name">{group.name}</span>
+            {activity && <Lamp state={activity === 'waiting' ? 'caution' : 'live'} pulse={activity === 'working'} />}
+            <span className="readout muted sb-project-count">{group.sessions.length}</span>
+          </button>
+          {/* A native tooltip: the styled one extends past the list and scrolled it sideways. */}
+          {group.project && <IconButton className="sb-project-new" icon="plus" size="sm" label={`New task in ${group.name}`} tip={false} title={`New task in ${group.name}`} onClick={() => void newChat(group.project)} />}
+        </div>
+        {open && group.sessions.map(renderRow)}
+        {open && group.sessions.length === 0 && modeConvs.length > 0 && <p className="sb-empty">No tasks in this project yet.</p>}
+      </section>
+    );
+  };
+
   const workLabel = visibleWork?.kind === 'agent'
     ? agentPhase === 'ROUTING' ? 'Understanding your request…' : !inf?.running ? 'Model stopped · this run needs attention' : agentPhase === 'WAITING_PERMISSION' ? 'Waiting for your approval' : agentPhase === 'COMPACTING' ? 'Compacting context… the run resumes on its own' : agentPhase === 'EXECUTING_TOOL' ? 'Working through the project…' : agentPhase === 'OBSERVING' ? 'Reviewing the results…' : 'Planning the next step…'
     : statusLine || (generationPhase === 'compacting' ? 'Compacting the conversation before replying…' : generationPhase === 'thinking' ? `${loadedMeta?.name ?? 'The model'} is thinking…` : generationPhase === 'responding' ? `${loadedMeta?.name ?? 'The model'} is writing…` : 'Processing your request…');
@@ -1330,7 +1446,7 @@ export default function App() {
                   <Popover open={projectMenuOpen} onClose={() => setProjectMenuOpen(false)} label="Projects" side="bottom" align="start">
                     {workspaces.length > 0 && <PopLabel>Projects</PopLabel>}
                     {workspaces.map((workspace) => (
-                      <PopItem key={workspace.id} checked={workspace.id === wsId} onClick={() => { setProjectMenuOpen(false); void changeWorkspace(workspace.id); }}>
+                      <PopItem key={workspace.id} checked={workspace.id === wsId} hint={convs.filter((conversation) => conversation.mode === 'code' && conversation.workspace === workspace.id).length || undefined} onClick={() => { setProjectMenuOpen(false); void changeWorkspace(workspace.id); }}>
                         {workspace.name}
                       </PopItem>
                     ))}
@@ -1367,14 +1483,14 @@ export default function App() {
                 {pinnedConvs.map(renderRow)}
               </>
             )}
-            <div className="sb-group-label"><span className="eyebrow">{mode === 'code' ? 'Tasks' : 'Chats'}</span>{modeConvs.length > 0 && <span className="readout muted" style={{ fontSize: 11.5 }}>{modeConvs.length}</span>}</div>
+            <div className="sb-group-label"><span className="eyebrow">{mode === 'code' ? 'Tasks by project' : 'Chats'}</span>{modeConvs.length > 0 && <span className="readout muted" style={{ fontSize: 11.5 }}>{modeConvs.length}</span>}</div>
             {(modeConvs.length > 8 || sessionFilter) && (
               <div className="sb-filter">
                 <Icon name="search" size={13} />
                 <input aria-label="Filter sessions" placeholder="Filter" value={sessionFilter} onChange={(event) => setSessionFilter(event.target.value)} />
               </div>
             )}
-            {listConvs.map(renderRow)}
+            {mode === 'code' && workspacesLoaded ? projectGroupList.map(renderProjectGroup) : listConvs.map(renderRow)}
             {modeConvs.length === 0 && <p className="sb-empty">{mode === 'code' ? 'No tasks yet. Start one to work in a project.' : 'No conversations yet. Start one above.'}</p>}
             {modeConvs.length > 0 && listConvs.length === 0 && filterText && <p className="sb-empty">Nothing matches “{sessionFilter}”.</p>}
           </nav>
@@ -1425,7 +1541,7 @@ export default function App() {
           onChoose={(workspace) => {
             setProjectLauncherOpen(false);
             setWorkspaces((items) => items.some((item) => item.id === workspace.id) ? items : [...items, workspace]);
-            void changeWorkspace(workspace.id);
+            void changeWorkspace(workspace.id, true);
           }}
           onClose={() => setProjectLauncherOpen(false)}
           notify={notify}
@@ -1558,7 +1674,7 @@ export default function App() {
                   onLoad={() => { if (selectedModel) requestLoad(selectedModel.id); }}
                   onChooseModel={() => setTab('models')}
                   onChooseProject={() => setProjectLauncherOpen(true)}
-                  onPickProject={(workspace) => void changeWorkspace(workspace.id)}
+                  onPickProject={(workspace) => void changeWorkspace(workspace.id, true)}
                 />
               ) : (
                 <div className="transcript" ref={transcriptRef} onScroll={(event) => { const view = event.currentTarget; followOutput.current = view.scrollHeight - view.scrollTop - view.clientHeight < 100; setShowLatest(!followOutput.current); }}>
