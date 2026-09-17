@@ -1,0 +1,7 @@
+{
+  "status": 400,
+  "content_type": "application/json",
+  "error": "context_exceeded",
+  "prompt_tokens": 9000,
+  "context": 8192
+}

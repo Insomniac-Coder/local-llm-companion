@@ -2,6 +2,7 @@ import { useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type { AgentEvent } from '../services/api';
+import { stepLabel, visibleTimelineEvents } from '../services/timeline';
 import { Icon, type IconName } from '../ui/Icon';
 
 type ActivityKind = 'task' | 'thought' | 'read' | 'list' | 'search' | 'edit' | 'write' | 'delete' | 'command' | 'permission' | 'final' | 'error' | 'tool' | 'status' | 'request' | 'response';
@@ -75,7 +76,7 @@ export function DiffLines({ value, className = 'activity-diff' }: { value: strin
   );
 }
 
-function ActivityItem({ event, index }: { event: AgentEvent; index: number }) {
+function ActivityItem({ event }: { event: AgentEvent }) {
   const kind = classify(event);
   const meta = META[kind];
   const isRunning = event.kind === 'tool_started';
@@ -92,7 +93,7 @@ function ActivityItem({ event, index }: { event: AgentEvent; index: number }) {
             <span className="activity-label">{meta.label}</span>
             {!narrative && <strong title={actionTitle(event, kind)}>{actionTitle(event, kind)}</strong>}
           </div>
-          <span className="activity-step">{isRunning ? 'Running' : `Step ${index + 1}`}</span>
+          <span className="activity-step">{isRunning ? 'Running' : stepLabel(event)}</span>
         </div>
 
         {narrative && (
@@ -132,24 +133,11 @@ function ActivityItem({ event, index }: { event: AgentEvent; index: number }) {
 
 export default function ToolTimeline({ events }: { events: AgentEvent[] }) {
   if (events.length === 0) return null;
-  const terminal = events.some((event) => ['COMPLETED', 'FAILED', 'CANCELLED'].includes(event.state));
-  const visible = events.reduce<AgentEvent[]>((items, event) => {
-    if (event.kind === 'context' || event.kind === 'thought_delta') return items;
-    if (event.kind === 'tool_result' || event.kind === 'tool_error') {
-      const pending = items.findIndex((item) => item.kind === 'tool_started'
-        && item.iteration === event.iteration && item.tool === event.tool);
-      if (pending >= 0) { items[pending] = event; return items; }
-    }
-    items.push(event);
-    return items;
-  }, []).map((event): AgentEvent => terminal && event.kind === 'tool_started' ? {
-    ...event, kind: 'tool_error', state: 'OBSERVING', diff: undefined,
-    message: 'No result was recorded before this run ended. Inspect the current file or output before retrying.',
-  } : event);
+  const visible = visibleTimelineEvents(events);
   return (
     <div className="activity-stream" aria-label="Agent activity timeline">
       {visible.map((event, i) => (
-        <ActivityItem key={`${event.iteration}-${event.kind ?? event.state}-${i}`} event={event} index={i} />
+        <ActivityItem key={`${event.iteration}-${event.kind ?? event.state}-${i}`} event={event} />
       ))}
     </div>
   );

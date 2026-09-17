@@ -2,6 +2,7 @@ import type { ModelMeta, Workspace } from '../services/api';
 import { Button, Lamp } from '../ui/primitives';
 import { Icon, type IconName } from '../ui/Icon';
 import { useMachineSample, type RigState } from './Rig';
+import StartScripts from './StartScripts';
 
 type Starter = { icon: IconName; label: string; description: string; text: string };
 
@@ -98,7 +99,7 @@ export default function Welcome({
           <>
             <div className="welcome-eyebrow eyebrow"><Lamp state="error" /> Runtime offline</div>
             <h1 className="welcome-title">Companion can’t reach its runtime.</h1>
-            <p className="welcome-lede">Start it again with run.ps1, then reload this page. Your conversations are safe on disk.</p>
+            <p className="welcome-lede">Start it again with <StartScripts />, then reload this page. Your conversations are safe on disk.</p>
           </>
         ) : machine === 'caution' && !loaded ? (
           <>

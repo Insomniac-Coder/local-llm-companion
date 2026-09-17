@@ -18,7 +18,7 @@ export default function SetupWizard({ notify }: { notify: (k: 'info' | 'error', 
         <div>
           <h2>Set up your local AI</h2>
           <p>
-            {!st.binary_found && 'Install llama-server: download a llama.cpp release and place llama-server(.exe) on PATH or in models/bin. '}
+            {!st.binary_found && 'Build the llama.cpp runtime: run scripts/build-runtime.ps1 (Windows) or scripts/build-runtime.sh (Linux, macOS) from the project folder. '}
             {st.binary_found && st.models_with_gguf === 0 && 'Download a GGUF model below, or put one in the models folder and scan. '}
             {st.models_with_gguf > 0 && !st.inference_running && 'Load a model from the machine panel to finish setup. '}
           </p>

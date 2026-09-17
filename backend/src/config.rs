@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub addr: String,
+    /// The installation root: where runtime/bin and plugins live, whatever
+    /// COMPANION_MODELS_DIR or COMPANION_DATA_DIR point at.
+    pub root: PathBuf,
     pub data_dir: PathBuf,
     pub models_dir: PathBuf,
     pub frontend_dir: PathBuf,
@@ -33,6 +36,7 @@ impl AppConfig {
         }
         Self {
             addr,
+            root,
             data_dir,
             models_dir,
             frontend_dir,

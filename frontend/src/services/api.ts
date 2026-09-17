@@ -1,20 +1,6 @@
 import type { GenerationPhase, OutputTiming } from './outputTiming';
 export const API = '';
 
-/** `source` says who decided: the model, the wording heuristic when the
- *  model's decision could not be read, or a client-side fallback when the
- *  response itself was unusable. Routing never fails a message. */
-export async function classifyRequest(message: string, conversationId: string, signal: AbortSignal): Promise<{intent: 'ask' | 'plan' | 'agent'; source: 'model' | 'heuristic' | 'fallback'}> {
-  const result = await req('/api/chat/classify', {
-    method: 'POST', headers: {'content-type': 'application/json'},
-    body: JSON.stringify({message, conversation_id: conversationId}), signal,
-  });
-  if (!['ask', 'plan', 'agent'].includes(result?.intent) || !['model', 'heuristic', 'fallback'].includes(result?.source)) {
-    return {intent: 'ask', source: 'fallback'};
-  }
-  return result;
-}
-
 export interface ModelMeta {
   id: string;
   name: string;
@@ -23,7 +9,11 @@ export interface ModelMeta {
   context_length: number;
   vision: boolean;
   tool_calling: boolean;
+  /** 'runtime' when llama.cpp reported it for this file, 'template' when only the chat template suggests it. */
+  tool_support_source?: 'runtime' | 'template' | null;
   supports_reasoning?: boolean;
+  /** Structural reasons this file may not load or chat correctly (advisory). */
+  load_issues?: string[];
   loaded: boolean;
 }
 
@@ -347,6 +337,10 @@ export async function streamChat(
   conversationId: string | null,
   cbs: {
     onToken: (t: string) => void;
+    /** A tool action the model wrote: shown as a status line, never as text. */
+    onAction?: (action: { state: 'started' | 'finished' | 'incomplete'; name: string | null }) => void;
+    /** The visible reply was cut back (a rejected round): show this text instead. */
+    onReplace?: (text: string) => void;
     /** Native reasoning text as the model produces it (never persisted). */
     onReasoning?: (t: string) => void;
     onStatus?: (s: string) => void;
@@ -356,7 +350,7 @@ export async function streamChat(
     onError?: (msg: string) => void;
   },
   signal: AbortSignal,
-  opts?: { reasoning?: boolean; search?: boolean; classified?: boolean },
+  opts?: { reasoning?: boolean; search?: boolean },
 ): Promise<void> {
   const r = await fetch('/api/chat', {
     method: 'POST',
@@ -364,7 +358,6 @@ export async function streamChat(
     body: JSON.stringify({
       message,
       conversation_id: conversationId ?? '',
-      classified: opts?.classified ?? false,
       ...(opts?.reasoning !== undefined ? { reasoning: opts.reasoning } : {}),
       ...(opts?.search !== undefined ? { search: opts.search } : {}),
     }),
@@ -402,6 +395,10 @@ export async function streamChat(
     }
     const data = parts.join('\n');
     if (event === 'token') cbs.onToken(data);
+    else if (event === 'action') {
+      try { if (cbs.onAction) cbs.onAction(JSON.parse(data)); } catch { /* a malformed action frame changes nothing visible */ }
+    }
+    else if (event === 'replace') { if (cbs.onReplace) cbs.onReplace(data); }
     else if (event === 'reasoning') { if (cbs.onReasoning) cbs.onReasoning(data); }
     else if (event === 'status' && cbs.onStatus) cbs.onStatus(data);
     else if (event === 'phase' && cbs.onPhase) {
@@ -557,7 +554,9 @@ export async function getRuntimePolicy(modelId?: string): Promise<RuntimePolicy>
   return req(`/api/runtime/policy${modelId ? `?model_id=${encodeURIComponent(modelId)}` : ''}`);
 }
 
-export type PermissionMode = 'ask' | 'auto';
+/** What a code session's agent may do without asking (Claude Code's modes):
+ *  ask before edits, accept edits, plan (read-only), auto. */
+export type PermissionMode = 'ask' | 'accept_edits' | 'plan' | 'auto';
 
 export async function getPermissionMode(): Promise<{ mode: PermissionMode }> {
   return req('/api/permissions/mode');
@@ -705,19 +704,19 @@ export interface AgentEvent {
   args?: Record<string, unknown> | null;
   output?: string | null;
   diff?: string | null;
-  pending_tool?: { tool: string; args: unknown; reason: string } | null;
+  pending_tool?: { tool: string; args: unknown; reason: string; session_grantable?: boolean } | null;
 }
 
 export type AgentStartResult =
   | { disposition?: 'run'; run_id: string; state?: string }
   | { disposition: 'conversation' | 'needs_task'; message: string; message_id: string };
 
-export async function startAgent(workspace: string, task: string, mode: string, conversation_id?: string, options: {search?: boolean; classified?: boolean; reasoning?: boolean} = {}): Promise<AgentStartResult> {
+export async function startAgent(workspace: string, task: string, mode: string, conversation_id?: string, options: {search?: boolean; reasoning?: boolean} = {}): Promise<AgentStartResult> {
   return req('/api/agent/run', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      workspace, task, mode, conversation_id: conversation_id ?? '', search: options.search ?? false, classified: options.classified ?? false,
+      workspace, task, mode, conversation_id: conversation_id ?? '', search: options.search ?? false,
       ...(options.reasoning !== undefined ? { reasoning: options.reasoning } : {}),
     }),
   });
@@ -731,6 +730,10 @@ export interface AgentRunSummary {
   state: string;
   iterations: number;
   conversation_id: string;
+  /** plan runs end with a plan the user approves; optional for older backends. */
+  mode?: string;
+  /** The run ended by presenting a plan to approve. */
+  plan_ready?: boolean;
 }
 
 export async function agentRuns(): Promise<AgentRunSummary[]> {
@@ -756,7 +759,9 @@ export async function streamAgentEvents(
   signal: AbortSignal,
 ): Promise<void> {
   const r = await fetch(`/api/agent/runs/${runId}/events`, { signal });
-  if (!r.ok || !r.body) throw new Error(`agent stream failed: ${r.status}`);
+  // `status` 404: the server no longer has the run (runs live in memory, so a
+  // restart forgets them); a view that remembered its id can drop it quietly.
+  if (!r.ok || !r.body) throw Object.assign(new Error(`agent stream failed: ${r.status}`), { status: r.status });
   const reader = r.body.getReader();
   const dec = new TextDecoder();
   let buf = '';

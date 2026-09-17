@@ -5,8 +5,9 @@ import {
   type AgentEvent,
   type AgentRunSummary,
 } from '../services/api';
-import { Lamp } from '../ui/primitives';
+import { Button, Lamp } from '../ui/primitives';
 import { Icon } from '../ui/Icon';
+import { planAwaitingApproval } from '../services/workbench';
 
 const TERMINAL = ['COMPLETED', 'FAILED', 'CANCELLED'];
 
@@ -103,6 +104,8 @@ export default function AgentChatProgress({
   onContextUsage,
   onOpenActivity,
   onFinished,
+  onApprovePlan,
+  onKeepPlanning,
 }: {
   convId: string | null;
   focusRun?: string | null;
@@ -110,7 +113,16 @@ export default function AgentChatProgress({
   onContextUsage?: (event: AgentEvent, runId: string) => void;
   onOpenActivity: (runId: string) => void;
   onFinished: () => void;
+  /** Carry out the latest plan in the chosen permission mode; true once the work started. */
+  onApprovePlan?: (mode: 'accept_edits' | 'ask') => Promise<boolean>;
+  /** Stay in Plan mode; true once it is in effect. */
+  onKeepPlanning?: () => Promise<boolean>;
 }) {
+  // Plans the user has answered in this view; a new run replaces the latest anyway.
+  const [answeredPlans, setAnsweredPlans] = useState<ReadonlySet<string>>(new Set());
+  // An answer being carried out: the card stays, with its buttons off, until it succeeds.
+  const [answeringPlan, setAnsweringPlan] = useState(false);
+  const approvalRef = useRef<HTMLElement>(null);
   const [runs, setRuns] = useState<AgentRunSummary[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(focusRun ?? null);
   const [events, setEvents] = useState<AgentEvent[]>([]);
@@ -177,6 +189,40 @@ export default function AgentChatProgress({
     }
     return items.slice(-5);
   }, [events]);
+
+  const pendingPlan = onApprovePlan ? planAwaitingApproval(runs, answeredPlans) : null;
+  // The decision is what the conversation waits on: bring it into view once.
+  useEffect(() => { if (pendingPlan) approvalRef.current?.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); }, [pendingPlan]);
+  const approve = onApprovePlan;
+  if (convId && pendingPlan && approve && !runs.some((run) => !TERMINAL.includes(run.state))) {
+    // The card goes only once the answer took effect: a failed start (no model
+    // loaded, the mode could not be saved) leaves it to answer again.
+    const answer = async (then: (() => Promise<boolean>) | undefined) => {
+      if (answeringPlan || !then) return;
+      setAnsweringPlan(true);
+      try {
+        if (await then()) setAnsweredPlans((answered) => new Set([...answered, pendingPlan]));
+      } finally {
+        setAnsweringPlan(false);
+      }
+    };
+    return (
+      <section ref={approvalRef} className="plan-approval" aria-label="Plan approval">
+        <header className="agent-run-head">
+          <Icon name="list" size={16} />
+          <div>
+            <strong>The plan is ready</strong>
+            <span>Carry it out? Nothing has been changed yet.</span>
+          </div>
+        </header>
+        <div className="plan-approval-actions">
+          <Button size="sm" icon="check" disabled={answeringPlan} onClick={() => void answer(() => approve('accept_edits'))}>Yes, accept edits</Button>
+          <Button size="sm" variant="ghost" disabled={answeringPlan} onClick={() => void answer(() => approve('ask'))}>Yes, ask before edits</Button>
+          <Button size="sm" variant="ghost" disabled={answeringPlan} onClick={() => void answer(onKeepPlanning)}>No, keep planning</Button>
+        </div>
+      </section>
+    );
+  }
 
   if (!convId || !selected) return null;
   const active = !TERMINAL.includes(state ?? '');

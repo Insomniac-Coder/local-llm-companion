@@ -1,0 +1,32 @@
+data: {"id": "chatcmpl-fixture", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": "I will "}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-fixture", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": "read th"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-fixture", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": "e file "}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-fixture", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": "first.\n"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-fixture", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": "```tool"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-fixture", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": "\n{\"name"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-fixture", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": "\":\"read"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-fixture", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": "_file\","}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-fixture", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": "\"args\":"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-fixture", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": "{\"path\""}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-fixture", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": ":\"src/m"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-fixture", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": "ain.rs\""}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-fixture", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": "}}\n```"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-fixture", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": "stop"}]}
+
+data: {"id": "chatcmpl-fixture", "object": "chat.completion.chunk", "choices": [], "usage": {"prompt_tokens": 300, "completion_tokens": 30, "total_tokens": 330}, "timings": {"cache_n": 0, "prompt_n": 300, "prompt_ms": 120.0, "prompt_per_second": 1000.0, "predicted_n": 30, "predicted_ms": 400.0, "predicted_per_second": 50.0}}
+
+data: [DONE]
+

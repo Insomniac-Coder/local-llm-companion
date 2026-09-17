@@ -22,6 +22,15 @@ pub struct InferenceSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HardwareSettings {
     pub cpu_threads: u32,
+    /// Manual mode: prompt-processing threads; 0 uses `cpu_threads`.
+    #[serde(default)]
+    pub threads_batch: u32,
+    /// Manual mode: `--poll` (0 sleeps between operations, 50 spin-waits).
+    #[serde(default)]
+    pub poll: Option<u8>,
+    /// Manual mode: `--prio` (-1 low, 0 normal).
+    #[serde(default)]
+    pub priority: Option<i8>,
     pub gpu_backend: String,
     pub gpu_layers: i32,
     pub flash_attention: bool,
@@ -33,6 +42,11 @@ pub struct AgentSettings {
     pub max_iterations: u32,
     pub command_timeout_secs: u64,
     pub autonomous_enabled: bool,
+    /// ask | accept_edits | plan | auto (`permissions::PERMISSION_MODES`).
+    /// `autonomous_enabled` follows it ("auto"), for code that still reads the
+    /// switch; a settings file from before the modes reads its mode from it.
+    #[serde(default)]
+    pub permission_mode: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,7 +109,36 @@ impl AppSettings {
         if self.memory.auto_compact == "ask" {
             self.memory.auto_compact = "automatic".into();
         }
+        // The Performance mode replaced a single automatic/manual switch. A
+        // save without a mode keeps meaning what its switch said; afterwards
+        // the switch follows the mode, for code that still reads it.
+        match self.runtime.mode.as_str() {
+            "auto" | "fastest" | "balanced" | "light" | "manual" => {}
+            _ => self.runtime.mode = if self.runtime_auto { "auto" } else { "manual" }.into(),
+        }
+        self.runtime_auto = self.runtime.mode != "manual";
+        if !crate::permissions::PERMISSION_MODES.contains(&self.agent.permission_mode.as_str()) {
+            self.agent.permission_mode = if self.agent.autonomous_enabled { "auto" } else { "ask" }.into();
+        }
+        self.agent.autonomous_enabled = self.agent.permission_mode == "auto";
         self
+    }
+
+    /// A save measured against the settings it replaces. A client that knows
+    /// only the old automatic/manual switch sends back the mode it read,
+    /// unchanged, with the switch flipped; the switch is then what the user
+    /// changed, so the mode follows it instead of silently reverting it.
+    pub fn reconciled_with(mut self, previous: &AppSettings) -> Self {
+        if self.runtime_auto != previous.runtime_auto && self.runtime.mode == previous.runtime.mode {
+            self.runtime.mode = if self.runtime_auto { "auto" } else { "manual" }.into();
+        }
+        // The same for a client that only knows the Auto switch.
+        if self.agent.autonomous_enabled != previous.agent.autonomous_enabled
+            && self.agent.permission_mode == previous.agent.permission_mode
+        {
+            self.agent.permission_mode = if self.agent.autonomous_enabled { "auto" } else { "ask" }.into();
+        }
+        self.normalized()
     }
 }
 
@@ -119,6 +162,14 @@ pub struct KeyboardSettings {
 pub struct PrivacySettings {
     pub telemetry: bool,
     pub log_redaction: bool,
+    /// Keep each model request and its output (capped) for diagnosis; they
+    /// are included in conversation exports. On by default (owner decision).
+    #[serde(default = "default_true")]
+    pub record_model_requests: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Stage 23 network policy (§56).
@@ -207,6 +258,17 @@ pub struct RuntimeSettings {
     /// this decides which of the two the user meant.
     #[serde(default = "default_context_fit")]
     pub context_fit: String,
+    /// auto | fastest | balanced | light | manual. The three profiles apply a
+    /// model's own calibration; a model without one runs as auto. Older saves
+    /// have no mode: `normalized` derives it from `runtime_auto`.
+    #[serde(default)]
+    pub mode: String,
+}
+
+impl RuntimeSettings {
+    pub fn profile_name(&self) -> Option<&str> {
+        matches!(self.mode.as_str(), "fastest" | "balanced" | "light").then_some(self.mode.as_str())
+    }
 }
 
 fn default_context_fit() -> String {
@@ -227,6 +289,7 @@ impl Default for RuntimeSettings {
             kv_cache: "f16".into(),
             cache_reuse: true,
             context_fit: default_context_fit(),
+            mode: "auto".into(),
         }
     }
 }
@@ -310,6 +373,7 @@ fn default_privacy_settings() -> PrivacySettings {
     PrivacySettings {
         telemetry: true,
         log_redaction: true,
+        record_model_requests: true,
     }
 }
 fn default_network_settings() -> NetworkSettings {
@@ -354,7 +418,19 @@ impl Default for AppSettings {
                 batch_size: 512,
             },
             hardware: HardwareSettings {
-                cpu_threads: 8,
+                // The detected physical core count, which measured fastest
+                // for both prompt and generation on the audit machine, rather
+                // than a number chosen for one processor.
+                cpu_threads: crate::cpu_topology::detect()
+                    .map(|topology| topology.physical_count() as u32)
+                    .unwrap_or_else(|| {
+                        std::thread::available_parallelism()
+                            .map(|n| n.get() as u32)
+                            .unwrap_or(1)
+                    }),
+                threads_batch: 0,
+                poll: None,
+                priority: None,
                 gpu_backend: "auto".into(),
                 gpu_layers: -1,
                 flash_attention: true,
@@ -364,6 +440,7 @@ impl Default for AppSettings {
                 max_iterations: 30,
                 command_timeout_secs: 120,
                 autonomous_enabled: false,
+                permission_mode: "ask".into(),
             },
             security: SecuritySettings {
                 allowed_dirs: vec![],
@@ -419,6 +496,49 @@ pub fn apply_preset(s: &mut AppSettings, p: Preset) {
             s.hardware.gpu_layers = -1;
         }
         Preset::Custom => {}
+    }
+}
+
+#[cfg(test)]
+mod runtime_mode_tests {
+    use super::*;
+
+    #[test]
+    fn a_save_from_before_modes_keeps_its_meaning() {
+        let mut manual = AppSettings::default();
+        manual.runtime_auto = false;
+        manual.runtime.mode = String::new();
+        let manual = manual.normalized();
+        assert_eq!(manual.runtime.mode, "manual");
+        assert!(!manual.runtime_auto);
+
+        let mut automatic = AppSettings::default();
+        automatic.runtime.mode = String::new();
+        assert_eq!(automatic.normalized().runtime.mode, "auto");
+
+        let mut balanced = AppSettings::default();
+        balanced.runtime.mode = "balanced".into();
+        let balanced = balanced.normalized();
+        assert!(balanced.runtime_auto, "a profile builds on automatic settings");
+        assert_eq!(balanced.runtime.profile_name(), Some("balanced"));
+        assert_eq!(AppSettings::default().runtime.profile_name(), None);
+    }
+
+    #[test]
+    fn flipping_only_the_old_switch_changes_the_mode() {
+        let previous = AppSettings::default().normalized();
+        let mut from_old_client = previous.clone();
+        from_old_client.runtime_auto = false;
+        let saved = from_old_client.reconciled_with(&previous);
+        assert_eq!(saved.runtime.mode, "manual");
+        assert!(!saved.runtime_auto);
+
+        // A client that sets the mode wins even when its switch is stale.
+        let mut from_new_client = saved.clone();
+        from_new_client.runtime.mode = "light".into();
+        let saved = from_new_client.reconciled_with(&saved);
+        assert_eq!(saved.runtime.mode, "light");
+        assert!(saved.runtime_auto);
     }
 }
 

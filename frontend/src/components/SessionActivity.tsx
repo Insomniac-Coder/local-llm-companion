@@ -8,6 +8,7 @@ import {
   type AgentRunSummary,
 } from '../services/api';
 import ToolTimeline from './ToolTimeline';
+import { approvalTarget } from '../services/approvalSummary';
 import { Button, Lamp } from '../ui/primitives';
 import { Icon } from '../ui/Icon';
 
@@ -100,7 +101,8 @@ export default function SessionActivity({
         activeCallback.current(true);
       }
     }, controller.signal).catch((error) => {
-      if (error?.name !== 'AbortError') notify('error', error?.message ?? 'Could not follow agent activity.');
+      // A run from before a restart is gone from the server; its record stays in the conversation.
+      if (error?.name !== 'AbortError' && error?.status !== 404) notify('error', error?.message ?? 'Could not follow agent activity.');
     });
     return () => controller.abort();
   }, [selectedId, notify]);
@@ -160,9 +162,14 @@ export default function SessionActivity({
           <header><Icon name="shield" size={16} /> Approval needed</header>
           <p>{pending.pending_tool.reason}</p>
           <code>{pending.pending_tool.tool}</code>
+          {approvalTarget(pending.pending_tool.tool, pending.pending_tool.args) && (
+            <pre className="approval-target" aria-label="Requested action">{approvalTarget(pending.pending_tool.tool, pending.pending_tool.args)}</pre>
+          )}
           <div className="approval-actions">
             <Button size="sm" variant="secondary" icon="check" onClick={() => void decide(true)}>Allow once</Button>
-            <Button size="sm" variant="ghost" onClick={() => void decide(true, true)}>Allow for session</Button>
+            {pending.pending_tool.session_grantable && (
+              <Button size="sm" variant="ghost" onClick={() => void decide(true, true)}>Allow for session</Button>
+            )}
             <Button size="sm" variant="danger" onClick={() => void decide(false)}>Deny</Button>
           </div>
         </section>

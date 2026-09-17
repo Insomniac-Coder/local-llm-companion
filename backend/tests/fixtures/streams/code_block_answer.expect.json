@@ -1,0 +1,6 @@
+{
+  "text": "Here is the function:\n```python\ndef add(a, b):\n    return a + b\n```\nIt returns the sum.",
+  "finish_reason": "stop",
+  "reasoning_present": false,
+  "prompt_tokens": 25
+}

@@ -1,0 +1,26 @@
+data: {"id": "chatcmpl-fixture", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": "A linked "}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-fixture", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": "list stor"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-fixture", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": "es each v"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-fixture", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": "alue in a"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-fixture", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": " node tha"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-fixture", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": "t points "}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-fixture", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": "to the ne"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-fixture", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": "xt — ünïc"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-fixture", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": "ödé survi"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-fixture", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": "ves."}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-fixture", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": "stop"}]}
+
+data: {"id": "chatcmpl-fixture", "object": "chat.completion.chunk", "choices": [], "usage": {"prompt_tokens": 40, "completion_tokens": 22, "total_tokens": 62}, "timings": {"cache_n": 12, "prompt_n": 28, "prompt_ms": 120.0, "prompt_per_second": 1000.0, "predicted_n": 22, "predicted_ms": 400.0, "predicted_per_second": 50.0}}
+
+data: [DONE]
+

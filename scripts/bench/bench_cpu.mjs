@@ -5,8 +5,16 @@ import { readFileSync } from 'node:fs';
 
 // Paths resolve against the repository root; override with BENCH_BIN / BENCH_MODEL.
 const ROOT = new URL('../../', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1');
-const BIN = process.env.BENCH_BIN || ROOT + 'models/bin/llama-server.exe';
-const MODEL = process.env.BENCH_MODEL || ROOT + 'models/qwen3-8b/Qwen3-8B-Q4_K_M.gguf';
+// The project's runtime (scripts/build-runtime.*), not a path on one machine.
+const SERVER_EXE = process.platform === 'win32' ? 'llama-server.exe' : 'llama-server';
+const BIN = process.env.BENCH_BIN || ROOT + 'runtime/bin/' + SERVER_EXE;
+// No default model: which file to measure is the caller's choice, never a
+// model name baked into the harness.
+const MODEL = process.env.BENCH_MODEL;
+if (!MODEL) {
+  console.error('Set BENCH_MODEL to the GGUF file to benchmark.');
+  process.exit(2);
+}
 const PORT = 3998;
 const SYSTEM = readFileSync(new URL('./system_prompt.txt', import.meta.url), 'utf8');
 const EDIT_FILE = readFileSync(new URL('./edit_fixture.rs', import.meta.url), 'utf8').split('\n').slice(0, 60).join('\n');

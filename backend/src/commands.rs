@@ -327,8 +327,8 @@ mod tests {
         );
         assert_eq!(parse("/help").unwrap(), ("help".into(), "".into()));
         assert_eq!(
-            parse("/model qwen-14b").unwrap(),
-            ("model".into(), "qwen-14b".into())
+            parse("/model example-14b").unwrap(),
+            ("model".into(), "example-14b".into())
         );
         assert!(parse("not a command").is_none());
         assert!(parse("/").is_none());

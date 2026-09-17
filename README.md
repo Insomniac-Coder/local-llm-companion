@@ -1,242 +1,301 @@
 # Local LLM PC Companion
 
-Privacy-first local AI companion (llama.cpp + GGUF). See `docs/ARCHITECTURE.md`
-and [the v5.1 product review](docs/PRODUCT_REVIEW_2026-09-11.md) for implemented improvements, verification and the remaining full-product roadmap.
+A privacy-first AI assistant that runs entirely on your PC: chat, code questions and agent tasks on
+local GGUF models, served by [llama.cpp](https://github.com/ggml-org/llama.cpp). No cloud API key is
+needed and nothing leaves your machine unless you turn on web search.
 
-## Layout (§71)
+The llama.cpp runtime is **part of this project**: it is built from a pinned upstream commit with the
+backends your PC can use (CPU always; Vulkan and CUDA when the hardware and SDKs are present). Model
+weights are not included.
+
+More documentation: `docs/ARCHITECTURE.md`, `docs/PERFORMANCE.md`, and the audit records in
+`docs/validation/` and `docs/research/`.
+
+## Layout
 
 ```
 local-llm-companion/
-  backend/   # Rust Axum API: chat, models, tools, agent, search, vision, docs, memory, daio, index, knowledge, plugins
-  frontend/  # React+TS+Vite: chat/code modes, resources, settings, themes
-  plugins/filesystem/plugin.json
-  docs/ARCHITECTURE.md
-  models/    # GGUF files in root/subfolders; metadata.json optional
+  backend/    Rust (Axum) API: chat, models, tools, agent, search, vision, documents, memory
+  frontend/   React + TypeScript + Vite UI, served by the backend
+  runtime/    llama.cpp.lock.json (the pinned commit); bin/ is built here (not in Git)
+  scripts/    build-runtime.ps1 / build-runtime.sh, benchmarks, backups, end-to-end checks
+  models/     your GGUF models, one folder per model (not in Git); modeldownloader.py
+  plugins/    plugin manifests
+  docs/       architecture, performance, research and validation records
+  run.ps1     build (first run) and start the app on Windows (PowerShell)
+  run.bat     the same from Command Prompt
+  run.sh      the same on Linux and macOS
 ```
 
-## Install prerequisites (Windows / PowerShell)
+## 1. Prerequisites
 
-Install these before running the project from source:
+### Windows
 
-1. **Git** — install [Git for Windows](https://git-scm.com/downloads/win) to clone
-   the repository and use the app's Git features.
-2. **Node.js 24 LTS with npm** — use the [official Node.js installer](https://nodejs.org/en/download).
-   Keep the npm option enabled; a separate npm installation is not needed.
-   Node.js 24+ is used by this project's tests, which import TypeScript directly.
-3. **Rust stable with Cargo** — install through [rustup](https://rust-lang.org/tools/install/)
-   and choose the default Windows MSVC toolchain. Cargo is included with Rust.
-   If Rust is already installed, run `rustup update stable`.
-4. **Visual Studio C++ build tools and Windows SDK** — follow the
-   [Rust Windows prerequisites](https://rust-lang.github.io/rustup/installation/windows-msvc.html).
-   In the Visual Studio installer, select **Desktop development with C++**, including
-   the MSVC x64/x86 tools and a Windows SDK. These supply the linker and compiler
-   needed by the backend and its bundled SQLite dependency. VS Code alone is not
-   a replacement for these build tools.
-5. **llama.cpp's `llama-server` runtime** — required to generate model responses;
-   it is not installed by Cargo or npm. See the runtime setup below.
-6. **A compatible GGUF model** — download one separately or use the app's model
-   downloader. Model weights are not included in this repository.
+Install these, then open a **new** PowerShell so PATH changes take effect.
 
-Open a **new PowerShell terminal** after installation so PATH changes take effect,
-then check:
+| Tool | Needed for | Notes |
+| --- | --- | --- |
+| [Git](https://git-scm.com/downloads/win) | cloning; fetching llama.cpp | |
+| [Node.js 24 LTS](https://nodejs.org/en/download) with npm | the UI and its tests | tests import TypeScript directly (Node 24+) |
+| [Rust](https://rust-lang.org/tools/install/) (stable, MSVC toolchain) | the backend | `rustup update stable` if already installed |
+| [Visual Studio 2022 or Build Tools](https://visualstudio.microsoft.com/downloads/) with **Desktop development with C++** | the backend and llama.cpp | provides the compiler, Windows SDK, CMake and Ninja |
+| **C++ Clang tools for Windows** (a Visual Studio Installer component: *C++ Clang Compiler for Windows*) | *recommended*: faster CPU inference | the runtime build uses clang automatically when it is installed; see the note below |
+| [Vulkan SDK](https://vulkan.lunarg.com/sdk/home) | *optional*: the Vulkan GPU backend | any GPU vendor, including integrated GPUs |
+| [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads) 12 or 13 | *optional*: the CUDA backend | NVIDIA GPUs only; the display driver is separate and not required from this installer |
+| Python 3 | *optional*: `models/modeldownloader.py`, `scripts/backup-data.py` | standard library only |
+
+Check:
 
 ```powershell
-git --version
-node --version
-npm --version
-rustc --version
-cargo --version
+git --version; node --version; npm --version; rustc --version; cargo --version
 ```
 
-The current development setup was verified with Rust/Cargo 1.98.1 and Node.js
-24.13.0; these are tested versions, not a declared minimum Rust version.
-React, Vite, TypeScript, and Rust libraries are installed automatically by the
-project's package managers; do not install them globally. A separate SQLite
-server is not required. Python 3 is optional, only for the included
-`scripts/backup-data.py` utility, not for building or running the core app.
+**Why clang is preferred.** llama.cpp's own Windows releases build the CPU modules with clang. Built
+with Microsoft's compiler (MSVC) from the same commit, CPU prompt processing measured 7% slower
+(generation speed and GPU speed were the same). When Visual Studio's clang component is installed,
+`scripts/build-runtime.ps1` builds the way the official release does: clang builds the CPU modules
+and the tools, and MSVC builds only the CUDA and Vulkan modules (NVIDIA supports only MSVC as CUDA's
+host compiler on Windows). Without clang, MSVC builds everything. `runtime/bin/BUILD_INFO.json`
+records which compiler built which part. If you add clang later, run the build script again.
 
-Allow disk space for build artifacts and model downloads. RAM/VRAM requirements
-depend on the model, quantization, and context size; model file size alone is not
-the total runtime memory requirement. The first build needs internet access to
-download dependencies. Local inference does not require a cloud API key.
+### Linux / macOS
 
-## First-time setup
+`git`, `cmake` 3.21+, a C/C++ compiler (`ninja` is used when present), Rust, Node.js 24+.
+Optional: the Vulkan SDK or `libvulkan-dev` + `glslc` (Vulkan), the CUDA Toolkit (CUDA, Linux).
+macOS builds Metal automatically. Start the app with `run.sh` (see "Run" below).
 
-### 1. Clone the project
+## 2. Get the project
 
 ```powershell
 git clone https://github.com/Insomniac-Coder/local-llm-companion.git
 cd local-llm-companion
 ```
 
-Run the remaining commands from this project directory.
+Run the remaining commands from this directory.
 
-### 2. Install the model runtime
+## 3. Build the llama.cpp runtime
 
-Download a Windows build from the official [llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases).
-Choose a build appropriate for your machine (CPU, or a supported GPU backend).
-Extract `llama-server.exe` **and its accompanying DLLs** into `models/bin/`.
-Keep the release's runtime dependencies together; copying only the executable
-can cause missing-DLL errors. For GPU builds, follow that release's driver and
-runtime requirements. Prebuilt releases avoid having to compile llama.cpp yourself.
-
-The expected layout is:
-
-```text
-models/
-  .gitkeep
-  bin/
-    llama-server.exe
-    ...DLLs from the matching release...
-  my-model.gguf
-```
-
-Verify the runtime can start:
+The runtime is built once into `runtime/bin/` from the commit in `runtime/llama.cpp.lock.json`.
+`run.ps1` (Windows) and `run.sh` (Linux, macOS) do this automatically the first time, or run it yourself:
 
 ```powershell
-.\models\bin\llama-server.exe --version
+.\scripts\build-runtime.ps1                         # Windows: CPU + every GPU backend this PC can use
+.\scripts\build-runtime.ps1 -Backends cpu           # CPU only
+.\scripts\build-runtime.ps1 -Backends cpu,cuda -CudaArchitectures 120   # smaller CUDA build for one GPU generation
 ```
 
-Alternatively, install `llama-server` on PATH or set its full path before starting
-the app:
+```bash
+scripts/build-runtime.sh                            # Linux / macOS
+scripts/build-runtime.sh --dry-run                  # print the plan, build nothing
+```
+
+What the automatic build (`auto`, the default) chooses:
+
+- **CPU**: always, as one module per x86 instruction set; the fastest one your processor supports is
+  loaded at startup.
+- **Vulkan**: when the PC has a GPU **and** the Vulkan SDK is installed.
+- **CUDA**: when the PC has an **NVIDIA GPU** **and** the CUDA Toolkit is installed. On a PC without
+  an NVIDIA GPU the CUDA backend and its runtime libraries are not built or copied at all, even if a
+  toolkit is installed. (Asking for `-Backends cuda` explicitly still builds it, with a warning, for
+  preparing a runtime for another PC.)
+- The CUDA runtime libraries (cuBLAS, cudart, nvJitLink) are copied next to the build, so the PC that
+  runs it needs only the NVIDIA display driver, not the toolkit.
+
+The build takes about 10 minutes with CUDA on a fast desktop CPU (much less without it). It fetches
+llama.cpp into `build/llama.cpp/`, builds there, then replaces `runtime/bin/` in one step and writes
+`runtime/bin/BUILD_INFO.json` (commit, backends, compiler, modules). Rebuild after changing
+`runtime/llama.cpp.lock.json` or installing a GPU SDK.
+
+Check the result:
 
 ```powershell
-$env:COMPANION_LLAMA_SERVER_BIN = 'C:\path\to\llama-server.exe'
+.\runtime\bin\llama-server.exe --version
+.\runtime\bin\llama-server.exe --list-devices     # CUDA0 / Vulkan0 lines when those backends work
 ```
 
-The environment-variable override takes precedence over PATH and `models/bin/`.
-The app launches the model server itself; you do not need to run a second server
-manually. Its default inference port is `3888`.
+```bash
+runtime/bin/llama-server --version                  # Linux / macOS
+runtime/bin/llama-server --list-devices
+```
 
-#### PCs without a dedicated GPU
+To use a llama.cpp you built or installed elsewhere, set `COMPANION_LLAMA_SERVER_BIN` to its
+`llama-server` executable; the app looks there first, then `runtime/bin/`, then `PATH`.
 
-The same app handles CPU operation automatically; no separate Companion build
-or manual CPU-settings change is required. Leave automatic hardware management on.
-At model load, Companion asks the installed runtime which devices it can use.
-Supported integrated GPUs are eligible too; a missing NVIDIA monitoring tool is
-not treated as proof that no GPU exists.
+## 4. Add models
 
-If the runtime reports no usable GPU, Companion loads the model on CPU. If GPU
-initialization/allocation fails, it retries once with GPU, KV-cache, operation,
-and vision-projector offloading disabled. Automatic CPU operation caps context
-at 8,192 tokens, keeps the runtime's default prompt batch and thread count
-(all physical cores measured faster than performance cores alone), and keeps
-context-drafted speculative decoding on (it measured 4x faster on code
-rewrites on CPU with no loss elsewhere). Saved settings are not overwritten.
-The app reports CPU operation and shows the effective settings under the
-loaded session's runtime configuration. Manual hardware overrides are
-respected and do not opt into automatic retries. On a CPU-only laptop prefer a
-4B-8B model at Q4_K_M or a mixture-of-experts model with few active
-parameters, and leave Reasoning off unless you need it: only the new text of
-each turn is processed thanks to the prompt cache, so long conversations stay
-usable. See `docs/PERFORMANCE.md` for the measurements.
+Put each model in its own folder under `models/`, e.g. `models/my-model/my-model-Q4_K_M.gguf`.
+Split GGUF files need all their parts in the same folder; a vision model's projector (`mmproj-*.gguf`)
+goes in the same folder as its weights.
 
-This fallback uses the **same installed llama-server**, which must itself be
-able to start and support CPU execution. It cannot repair a missing executable,
-missing mandatory DLLs, an unsupported model, or insufficient RAM, and it does
-not download replacement runtimes silently. CPU responses can be slower; choose
-a model that fits system memory. Actual GPU-less hardware has not yet been
-validated; automated tests simulate device discovery, and a live test verifies
-CPU generation using the same runtime on the development machine.
-
-### 3. Add a model manually (or download one in the app)
-
-The `models/` directory is included in fresh clones via `.gitkeep`. Place a GGUF
-directly inside it, such as `models/my-model.gguf`, or in a model-specific folder,
-such as `models/my-model/model.gguf`. For supported models, `metadata.json` is
-optional: the app reads GGUF metadata to discover the model. Split GGUF models
-need all their shards in the same folder.
-
-If you add files while the app is open, use **Scan** in the model library to
-rediscover them, then select and load the model. Models and runtime binaries stay
-local and are ignored by Git. Building the app does **not** download model weights.
-
-### 4. Build and run
+The included downloader does this for you, verifies the file against the size and SHA-256 the source
+publishes, and checks that the runtime can load it:
 
 ```powershell
-.\run.ps1                           # builds UI and starts one local process
-# Open http://localhost:5173
-# Press Ctrl+C once to stop the server and llama sidecar cleanly.
+python models\modeldownloader.py hf <owner>/<repository> <file>.gguf
+python models\modeldownloader.py hf <owner>/<repository> <file>.gguf --mmproj <projector>.gguf
+python models\modeldownloader.py ollama <model>:<tag>
 ```
 
-The launcher runs `npm ci` if `frontend/node_modules` is missing, builds the
-frontend, and uses Cargo to build/start the backend. The initial build can take
-several minutes; wait for the server's startup output before opening the page.
-Keep this terminal open while using the app. On later runs, use the same command.
+On Linux and macOS use `python3 models/modeldownloader.py` with the same arguments.
 
-After launch, open **Models**, scan if needed, and load your GGUF model. The app
-can open without model weights/runtime installed, but it cannot generate real
-model responses until both are available.
+Prefer the upstream GGUF from Hugging Face. Ollama's own registry files are packaged for Ollama (it
+repairs some of them in memory at load), so some load in Ollama but not in stock llama.cpp; the
+downloader then keeps the file with an `.incompatible` suffix and writes the reason next to it.
 
-### Common setup issues
+Files added while the app is open appear after **Scan** in the model library. Deleted model folders
+disappear from the list on the next refresh.
 
-- **`cargo`, `node`, or `npm` is not recognized:** finish the relevant installation
-  and reopen PowerShell so it sees the updated PATH.
-- **`link.exe`, MSVC, or Windows SDK errors:** install the C++ workload and SDK
-  above, then retry from a new terminal.
-- **`llama-server` not found / missing DLLs:** check `models/bin/`, the override
-  variable, and that the complete matching runtime package was extracted.
-- **No models detected:** check the files are actual `.gguf` weights, not ZIP
-  archives or download links, and scan again.
-- **Port `5173` or `3888` already in use:** stop the previous Companion/runtime
-  instance before launching another one. Use Ctrl+C in its terminal for shutdown.
-- **PowerShell blocks script execution:** follow your machine or organization's
-  script-execution policy. Do not globally disable security policies just to run
-  the launcher.
+## 5. Run
 
-For frontend development with hot reload, run Vite separately from `frontend/`;
-the normal user runtime is the single backend process, which serves both the UI
-and `/api/*` on port 5173. The backend still supports `COMPANION_ADDR` when
-started directly, defaulting to port 3877.
+### Windows
+
+```powershell
+.\run.ps1
+```
+
+Or, from Command Prompt (for example when PowerShell's execution policy blocks `run.ps1`):
+
+```bat
+run.bat
+```
+
+Then open <http://localhost:5173>. The first run builds the runtime if `runtime/bin/llama-server.exe`
+is missing (skipped when `COMPANION_LLAMA_SERVER_BIN` is set), installs UI dependencies, builds the UI
+and starts the backend; later runs start in seconds. Keep the terminal open and press **Ctrl+C** once
+to stop the app and the model server cleanly.
+
+### Linux / macOS
+
+```bash
+./run.sh
+```
+
+The same steps as `run.ps1`: it builds the runtime with `scripts/build-runtime.sh` the first time, installs
+the UI dependencies, builds the UI and starts the backend. Then open <http://localhost:5173>, and press
+**Ctrl+C** once in the terminal to stop. If the shell reports `Permission denied`, run
+`chmod +x run.sh scripts/build-runtime.sh` once, or start it with `bash run.sh`.
+
+Use a separate clone for each system. The UI dependencies and the runtime are built for the system
+that installed them, so one folder shared between Windows and WSL cannot run both `run.ps1` and
+`run.sh` (the runtime build refuses to replace a Windows runtime).
+
+### By hand (Linux / macOS)
+
+```bash
+scripts/build-runtime.sh                 # once
+cd frontend && npm ci && npm run build && cd ..
+cd backend && COMPANION_ADDR=127.0.0.1:5173 cargo run --release --bin companion-backend
+```
+
+For UI development with hot reload, start the backend on its default port (3877) and run
+`npm run dev` in `frontend/` (Vite proxies `/api` to it; set `COMPANION_API_TARGET` to proxy to
+another backend).
+
+### First steps in the app
+
+1. **Models**: select a model and **Load**. The app sizes the context and places the model on your
+   hardware automatically (see below).
+2. **Chat** for conversation and attachments; **Code** for questions about a linked project folder,
+   plans and agent tasks.
+3. **Settings > Performance** to choose how hardware is used.
+
+## Performance on your hardware
+
+Settings > Performance offers **Auto**, **Fastest**, **Balanced**, **Light** and **Manual**:
+
+- **Auto** (default) chooses for each model at load, aiming for the highest output speed: every layer
+  on the GPU if any cache precision (f16 or 8-bit) and GPU memory reserve achieves it, otherwise as
+  much of the model on the GPU as fits. Mixture-of-experts models keep expert weights in RAM when the
+  GPU is too small, which is much faster than splitting whole layers. The runtime's own memory fit
+  decides, so it is exact for every architecture llama.cpp loads.
+- **Fastest / Balanced / Light** apply a profile measured for that model on your PC: open the model's
+  details on the Models page and choose **Calibrate** (it unloads the current model and takes a minute
+  or two). Balanced keeps nearly the fastest generation with fewer cores busy; Light leaves the most
+  room for other programs.
+- **Manual** sets threads, GPU layers, batch size, cache and waiting behaviour yourself. Combinations
+  that cannot work (for example an 8-bit cache with Flash Attention off) cannot be selected.
+
+A model whose chat template has no tool support is detected at load: the model list shows whether
+**Tools** are confirmed, and such models create plain-text documents (`.txt`, `.md`, `.csv`, `.html`,
+`.json`) instead of Word, PowerPoint, Excel or PDF files.
+
+### PCs without a GPU
+
+Build the runtime as usual; it contains only the CPU backend. Auto mode loads models on the CPU with
+all physical cores and a context cap suited to the free RAM. Prefer 4B–8B models at Q4_K_M, or a
+mixture-of-experts model with few active parameters, and leave Reasoning off unless you need it.
+If a GPU start fails on a PC that has one, the app retries once on the CPU.
 
 ## Working modes
 
 - **Chat** for conversation and attachments.
 - **Code / Ask** for read-only project questions (default).
 - **Code / Plan** for inspection and a proposed implementation plan without edits.
-- **Code / Agent** for changes and verification. **Ask** requests action approvals; explicitly selecting **Auto** permits registered actions, including commands and deletion, without per-action prompts. File boundaries and tool safety limits still apply; shell commands are not process-sandboxed by their working directory. Web search requires the task's Search switch and is blocked when its saved policy is Deny.
-- Use **Ctrl+K** to find a session or action. The inspector can be resized by dragging its edge or focusing the separator and using arrow keys.
-- Models, Resources, Runtime & diagnostics, Tools & plugins and Settings are grouped at the bottom left. There is no duplicate configuration menu in the header.
+- **Code / Agent** for changes and verification. **Ask** requests action approvals; explicitly
+  selecting **Auto** permits registered actions, including commands and deletion, without per-action
+  prompts. File boundaries and tool safety limits still apply; shell commands are not process-sandboxed
+  by their working directory. Web search requires the task's Search switch and is blocked when its
+  saved policy is Deny.
+- **Ctrl+K** finds a session or action. The inspector can be resized by dragging its edge or with the
+  arrow keys on its separator.
 
-## Source exploration
+Code questions can use up to 24 read-only actions per reply (search, read any line range, list
+directories); results carry evidence IDs the model can keep or release as context fills.
 
-Code questions can use up to 24 read-only actions per reply. The model is guided
-to search for named symbols, inspect source and tests, and verify documentation
-against implementation instead of treating documentation as a complete audit.
+## Storage, privacy and configuration
 
-`read_file` accepts a workspace-relative `path` and optional 1-based, inclusive
-`start_line`/`end_line`. Any line is addressable, including lines beyond 17,000.
-Reads default to 200 lines, capped at 500 lines and approximately 12,000 content
-characters per chunk. Results include total lines, numbered content, and exact
-continuation coordinates; `start_column` handles exceptionally long lines.
-Search can target a directory or one file and no longer skips source files
-merely because they exceed 1 MB. Broad searches remain capped at 50 matches;
-narrow the path or query when that limit is reported.
+- Conversations, settings and records live in `data/` (or an existing `backend/data/`). Set
+  `COMPANION_DATA_DIR` to choose a directory explicitly. Back it up before moving an installation
+  (`scripts/backup-data.py`).
+- **Settings > Privacy & boundaries > Keep a record of model requests** (on by default) stores what was
+  sent to the model and what it returned, capped at the latest 300 requests, for diagnosing wrong or
+  broken answers. The records stay on this PC and are included when you export a conversation; they
+  can contain file contents the assistant read.
 
-For read-only chat exploration, each result has an evidence ID. The model can
-use `manage_context` with `keep` and `release` ID arrays to select evidence after
-reading it. Under context pressure, unmarked chunks with fewer matches to the
-recent user requests are released first (oldest first for ties). This relevance
-score is a heuristic, not semantic certainty. Explicitly kept chunks and the
-latest result are protected. Released chunks retain their path/range so they
-can be read again; the original activity log and conversation are not deleted.
-Selection is request-local, not permanent memory. Context and action limits
-still apply; incomplete inspection must not be presented as a full audit.
-
-## Storage and configuration
-
-Launch location no longer changes the default storage root. Existing `backend/data/companion.db` is preserved when present; otherwise data lives in `data/`. If both exist, neither is merged or removed. Set `COMPANION_DATA_DIR` to an explicit absolute directory to choose one. `COMPANION_MODELS_DIR` and `COMPANION_FRONTEND_DIR` override models and compiled UI locations.
-
-Back up your active data directory before migrations or moving an installation. Model header validation detects structural problems; it is not a checksum verification of all weights.
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `COMPANION_ADDR` | address the backend listens on | `127.0.0.1:3877` (`run.ps1` and `run.sh` use `:5173`) |
+| `COMPANION_DATA_DIR` | data directory | `data/` |
+| `COMPANION_MODELS_DIR` | models directory | `models/` |
+| `COMPANION_FRONTEND_DIR` | compiled UI | `frontend/dist/` |
+| `COMPANION_LLAMA_SERVER_BIN` | a specific `llama-server` | `runtime/bin/`, then `PATH` |
 
 ## Checks
 
 ```powershell
-cd backend
-cargo test
-cd ../frontend
-npm test       # Node.js 24+ (native TypeScript test imports)
-npm run build
+cd backend;  cargo test
+cd ..\frontend;  npm test;  npm run build
 ```
 
-The complete v5.1 design is a product roadmap, not a checklist of already-shipped features. See the review for remaining durable tasks, sandboxing, vector retrieval, automation and multi-model orchestration work.
+```bash
+cd backend && cargo test
+cd ../frontend && npm test && npm run build
+```
+
+## Troubleshooting
+
+- **`cargo`, `node` or `npm` not recognised**: finish installing and open a new terminal.
+- **`link.exe`, MSVC or Windows SDK errors**: install Visual Studio's *Desktop development with C++*
+  workload, then use a new terminal.
+- **The runtime build skips CUDA or Vulkan**: the build prints why (no matching GPU, or the SDK was not
+  found). Install the SDK, open a new terminal so its environment variables are visible, and run the
+  build again.
+- **`llama-server` not found**: run `scripts\build-runtime.ps1` (Windows) or `scripts/build-runtime.sh`
+  (Linux, macOS), or set `COMPANION_LLAMA_SERVER_BIN`.
+- **A model does not load**: the error names the cause (for example a file packaged for Ollama, or an
+  architecture this llama.cpp version does not know). Check the model's folder for `INCOMPATIBLE.txt`
+  when it came from the downloader.
+- **No models listed**: models must be `.gguf` files (not archives) inside `models/`; press Scan.
+- **Port 5173 or 3877 in use**: stop the previous instance with Ctrl+C in its terminal.
+- **PowerShell blocks scripts**: follow your organisation's execution policy; do not disable security
+  policies globally to run the launcher.
+
+## License
+
+This project is public domain under [The Unlicense](LICENSE). Anyone may clone, fork, copy, modify, publish,
+compile, sell or distribute it, for any purpose, commercial or not, with no conditions and no attribution
+required.
+
+The third-party software it builds on keeps its own licenses. The llama.cpp runtime (MIT) is built into
+`runtime/` by the build script and is not stored in this repository. The Rust and npm dependencies are
+fetched at build time. Models you download come with their own terms.

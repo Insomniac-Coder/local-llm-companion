@@ -156,6 +156,12 @@ pub fn registry() -> Vec<ToolDescriptor> {
             permission_required: "none",
         },
         ToolDescriptor {
+            name: "present_plan",
+            description: "Plan runs only: present the finished plan for the user to approve. Ends the run.",
+            risk: RiskLevel::Safe,
+            permission_required: "none",
+        },
+        ToolDescriptor {
             name: "open_path",
             description: "Open a workspace file/folder with the OS default app",
             risk: RiskLevel::Moderate,
@@ -170,6 +176,41 @@ pub fn risk_of(name: &str) -> RiskLevel {
         "write_file" | "append_file" | "edit_file" | "web_search" | "create_document"
         | "git_commit" | "open_path" => RiskLevel::Moderate,
         _ => RiskLevel::Safe,
+    }
+}
+
+/// Tools that write files inside the project: what Accept edits mode runs
+/// without asking. Deletion is not an edit.
+pub fn is_file_edit(tool: &str) -> bool {
+    matches!(tool, "write_file" | "append_file" | "edit_file" | "create_document")
+}
+
+/// A file edit inside a `.git` folder. Git runs commands named there (hooks,
+/// `core.fsmonitor`, `diff.external` in its config), so such an edit is never
+/// automatic outside Auto: review found that Accept edits would otherwise let
+/// a model plant a command that the app's own `git status` later runs.
+pub fn touches_git_internals(tool: &str, args: &serde_json::Value) -> bool {
+    is_file_edit(tool)
+        && args
+            .get("path")
+            .and_then(|path| path.as_str())
+            .is_some_and(|path| path.replace('\\', "/").split('/').any(|part| part.eq_ignore_ascii_case(".git")))
+}
+
+/// Arguments a tool cannot run without, and whether each must be non-empty.
+/// The schema-constrained action envelope builds its grammar from these, so a
+/// model under it cannot leave one out. Optional arguments are not listed.
+pub fn required_args(tool: &str) -> &'static [(&'static str, bool)] {
+    match tool {
+        "read_file" | "delete_file" => &[("path", true)],
+        // May be empty: the runner then presents the plan the model just wrote.
+        "present_plan" => &[("plan", false)],
+        "write_file" | "append_file" => &[("path", true), ("content", false)],
+        "edit_file" => &[("path", true), ("old", true), ("new", false)],
+        "search_text" => &[("query", true)],
+        "execute_command" => &[("command", true)],
+        "git_commit" => &[("message", true)],
+        _ => &[],
     }
 }
 
@@ -207,6 +248,58 @@ fn require_approved(req: &ToolRequest, approved: bool, what: &str) -> Result<(),
     })
 }
 
+/// A path that does not exist, reported with the project's files or folders of
+/// the same name (at most five, workspace-relative). Small models drop the
+/// folder part of a path they saw in the listing: measured live, a 4B model
+/// asked for `orders.py` three times when the file was `project/orders.py`,
+/// and "cannot find the file specified" never told it where to look.
+fn missing_path(ws: &WorkspaceManager, rel: &str, error: std::io::Error) -> ToolError {
+    if error.kind() != std::io::ErrorKind::NotFound {
+        return ToolError::Io(error);
+    }
+    let Some(name) = std::path::Path::new(rel.trim_end_matches(['/', '\\'])).file_name().map(|name| name.to_os_string()) else {
+        return ToolError::Io(error);
+    };
+    let root = ws.root().to_path_buf();
+    let mut matches: Vec<String> = Vec::new();
+    let mut pending = vec![(root.clone(), 0usize)];
+    let mut seen = 0usize;
+    'walk: while let Some((dir, depth)) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            seen += 1;
+            if seen > 20_000 || matches.len() >= 5 {
+                break 'walk;
+            }
+            let entry_name = entry.file_name();
+            let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
+            if entry_name.eq_ignore_ascii_case(&name) {
+                if let Ok(relative) = entry.path().strip_prefix(&root) {
+                    matches.push(relative.to_string_lossy().replace('\\', "/"));
+                }
+            }
+            let skipped = entry_name
+                .to_str()
+                .is_some_and(|dir_name| dir_name.starts_with('.') || matches!(dir_name, "node_modules" | "target" | "__pycache__" | "dist" | "build"));
+            if is_dir && !skipped && depth < 8 {
+                pending.push((entry.path(), depth + 1));
+            }
+        }
+    }
+    matches.sort();
+    let hint = if matches.is_empty() {
+        "list_directory shows what exists.".to_string()
+    } else {
+        format!("Found with that name: {}.", matches.join(", "))
+    };
+    ToolError::Io(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("no such path '{rel}' (paths are relative to the project root). {hint}"),
+    ))
+}
+
 /// Execute a validated tool. SAFE reads run immediately; MODERATE/DANGEROUS
 /// require `req.approved == true` (set by the permission UX, §26).
 pub fn execute(
@@ -218,7 +311,7 @@ pub fn execute(
         "list_directory" => {
             let rel = req.args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
             let dir = ws.resolve(rel).map_err(ToolError::Workspace)?;
-            let entries = std::fs::read_dir(&dir).map_err(ToolError::Io)?;
+            let entries = std::fs::read_dir(&dir).map_err(|error| missing_path(ws, rel, error))?;
             let mut names: Vec<String> = entries
                 .filter_map(|e| e.ok())
                 .map(|e| e.file_name().to_string_lossy().into_owned())
@@ -231,7 +324,10 @@ pub fn execute(
                 ToolError::InvalidArgs("read_file requires {\"path\": \"...\"}".into())
             })?;
             let p = ws.resolve(rel).map_err(ToolError::Workspace)?;
-            crate::file_read::read(&p, &req.args)
+            crate::file_read::read(&p, &req.args).map_err(|error| match error {
+                ToolError::Io(io) => missing_path(ws, rel, io),
+                other => other,
+            })
         }
         "write_file" => {
             require_approved(req, approved, "File creation needs explicit approval.")?;
@@ -332,7 +428,7 @@ pub fn execute(
                 ToolError::InvalidArgs(USAGE.into())
             })?;
             let p = ws.resolve(rel).map_err(ToolError::Workspace)?;
-            let original = std::fs::read_to_string(&p).map_err(ToolError::Io)?;
+            let original = std::fs::read_to_string(&p).map_err(|error| missing_path(ws, rel, error))?;
             if original.len() as u64 > MAX_FILE_BYTES {
                 return Err(ToolError::InvalidArgs("file too large to patch; rewrite it in chunks".into()));
             }
@@ -363,6 +459,9 @@ pub fn execute(
                 ToolError::InvalidArgs("delete_file requires {\"path\": \"...\"}".into())
             })?;
             let p = ws.resolve(rel).map_err(ToolError::Workspace)?;
+            if !p.exists() {
+                return Err(missing_path(ws, rel, std::io::ErrorKind::NotFound.into()));
+            }
             if !p.is_file() {
                 return Err(ToolError::InvalidArgs(format!("not a file: {rel}")));
             }
@@ -443,6 +542,11 @@ pub fn execute(
             rows.truncate(300);
             Ok(ToolResult::ok(rows.join("\n")))
         }
+        // The plan run's finish (Claude Code's ExitPlanMode). The agent loop
+        // handles it; it does nothing on its own.
+        "present_plan" => Err(ToolError::InvalidArgs(
+            "present_plan requires {\"plan\": \"...\"} and only ends a plan run".into(),
+        )),
         "open_path" => {
             require_approved(req, approved, "Opening apps/files needs explicit approval.")?;
             let rel = req.args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
@@ -886,6 +990,52 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.txt"), "hello").unwrap();
         WorkspaceManager::new(dir)
+    }
+
+    #[test]
+    fn every_listed_required_argument_is_refused_when_missing() {
+        let w = ws();
+        for tool in registry() {
+            for (missing, _) in required_args(tool.name) {
+                let args: serde_json::Map<String, serde_json::Value> = required_args(tool.name)
+                    .iter()
+                    .filter(|(name, _)| name != missing)
+                    .map(|(name, _)| (name.to_string(), serde_json::json!("a.txt")))
+                    .collect();
+                let request = ToolRequest { name: tool.name.into(), args: serde_json::Value::Object(args), approved: true };
+                let error = execute(&request, &w, true).unwrap_err().to_string();
+                assert!(error.contains("requires"), "{} without {missing}: {error}", tool.name);
+            }
+        }
+    }
+
+    #[test]
+    fn edits_inside_git_folders_are_recognised_on_any_separator() {
+        for path in [".git/config", "project/.git/hooks/pre-commit", ".GIT\\config", "a\\.git\\info"] {
+            assert!(touches_git_internals("write_file", &serde_json::json!({"path": path})), "{path}");
+        }
+        assert!(!touches_git_internals("write_file", &serde_json::json!({"path": ".gitignore"})));
+        assert!(!touches_git_internals("write_file", &serde_json::json!({"path": "src/git/config.rs"})));
+        assert!(!touches_git_internals("read_file", &serde_json::json!({"path": ".git/config"})), "reads are not edits");
+    }
+
+    #[test]
+    fn a_missing_path_names_the_projects_files_of_that_name() {
+        let w = ws();
+        std::fs::create_dir_all(w.root().join("project")).unwrap();
+        std::fs::write(w.root().join("project").join("orders.py"), "x = 1\n").unwrap();
+        let read = |path: &str| {
+            let request = ToolRequest { name: "read_file".into(), args: serde_json::json!({"path": path}), approved: false };
+            execute(&request, &w, false).unwrap_err().to_string()
+        };
+        let message = read("orders.py");
+        assert!(message.contains("no such path 'orders.py'") && message.contains("project/orders.py"), "{message}");
+        let none = read("missing.py");
+        assert!(none.contains("list_directory shows what exists"), "{none}");
+        let listed = execute(&ToolRequest { name: "list_directory".into(), args: serde_json::json!({"path": "src"}), approved: false }, &w, false)
+            .unwrap_err()
+            .to_string();
+        assert!(listed.contains("no such path 'src'"), "{listed}");
     }
 
     /// The whole path a file body travels: the model's reply, parsed as an

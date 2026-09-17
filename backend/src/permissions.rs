@@ -29,6 +29,24 @@ pub enum AutonomyLevel {
     /// Level 3 — Autonomous: registered tools run without approval prompts
     /// (explicit opt-in). Tool path, argument, mode and search gates still apply.
     Autonomous = 3,
+    /// Accept edits: SAFE tools and file edits in the workspace run without
+    /// asking; commands, deletion, Git, opening paths and web search still ask
+    /// (the Claude Code mode of the same name).
+    AcceptEdits = 4,
+}
+
+/// The permission modes a code session cycles through (owner decision
+/// 2026-09-17, modelled on Claude Code): what each lets run without asking.
+/// "plan" also runs the agent read-only; its reads run freely like "ask".
+pub const PERMISSION_MODES: [&str; 4] = ["ask", "accept_edits", "plan", "auto"];
+
+/// The autonomy level a permission mode applies. Unknown names read as "ask".
+pub fn autonomy_for_mode(mode: &str) -> AutonomyLevel {
+    match mode {
+        "auto" => AutonomyLevel::Autonomous,
+        "accept_edits" => AutonomyLevel::AcceptEdits,
+        _ => AutonomyLevel::WorkspaceAgent,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +94,9 @@ impl PermissionManager {
             AutonomyLevel::Autonomous => {
                 "Level 3 — Auto (registered actions, including commands and deletion, run without per-action approval; tool safety limits remain enforced)"
             }
+            AutonomyLevel::AcceptEdits => {
+                "Accept edits (reads and file edits in the project run without asking; commands, deletion, Git and web search ask)"
+            }
         };
         format!(
             "{mode}\nSession grants: {} (moderate tools, per workspace)\nWeb search: requires the request's Search switch and its configured search policy.",
@@ -98,6 +119,24 @@ impl PermissionManager {
     /// `workspace` is the canonical workspace root when known (for grants).
     pub fn decide(&self, tool: &str, risk: RiskLevel, in_workspace: bool) -> PermissionDecision {
         self.decide_in(tool, risk, in_workspace, None)
+    }
+
+    /// `decide_in` for one concrete call, whose arguments can make an
+    /// otherwise automatic action ask (an edit inside `.git` in Accept edits).
+    pub fn decide_call(
+        &self,
+        tool: &str,
+        args: &serde_json::Value,
+        risk: RiskLevel,
+        in_workspace: bool,
+        workspace: Option<&str>,
+    ) -> PermissionDecision {
+        if self.autonomy == AutonomyLevel::AcceptEdits && crate::tools::touches_git_internals(tool, args) {
+            return PermissionDecision::RequireApproval {
+                reason: format!("'{tool}' edits a file inside .git, where git keeps commands it runs; this asks even in Accept edits mode."),
+            };
+        }
+        self.decide_in(tool, risk, in_workspace, workspace)
     }
 
     pub fn decide_in(
@@ -149,6 +188,13 @@ impl PermissionManager {
             },
             (AutonomyLevel::Assisted, _) => PermissionDecision::RequireApproval {
                 reason: format!("Assisted mode: confirm '{tool}' to continue."),
+            },
+            (AutonomyLevel::AcceptEdits, RiskLevel::Safe) if in_workspace => PermissionDecision::Allow,
+            (AutonomyLevel::AcceptEdits, RiskLevel::Moderate) if in_workspace && crate::tools::is_file_edit(tool) => {
+                PermissionDecision::Allow
+            }
+            (AutonomyLevel::AcceptEdits, _) => PermissionDecision::RequireApproval {
+                reason: format!("'{tool}' needs approval in Accept edits mode: only reads and file edits run without asking."),
             },
             (AutonomyLevel::WorkspaceAgent, RiskLevel::Safe) if in_workspace => {
                 PermissionDecision::Allow
@@ -227,6 +273,44 @@ mod tests {
             std::env::temp_dir().join("auto-boundary-fixture"),
         );
         assert!(ws.resolve("../outside.txt").is_err());
+    }
+
+    #[test]
+    fn accept_edits_runs_reads_and_file_edits_and_asks_for_the_rest() {
+        let pm = PermissionManager::new(autonomy_for_mode("accept_edits"));
+        for tool in ["read_file", "list_directory", "search_text"] {
+            assert!(matches!(pm.decide(tool, crate::tools::risk_of(tool), true), PermissionDecision::Allow), "{tool}");
+        }
+        for tool in ["write_file", "append_file", "edit_file", "create_document"] {
+            assert!(matches!(pm.decide(tool, crate::tools::risk_of(tool), true), PermissionDecision::Allow), "{tool}");
+            assert!(matches!(pm.decide(tool, crate::tools::risk_of(tool), false), PermissionDecision::RequireApproval { .. }), "{tool} outside");
+        }
+        for tool in ["execute_command", "delete_file", "git_commit", "open_path", "web_search"] {
+            assert!(matches!(pm.decide(tool, crate::tools::risk_of(tool), true), PermissionDecision::RequireApproval { .. }), "{tool}");
+        }
+    }
+
+    #[test]
+    fn accept_edits_asks_for_edits_inside_git_folders() {
+        let pm = PermissionManager::new(autonomy_for_mode("accept_edits"));
+        let config = serde_json::json!({"path": ".git/config"});
+        assert!(matches!(pm.decide_call("write_file", &config, RiskLevel::Moderate, true, None), PermissionDecision::RequireApproval { .. }));
+        let page = serde_json::json!({"path": "index.html"});
+        assert!(matches!(pm.decide_call("write_file", &page, RiskLevel::Moderate, true, None), PermissionDecision::Allow));
+        let auto = PermissionManager::new(autonomy_for_mode("auto"));
+        assert!(matches!(auto.decide_call("write_file", &config, RiskLevel::Moderate, true, None), PermissionDecision::Allow), "Auto is Auto");
+    }
+
+    #[test]
+    fn ask_mode_reads_freely_and_asks_before_edits_and_commands() {
+        let pm = PermissionManager::new(autonomy_for_mode("ask"));
+        assert!(matches!(pm.decide("read_file", RiskLevel::Safe, true), PermissionDecision::Allow));
+        for tool in ["write_file", "edit_file", "execute_command", "delete_file"] {
+            assert!(matches!(pm.decide(tool, crate::tools::risk_of(tool), true), PermissionDecision::RequireApproval { .. }), "{tool}");
+        }
+        assert_eq!(autonomy_for_mode("plan"), AutonomyLevel::WorkspaceAgent);
+        assert_eq!(autonomy_for_mode("auto"), AutonomyLevel::Autonomous);
+        assert_eq!(autonomy_for_mode("anything else"), AutonomyLevel::WorkspaceAgent);
     }
 
     #[test]

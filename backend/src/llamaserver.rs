@@ -12,7 +12,8 @@
 //! `GET /health`, `POST /v1/chat/completions`, `POST /tokenize`.
 
 use crate::inference::{
-    thiserror_stub::InferenceError, ChatTemplateShape, InferenceConfig, Metrics, OutputTiming,
+    thiserror_stub::{InferenceError, SidecarFailure},
+    ChatTemplateShape, InferenceConfig, Metrics, OutputTiming,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -82,18 +83,70 @@ impl SidecarBinary {
             .unwrap_or_default();
         crate::runtime_selection::parse_devices(&format!("{err}\n{out}"), success)
     }
-    /// Search order: env `COMPANION_LLAMA_SERVER_BIN` → PATH → common
-    /// release locations → `<models_dir>/bin/`. Returns a user-friendly
-    /// error telling the user exactly where to put the binary (§52).
-    pub fn detect(models_dir: &Path) -> Result<Self, InferenceError> {
-        if let Ok(p) = std::env::var("COMPANION_LLAMA_SERVER_BIN") {
+
+    /// Whether this runtime's `--help` lists `argument`. An older runtime given
+    /// through the override refuses arguments it does not know, and "unknown
+    /// argument" is never retried, so an optional argument is only passed when
+    /// the runtime lists it.
+    pub async fn supports_argument(&self, argument: &str) -> bool {
+        self.help_text()
+            .await
+            .map(|text| text.split(|c: char| c.is_whitespace() || c == ',').any(|word| word == argument))
+            .unwrap_or(false)
+    }
+
+    /// The built-in chat formats this runtime's `--help` lists.
+    pub async fn builtin_chat_templates(&self) -> Vec<String> {
+        self.help_text().await.map(|text| listed_builtin_chat_templates(&text)).unwrap_or_default()
+    }
+
+    /// This runtime's `--help` text, read once per binary and modification
+    /// time. None when it cannot be read; that is not remembered.
+    async fn help_text(&self) -> Option<Arc<String>> {
+        use std::collections::HashMap;
+        use std::sync::OnceLock;
+        type Key = (PathBuf, Option<std::time::SystemTime>);
+        static SEEN: OnceLock<Mutex<HashMap<Key, Arc<String>>>> = OnceLock::new();
+        let modified = std::fs::metadata(&self.0).and_then(|meta| meta.modified()).ok();
+        let key = (self.0.clone(), modified);
+        if let Some(known) = SEEN.get_or_init(Default::default).lock().ok().and_then(|seen| seen.get(&key).cloned()) {
+            return Some(known);
+        }
+        let mut command = Command::new(&self.0);
+        command
+            .arg("--help")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        command.creation_flags(0x08000000);
+        let child = command.spawn().ok()?;
+        let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output()).await.ok()?.ok()?;
+        let text = Arc::new(format!("{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr)));
+        if let Ok(mut seen) = SEEN.get_or_init(Default::default).lock() {
+            seen.insert(key, text.clone());
+        }
+        Some(text)
+    }
+    /// Where the llama-server runtime is, in order of authority (the error
+    /// tells the user how to build it, §52):
+    /// 1. COMPANION_LLAMA_SERVER_BIN, an explicit override;
+    /// 2. `runtime_dir` (runtime/bin at the installation root), built from the
+    ///    pinned commit by scripts/build-runtime.ps1 or build-runtime.sh;
+    /// 3. PATH, last. It used to be searched first, so any llama.cpp installed
+    ///    system-wide silently replaced the project's pinned build.
+    pub fn detect(runtime_dir: &Path) -> Result<Self, InferenceError> {
+        // Empty counts as unset, as for the other COMPANION_* folders (a shell
+        // can export an empty variable; run.sh then builds runtime/bin).
+        if let Some(p) = std::env::var("COMPANION_LLAMA_SERVER_BIN").ok().filter(|p| !p.is_empty()) {
             let pb = PathBuf::from(&p);
             if pb.is_file() {
                 return Ok(Self(pb));
             }
             return Err(InferenceError::Generation(format!(
                 "COMPANION_LLAMA_SERVER_BIN points at '{p}' but no file is there. \
-                 Download a llama.cpp release and set the env var to llama-server(.exe)."
+                 Unset it to use the project runtime in runtime/bin."
             )));
         }
         let exe = if cfg!(windows) {
@@ -101,25 +154,31 @@ impl SidecarBinary {
         } else {
             "llama-server"
         };
+        let bundled = runtime_dir.join(exe);
+        if bundled.is_file() {
+            return Ok(Self(bundled));
+        }
         if let Some(p) = search_path(exe) {
             return Ok(Self(p));
         }
-        for cand in [
-            models_dir.join("bin").join(exe),
-            PathBuf::from("llama-server").join(exe),
-            PathBuf::from("../llama-server").join(exe),
-        ] {
-            if cand.is_file() {
-                return Ok(Self(cand));
-            }
-        }
-        Err(InferenceError::Generation(
-            "llama-server binary not found. Download a llama.cpp release zip, place \
-             llama-server(.exe) on PATH or in models/bin/, or set \
-             COMPANION_LLAMA_SERVER_BIN. Stub mode continues to work meanwhile."
-                .into(),
-        ))
+        let script = if cfg!(windows) {
+            "scripts\\build-runtime.ps1"
+        } else {
+            "scripts/build-runtime.sh"
+        };
+        Err(InferenceError::Generation(format!(
+            "The llama.cpp runtime is not built yet. Run {script} from the project folder \
+             (it builds llama-server with the backends this machine supports \
+             into runtime/bin), or set COMPANION_LLAMA_SERVER_BIN."
+        )))
     }
+}
+
+/// The project's runtime folder: runtime/bin at the installation root. It used
+/// to be derived from the models folder's parent, so a models folder elsewhere
+/// (COMPANION_MODELS_DIR) made a built runtime look missing.
+pub fn runtime_dir(install_root: &Path) -> PathBuf {
+    install_root.join("runtime").join("bin")
 }
 
 fn search_path(exe: &str) -> Option<PathBuf> {
@@ -131,6 +190,23 @@ fn search_path(exe: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// The names under "list of built-in templates:" in `--help`, which runs over
+/// the following lines until the option's `(env: ...)` line.
+fn listed_builtin_chat_templates(help: &str) -> Vec<String> {
+    let Some(start) = help.find("list of built-in templates:") else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for line in help[start + "list of built-in templates:".len()..].lines() {
+        let line = line.trim();
+        if line.starts_with("(env:") || line.starts_with('-') {
+            break;
+        }
+        names.extend(line.split(',').map(str::trim).filter(|name| !name.is_empty()).map(str::to_string));
+    }
+    names
 }
 
 /// Build the `llama-server` argv from our config (§13 advanced panel).
@@ -169,9 +245,27 @@ pub fn server_args(cfg: &InferenceConfig, port: u16) -> Vec<String> {
     ];
     // Zero leaves the runtime's own default (2048 logical / 512 physical);
     // forcing a smaller logical batch only adds decode calls during prefill.
-    if cfg.n_batch > 0 {
+    // llama.cpp caps the micro-batch at the logical batch, so a chosen
+    // micro-batch raises the logical batch when that would be smaller.
+    let micro_batch = cfg.micro_batch.filter(|size| *size > 0);
+    let batch = match (cfg.n_batch, micro_batch) {
+        (0, Some(size)) if size > crate::runtime_fit::RUNTIME_DEFAULT_BATCH => size,
+        (0, _) => 0,
+        (batch, Some(size)) => batch.max(size),
+        (batch, None) => batch,
+    };
+    if batch > 0 {
         a.push("--batch-size".into());
-        a.push(cfg.n_batch.to_string());
+        a.push(batch.to_string());
+    }
+    if let Some(size) = micro_batch {
+        a.push("--ubatch-size".into());
+        a.push(size.to_string());
+    }
+    // The pinned runtime's spelling; `--no-mmap` is deprecated there.
+    if cfg.load_without_mmap {
+        a.push("--load-mode".into());
+        a.push("none".into());
     }
     if cfg.cache_reuse > 0 {
         a.push("--cache-reuse".into());
@@ -180,10 +274,51 @@ pub fn server_args(cfg: &InferenceConfig, port: u16) -> Vec<String> {
     if !cfg.speculative.is_empty() && cfg.speculative != "none" {
         a.push("--spec-type".into());
         a.push(cfg.speculative.clone());
+        if let Some(tokens) = cfg.spec_draft_n_max {
+            a.push("--spec-draft-n-max".into());
+            a.push(tokens.to_string());
+        }
+        if let Some(length) = cfg.spec_ngram_length.filter(|_| cfg.speculative.contains("ngram-simple")) {
+            // N-gram drafting drafts nothing when the length is shorter than
+            // its lookup (default 12), so a short length shortens the lookup.
+            a.push("--spec-ngram-simple-size-n".into());
+            a.push(length.clamp(1, 12).to_string());
+            a.push("--spec-ngram-simple-size-m".into());
+            a.push(length.max(1).to_string());
+        }
+    }
+    // A model file without a chat template: llama.cpp's own formatter for the
+    // architecture. Built-in formats exist only outside the Jinja engine, whose
+    // one request feature lost is native tool definitions, which the app never
+    // sends. ChatML is already the runtime's fallback.
+    if let Some(format) = cfg.builtin_chat_format.as_deref().filter(|format| *format != "chatml") {
+        a.push("--no-jinja".into());
+        a.push("--chat-template".into());
+        a.push(format.to_string());
     }
     if cfg.n_threads > 0 {
         a.push("--threads".into());
         a.push(cfg.n_threads.to_string());
+    }
+    if cfg.n_threads_batch > 0 {
+        a.push("--threads-batch".into());
+        a.push(cfg.n_threads_batch.to_string());
+    }
+    if let Some(poll) = cfg.poll {
+        a.push("--poll".into());
+        a.push(poll.min(100).to_string());
+    }
+    if let Some(priority) = cfg.priority {
+        a.push("--prio".into());
+        a.push(priority.clamp(-1, 3).to_string());
+    }
+    if let Some(mib) = cfg.fit_target_mib {
+        a.push("--fit-target".into());
+        a.push(mib.to_string());
+    }
+    if let Some(mib) = cfg.cache_ram_mib {
+        a.push("--cache-ram".into());
+        a.push(mib.to_string());
     }
     if let Some(mmproj) = &cfg.projector_path {
         a.push("--mmproj".into());
@@ -199,6 +334,50 @@ pub fn server_args(cfg: &InferenceConfig, port: u16) -> Vec<String> {
         }
     }
     a
+}
+
+/// Separates a load failure's plain message from the runtime log that follows.
+pub const RUNTIME_DIAGNOSTIC_MARKER: &str = " Runtime diagnostic: ";
+
+/// A load failure without the runtime log appended to it.
+pub fn without_runtime_diagnostic(message: &str) -> &str {
+    message.split(RUNTIME_DIAGNOSTIC_MARKER).next().unwrap_or(message)
+}
+
+/// The last error-level line of a llama.cpp log (`<time> E <message>`),
+/// without its timestamp.
+fn last_runtime_error(log: &str) -> Option<String> {
+    log.lines()
+        .rev()
+        .find_map(|line| line.split_once(" E ").map(|(_, message)| message.trim().to_string()))
+        .filter(|message| !message.is_empty())
+}
+
+/// The runtime's own words for why a model would not load, restated as the
+/// cause and what to do. Before this, the only explanation was a log excerpt
+/// such as "key not found in model: gemma3.attention.layer_norm_rms_epsilon",
+/// which names a symptom of the file's packaging, not the packaging.
+/// Recognises llama.cpp's loader messages, not model names.
+fn explain_load_failure(log: &str) -> Option<String> {
+    let lower = log.to_ascii_lowercase();
+    let registry_note = "Files taken from Ollama's registry are packaged for Ollama, whose runtime repairs them while loading; download the upstream GGUF (for example with models/modeldownloader.py hf <owner/repo> <file>).";
+    if lower.contains("wrong number of tensors") {
+        Some(format!(
+            "The model file contains tensors this runtime does not use, typically a vision or audio tower packed in with the language model instead of a separate projector file. {registry_note}"
+        ))
+    } else if lower.contains("key not found in model") {
+        Some(format!(
+            "The model file is missing metadata this runtime requires for its architecture. {registry_note}"
+        ))
+    } else if lower.contains("wrong shape") {
+        Some(format!(
+            "A tensor in the model file does not have the shape its metadata describes (for example a tokenizer longer than the embedding table). {registry_note}"
+        ))
+    } else if lower.contains("unknown model architecture") {
+        Some("This runtime build does not support the model's architecture. A newer llama.cpp (runtime/llama.cpp.lock.json, then rebuild the runtime) may.".into())
+    } else {
+        None
+    }
 }
 
 /// A running sidecar: child process + base URL + the config it was started with.
@@ -286,14 +465,23 @@ impl RunningSidecar {
                 .lock()
                 .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
                 .unwrap_or_default();
-            return Err(InferenceError::Generation(format!(
-                "{error}{}",
-                if tail.is_empty() {
-                    String::new()
-                } else {
-                    format!(" Runtime diagnostic: {tail}")
-                }
-            )));
+            // The cause in plain words first; the runtime's log follows the
+            // marker for the log and for the GPU-fallback check, and the API
+            // shows only what comes before it.
+            let started = match error {
+                InferenceError::Generation(message) => message,
+                other => other.to_string(),
+            };
+            let plain = match (explain_load_failure(&tail), last_runtime_error(&tail)) {
+                (Some(reason), _) => reason,
+                (None, Some(line)) => format!("{started} The runtime's last error: {line}"),
+                (None, None) => started,
+            };
+            return Err(InferenceError::Generation(if tail.is_empty() {
+                plain
+            } else {
+                format!("{plain}{RUNTIME_DIAGNOSTIC_MARKER}{tail}")
+            }));
         }
         Ok(Self {
             child,
@@ -444,10 +632,80 @@ fn shared_client() -> &'static reqwest::Client {
 }
 
 /// Thin OpenAI-compatible client over the sidecar.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SidecarClient {
     pub base_url: String,
     inner: reqwest::Client,
+    recorder: Option<RequestRecorder>,
+}
+
+impl std::fmt::Debug for SidecarClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SidecarClient")
+            .field("base_url", &self.base_url)
+            .field("recording", &self.recorder.is_some())
+            .finish()
+    }
+}
+
+/// What one model request carried and returned, handed to a recorder after
+/// the response (or failure) so the caller can store it.
+#[derive(Debug, Clone)]
+pub struct RecordedRequest {
+    /// The body as sent, image data replaced by a placeholder.
+    pub body: serde_json::Value,
+    pub output: String,
+    pub finish_reason: Option<String>,
+    /// completed | early_stopped | cancelled | failed
+    pub outcome: &'static str,
+    pub failure: Option<String>,
+    pub prompt_tokens: u32,
+    pub cached_tokens: u32,
+    pub generated_tokens: u32,
+}
+
+pub type RequestRecorder = Arc<dyn Fn(RecordedRequest) + Send + Sync>;
+
+/// Teach the token estimate this model's real characters per token from a
+/// request the runtime measured. Requests with images are skipped: an image
+/// is hundreds of tokens and no characters.
+fn observe_prompt_size(body: &serde_json::Value, prompt_tokens: u32) {
+    let Some(messages) = body.get("messages").and_then(|messages| messages.as_array()) else {
+        return;
+    };
+    let mut chars = 0usize;
+    for message in messages {
+        match message.get("content") {
+            Some(serde_json::Value::String(text)) => chars += text.chars().count(),
+            Some(serde_json::Value::Array(parts)) => {
+                for part in parts {
+                    if part.get("type").and_then(|t| t.as_str()) == Some("image_url") {
+                        return;
+                    }
+                    if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                        chars += text.chars().count();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    crate::agent::observe_prompt(chars, prompt_tokens);
+}
+
+/// A copy of a request body with inline image data replaced: a photo is
+/// megabytes of base64 that says nothing about why a reply went wrong.
+fn without_image_data(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) if text.starts_with("data:image") => {
+            serde_json::Value::String(format!("[image data omitted: {} characters]", text.len()))
+        }
+        serde_json::Value::Array(items) => serde_json::Value::Array(items.iter().map(without_image_data).collect()),
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter().map(|(key, item)| (key.clone(), without_image_data(item))).collect(),
+        ),
+        other => other.clone(),
+    }
 }
 
 /// Agent-control metadata for one completion. Native reasoning text is never
@@ -473,7 +731,7 @@ impl AgentCompletion {
 }
 
 /// One chat turn with a proper role (§20 multi-turn history).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ChatTurn {
     pub role: String, // system | user | assistant | tool
     pub content: String,
@@ -571,6 +829,67 @@ fn is_template_refusal(body: &str) -> bool {
         || lower.contains("role not supported")
         || lower.contains("unable to generate parser for this template")
         || (lower.contains("template") && lower.contains("jinja"))
+}
+
+/// Classify a non-success llama-server response by its HTTP status and the
+/// error object it returns (`{"error": {"code", "message", "type", ...}}`).
+pub(crate) fn classify_failure(status: u16, body: &str) -> SidecarFailure {
+    let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+    match parsed.as_ref().and_then(|v| v.get("error")).filter(|e| e.is_object()) {
+        Some(error) => classify_error_object(error, status),
+        None => classify_status(status, body.chars().take(300).collect()),
+    }
+}
+
+/// An error object from a response body or from a mid-stream SSE frame.
+fn classify_error_object(error: &serde_json::Value, status: u16) -> SidecarFailure {
+    let kind = error.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    let message: String = error
+        .get("message")
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .chars()
+        .take(300)
+        .collect();
+    let code = error
+        .get("code")
+        .and_then(|c| c.as_u64())
+        .and_then(|c| u16::try_from(c).ok())
+        .unwrap_or(status);
+    let count = |key: &str| {
+        error
+            .get(key)
+            .and_then(|v| v.as_u64())
+            .map(|v| v.min(u64::from(u32::MAX)) as u32)
+            .unwrap_or(0)
+    };
+    match kind {
+        "exceed_context_size_error" => SidecarFailure::ContextExceeded {
+            prompt_tokens: count("n_prompt_tokens"),
+            context: count("n_ctx"),
+        },
+        "unavailable_error" => SidecarFailure::Unavailable(message),
+        _ => classify_status(code, message),
+    }
+}
+
+fn classify_status(status: u16, detail: String) -> SidecarFailure {
+    match status {
+        503 => SidecarFailure::Unavailable(detail),
+        408 | 504 => SidecarFailure::Timeout,
+        400..=499 => SidecarFailure::BadRequest(detail),
+        _ => SidecarFailure::Server(detail),
+    }
+}
+
+/// No response arrived: a timeout, or a connection that could not be made or
+/// was reset.
+fn transport_failure(error: &reqwest::Error) -> SidecarFailure {
+    if error.is_timeout() {
+        SidecarFailure::Timeout
+    } else {
+        SidecarFailure::Unavailable(error.to_string())
+    }
 }
 
 /// The same message list under the strictest shape any template demands.
@@ -830,7 +1149,64 @@ impl SidecarClient {
         Ok(Self {
             base_url,
             inner: shared_client().clone(),
+            recorder: None,
         })
+    }
+
+    /// The template capabilities the runtime reports, or None when it does
+    /// not report them or does not answer within a few seconds.
+    pub async fn template_caps(&self) -> Option<crate::inference::TemplateCaps> {
+        let response = self
+            .inner
+            .get(format!("{}/props", self.base_url))
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let props: serde_json::Value = response.json().await.ok()?;
+        crate::inference::TemplateCaps::from_props(&props)
+    }
+
+    /// Every request this client sends is handed to `recorder` once it ends.
+    pub fn with_recorder(mut self, recorder: RequestRecorder) -> Self {
+        self.recorder = Some(recorder);
+        self
+    }
+
+    fn record_request(
+        &self,
+        body: &serde_json::Value,
+        result: Result<(&str, Option<&str>, &'static str, &Metrics), &InferenceError>,
+    ) {
+        let Some(recorder) = &self.recorder else {
+            return;
+        };
+        let request = match result {
+            Ok((output, finish_reason, outcome, metrics)) => RecordedRequest {
+                body: without_image_data(body),
+                output: output.to_string(),
+                finish_reason: finish_reason.map(str::to_string),
+                outcome,
+                failure: None,
+                prompt_tokens: metrics.prompt_tokens,
+                cached_tokens: metrics.engine.as_ref().map(|engine| engine.cached_tokens).unwrap_or(0),
+                generated_tokens: metrics.generated_tokens,
+            },
+            Err(error) => RecordedRequest {
+                body: without_image_data(body),
+                output: String::new(),
+                finish_reason: None,
+                outcome: "failed",
+                failure: Some(error.to_string()),
+                prompt_tokens: 0,
+                cached_tokens: 0,
+                generated_tokens: 0,
+            },
+        };
+        recorder(request);
     }
 
     /// Non-streaming chat completion. Returns text + usage-derived metrics.
@@ -854,41 +1230,57 @@ impl SidecarClient {
         self.complete(body, cfg).await
     }
 
-    pub async fn classify_request(
-        &self,
-        turns: &[ChatTurn],
-        cfg: &InferenceConfig,
-    ) -> Result<AgentCompletion, InferenceError> {
-        let mut body = sampling_body(turns, 192, cfg, false);
-        apply_options(
-            &mut body,
-            &RequestOptions {
-                thinking: Some(false),
-                deterministic: true,
-                response_format: Some(serde_json::json!({"type":"json_object", "schema": {
-                    "type":"object", "properties":{"activity":{"type":"string","minLength":1,"maxLength":500},"intent":{"type":"string","enum":["ask","plan","agent"]}},
-                    "required":["activity","intent"], "additionalProperties":false
-                }})),
+    /// The enforced action envelope for models whose template has no tool
+    /// support. Each tool is its own alternative, with its name fixed and the
+    /// arguments it cannot run without required (`tools::required_args`), so
+    /// the runtime's grammar cannot produce a blank name or a call its tool
+    /// will refuse. Measured live under the looser envelope: a 4B model sent a
+    /// tool call with an empty name, a search without a query and a file write
+    /// without its text.
+    pub(crate) fn structured_action_schema() -> serde_json::Value {
+        // Field order is generation order (serde_json keeps insertion order):
+        // kind and name first, so the model has chosen the tool before it writes
+        // arguments. Serialized alphabetically, answer and args came first and
+        // name last; measured live, a 4B model wrote a whole page as `content`
+        // and then named the tool list_directory, which the grammar allowed.
+        let mut alternatives = vec![serde_json::json!({
+            "type": "object",
+            "properties": {
+                "kind": {"const": "final"},
+                "name": {"const": ""},
+                "args": {"type": "object", "properties": {}, "additionalProperties": false},
+                "answer": {"type": "string", "minLength": 1}
             },
-        );
-        self.complete_detailed(body, cfg).await
-    }
-
-    fn structured_action_schema() -> serde_json::Value {
-        serde_json::json!({
-            "type": "json_object",
-            "schema": {
+            "required": ["kind", "name", "args", "answer"],
+            "additionalProperties": false
+        })];
+        for tool in crate::tools::registry() {
+            let required = crate::tools::required_args(tool.name);
+            let properties: serde_json::Map<String, serde_json::Value> = required
+                .iter()
+                .map(|(name, non_empty)| {
+                    let schema = if *non_empty {
+                        serde_json::json!({"type": "string", "minLength": 1})
+                    } else {
+                        serde_json::json!({"type": "string"})
+                    };
+                    (name.to_string(), schema)
+                })
+                .collect();
+            let names: Vec<&str> = required.iter().map(|(name, _)| *name).collect();
+            alternatives.push(serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "kind": {"type": "string", "enum": ["tool", "final"]},
-                    "name": {"type": "string"},
-                    "args": {"type": "object", "additionalProperties": true},
-                    "answer": {"type": "string"}
+                    "kind": {"const": "tool"},
+                    "name": {"const": tool.name},
+                    "args": {"type": "object", "properties": properties, "required": names, "additionalProperties": true},
+                    "answer": {"const": ""}
                 },
                 "required": ["kind", "name", "args", "answer"],
                 "additionalProperties": false
-            }
-        })
+            }));
+        }
+        serde_json::json!({"type": "json_object", "schema": {"anyOf": alternatives}})
     }
 
     /// Only agent execution opts into this override. A caller may make one
@@ -980,18 +1372,15 @@ impl SidecarClient {
             Ok(response) => Ok(response),
             Err(error) if !error.is_timeout() && (error.is_connect() || error.is_request()) => {
                 let Some(retry) = retry else {
-                    return Err(InferenceError::Generation(format!(
-                        "sidecar request failed: {error}"
-                    )));
+                    return Err(InferenceError::Sidecar(transport_failure(&error)));
                 };
                 tracing::warn!("sidecar request failed before any response ({error}); retrying once");
-                retry.send().await.map_err(|e| {
-                    InferenceError::Generation(format!("sidecar request failed: {e}"))
-                })
+                retry
+                    .send()
+                    .await
+                    .map_err(|e| InferenceError::Sidecar(transport_failure(&e)))
             }
-            Err(error) => Err(InferenceError::Generation(format!(
-                "sidecar request failed: {error}"
-            ))),
+            Err(error) => Err(InferenceError::Sidecar(transport_failure(&error))),
         }
     }
 
@@ -1021,16 +1410,14 @@ impl SidecarClient {
                 }
                 let code = retry.status();
                 let text = retry.text().await.unwrap_or_default();
-                return Err(InferenceError::Generation(format!(
+                tracing::warn!(
                     "llama-server returned {code} for both the original and the template-safe message list: {}",
                     text.chars().take(300).collect::<String>()
-                )));
+                );
+                return Err(InferenceError::Sidecar(classify_failure(code.as_u16(), &text)));
             }
         }
-        Err(InferenceError::Generation(format!(
-            "llama-server returned {code}: {}. Check context size vs prompt length.",
-            text.chars().take(300).collect::<String>()
-        )))
+        Err(InferenceError::Sidecar(classify_failure(code.as_u16(), &text)))
     }
 
     async fn complete_detailed(
@@ -1038,11 +1425,30 @@ impl SidecarClient {
         body: serde_json::Value,
         cfg: &InferenceConfig,
     ) -> Result<AgentCompletion, InferenceError> {
-        let r = self.post_chat(&body).await?;
+        let result = self.complete_detailed_body(&body, cfg).await;
+        match &result {
+            Ok(completion) => {
+                observe_prompt_size(&body, completion.metrics.prompt_tokens);
+                self.record_request(
+                    &body,
+                    Ok((&completion.text, completion.finish_reason.as_deref(), "completed", &completion.metrics)),
+                )
+            }
+            Err(error) => self.record_request(&body, Err(error)),
+        }
+        result
+    }
+
+    async fn complete_detailed_body(
+        &self,
+        body: &serde_json::Value,
+        cfg: &InferenceConfig,
+    ) -> Result<AgentCompletion, InferenceError> {
+        let r = self.post_chat(body).await?;
         let v: serde_json::Value = r
             .json()
             .await
-            .map_err(|e| InferenceError::Generation(format!("bad sidecar JSON: {e}")))?;
+            .map_err(|e| InferenceError::Sidecar(SidecarFailure::Server(format!("unreadable response: {e}"))))?;
         let text = v
             .pointer("/choices/0/message/content")
             .and_then(|c| c.as_str())
@@ -1168,9 +1574,8 @@ impl SidecarClient {
         max_tokens: u32,
         cfg: &InferenceConfig,
         options: &RequestOptions,
-        mut handlers: StreamHandlers,
+        handlers: StreamHandlers,
     ) -> Result<StreamOutcome, InferenceError> {
-        use futures::StreamExt;
         let request_started = std::time::Instant::now();
         let mut body = sampling_body(turns, max_tokens, cfg, true);
         body["stream_options"] = serde_json::json!({"include_usage": true});
@@ -1179,9 +1584,38 @@ impl SidecarClient {
         // cache hits and the tokens decoded so far.
         body["timings_per_token"] = serde_json::json!(true);
         apply_options(&mut body, options);
+        let result = self.stream_body(&body, cfg, handlers, request_started).await;
+        match &result {
+            Ok(outcome) => {
+                observe_prompt_size(&body, outcome.metrics.prompt_tokens);
+                let kind = if outcome.cancelled {
+                    "cancelled"
+                } else if outcome.early_stopped {
+                    "early_stopped"
+                } else {
+                    "completed"
+                };
+                self.record_request(
+                    &body,
+                    Ok((&outcome.text, outcome.finish_reason.as_deref(), kind, &outcome.metrics)),
+                );
+            }
+            Err(error) => self.record_request(&body, Err(error)),
+        }
+        result
+    }
+
+    async fn stream_body(
+        &self,
+        body: &serde_json::Value,
+        cfg: &InferenceConfig,
+        mut handlers: StreamHandlers,
+        request_started: std::time::Instant,
+    ) -> Result<StreamOutcome, InferenceError> {
+        use futures::StreamExt;
         (handlers.on_phase)("processing");
         let mut phase = "processing";
-        let r = self.post_chat(&body).await?;
+        let r = self.post_chat(body).await?;
         let mut outcome = StreamOutcome {
             metrics: Metrics {
                 kv_cache_limit: cfg.n_ctx,
@@ -1192,14 +1626,16 @@ impl SidecarClient {
         let mut frames = SseFrames::new();
         let mut clock = VisibleOutputClock::default();
         let mut usage_seen = false;
+        // A stream the server finished ends with a finish_reason and [DONE];
+        // one that just stops (a crashed or restarted server) is truncated.
+        let mut done_seen = false;
         let mut byte_stream = r.bytes_stream();
         'read: while let Some(chunk) = byte_stream.next().await {
             if (handlers.is_cancelled)() {
                 outcome.cancelled = true;
                 break;
             }
-            let bytes = chunk
-                .map_err(|e| InferenceError::Generation(format!("stream read failed: {e}")))?;
+            let bytes = chunk.map_err(|e| InferenceError::Sidecar(transport_failure(&e)))?;
             // Decode only complete SSE frames, preserving UTF-8 characters
             // when the transport splits a code point between network chunks.
             frames.push(&bytes);
@@ -1207,12 +1643,21 @@ impl SidecarClient {
                 let frame = String::from_utf8_lossy(&frame_bytes);
                 for line in frame.lines() {
                     let line = line.strip_prefix("data:").map(str::trim).unwrap_or("");
-                    if line.is_empty() || line == "[DONE]" {
+                    if line == "[DONE]" {
+                        done_seen = true;
+                        continue;
+                    }
+                    if line.is_empty() {
                         continue;
                     }
                     let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
                         continue;
                     };
+                    // An error raised after streaming began arrives as its own
+                    // frame; skipping it made a failed reply look finished.
+                    if let Some(error) = v.get("error").filter(|error| error.is_object()) {
+                        return Err(InferenceError::Sidecar(classify_error_object(error, 500)));
+                    }
                     let now = request_started.elapsed().as_millis() as u64;
                     let choice = &v["choices"][0];
                     if let Some(reasoning) = choice
@@ -1277,6 +1722,9 @@ impl SidecarClient {
         // Dropping the response stream closes the connection: llama-server
         // aborts the slot instead of finishing tokens nobody will read.
         drop(byte_stream);
+        if !outcome.cancelled && !outcome.early_stopped && !done_seen && outcome.finish_reason.is_none() {
+            return Err(InferenceError::Sidecar(SidecarFailure::Truncated));
+        }
         let mut timing = clock.finish(request_started.elapsed().as_millis() as u64);
         if let Some(engine) = &outcome.metrics.engine {
             timing.add_engine(engine);
@@ -1435,6 +1883,172 @@ pub struct InferenceStatus {
 }
 
 #[cfg(test)]
+mod replay_fixture_tests {
+    use super::*;
+
+    fn failure_class(failure: &SidecarFailure) -> &'static str {
+        match failure {
+            SidecarFailure::ContextExceeded { .. } => "context_exceeded",
+            SidecarFailure::Unavailable(_) => "unavailable",
+            SidecarFailure::Timeout => "timeout",
+            SidecarFailure::Truncated => "truncated",
+            SidecarFailure::BadRequest(_) => "bad_request",
+            SidecarFailure::Server(_) => "server",
+        }
+    }
+
+    /// Serve `body` in `chunk`-byte pieces with the given status.
+    async fn serve(body: Vec<u8>, status: u16, content_type: String, chunk: usize) -> (String, tokio::task::JoinHandle<()>) {
+        use futures::StreamExt;
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || {
+                let body = body.clone();
+                let content_type = content_type.clone();
+                async move {
+                    let pieces: Vec<Vec<u8>> = body.chunks(chunk.max(1)).map(|piece| piece.to_vec()).collect();
+                    let stream = futures::stream::iter(pieces).map(Ok::<_, std::convert::Infallible>);
+                    axum::http::Response::builder()
+                        .status(status)
+                        .header("content-type", content_type)
+                        .body(axum::body::Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://127.0.0.1:{port}"), server)
+    }
+
+    #[tokio::test]
+    async fn every_recorded_stream_replays_to_its_expected_outcome() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/streams");
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .expect("fixture folder")
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| entry.file_name().to_str().and_then(|name| name.strip_suffix(".sse")).map(str::to_string))
+            .collect();
+        names.sort();
+        assert!(names.len() >= 9, "fixtures missing: {names:?}");
+        for name in &names {
+            let body = std::fs::read(dir.join(format!("{name}.sse"))).unwrap();
+            let expect: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(dir.join(format!("{name}.expect.json"))).unwrap()).unwrap();
+            let status = expect["status"].as_u64().unwrap_or(200) as u16;
+            let content_type = expect["content_type"].as_str().unwrap_or("text/event-stream").to_string();
+            for chunk in [1usize, 7, body.len()] {
+                let (url, server) = serve(body.clone(), status, content_type.clone(), chunk).await;
+                // No /tokenize here: token counts fall back to the engine's.
+                let result = SidecarClient::new(url)
+                    .unwrap()
+                    .stream(
+                        &[ChatTurn::text("user", "fixture")],
+                        256,
+                        &InferenceConfig::default(),
+                        &RequestOptions::default(),
+                        StreamHandlers::default(),
+                    )
+                    .await;
+                server.abort();
+                let context = format!("{name} in {chunk}-byte chunks");
+                match (expect.get("error").and_then(|e| e.as_str()), result) {
+                    (Some(class), Err(error)) => {
+                        let failure = error.sidecar().unwrap_or_else(|| panic!("{context}: untyped error {error}"));
+                        assert_eq!(failure_class(failure), class, "{context}");
+                        if let SidecarFailure::ContextExceeded { prompt_tokens, context: window } = failure {
+                            assert_eq!(u64::from(*prompt_tokens), expect["prompt_tokens"].as_u64().unwrap(), "{context}");
+                            assert_eq!(u64::from(*window), expect["context"].as_u64().unwrap(), "{context}");
+                        }
+                    }
+                    (Some(class), Ok(outcome)) => panic!("{context}: expected {class}, got text {:?}", outcome.text),
+                    (None, Err(error)) => panic!("{context}: unexpected error {error}"),
+                    (None, Ok(outcome)) => {
+                        assert_eq!(outcome.text, expect["text"].as_str().unwrap(), "{context}");
+                        assert_eq!(outcome.finish_reason.as_deref(), expect["finish_reason"].as_str(), "{context}");
+                        assert_eq!(outcome.reasoning_present, expect["reasoning_present"].as_bool().unwrap(), "{context}");
+                        assert_eq!(u64::from(outcome.metrics.prompt_tokens), expect["prompt_tokens"].as_u64().unwrap(), "{context}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod failure_class_tests {
+    use super::*;
+
+    #[test]
+    fn a_recorded_body_keeps_the_text_and_drops_image_data() {
+        let body = serde_json::json!({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is this"},
+            {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{}", "A".repeat(5000))}}
+        ]}]});
+        let kept = without_image_data(&body);
+        assert_eq!(kept["messages"][0]["content"][0]["text"], "what is this");
+        let url = kept["messages"][0]["content"][1]["image_url"]["url"].as_str().unwrap();
+        assert!(url.starts_with("[image data omitted"), "{url}");
+    }
+
+    #[test]
+    fn a_context_overflow_is_read_from_the_servers_error_object() {
+        let body = r#"{"error":{"code":400,"message":"request (9000 tokens) exceeds the available context size (8192 tokens), try increasing it","type":"exceed_context_size_error","n_prompt_tokens":9000,"n_ctx":8192}}"#;
+        assert_eq!(
+            classify_failure(400, body),
+            SidecarFailure::ContextExceeded { prompt_tokens: 9000, context: 8192 }
+        );
+        let without_counts = r#"{"error":{"code":400,"message":"too long","type":"exceed_context_size_error"}}"#;
+        assert!(matches!(classify_failure(400, without_counts), SidecarFailure::ContextExceeded { prompt_tokens: 0, context: 0 }));
+    }
+
+    #[test]
+    fn unavailable_and_server_errors_are_told_apart_from_bad_requests() {
+        let loading = r#"{"error":{"code":503,"message":"Loading model","type":"unavailable_error"}}"#;
+        assert!(matches!(classify_failure(503, loading), SidecarFailure::Unavailable(_)));
+        assert!(classify_failure(503, loading).is_transient());
+        assert!(matches!(classify_failure(503, "not json"), SidecarFailure::Unavailable(_)));
+        let invalid = r#"{"error":{"code":400,"message":"bad field","type":"invalid_request_error"}}"#;
+        assert!(matches!(classify_failure(400, invalid), SidecarFailure::BadRequest(_)));
+        assert!(!classify_failure(400, invalid).is_transient());
+        let crashed = r#"{"error":{"code":500,"message":"boom","type":"server_error"}}"#;
+        assert!(matches!(classify_failure(500, crashed), SidecarFailure::Server(_)));
+        assert!(!SidecarFailure::ContextExceeded { prompt_tokens: 1, context: 1 }.is_transient());
+    }
+
+    #[test]
+    fn failures_read_as_plain_sentences() {
+        let error = InferenceError::Sidecar(SidecarFailure::ContextExceeded { prompt_tokens: 9000, context: 8192 });
+        assert_eq!(error.to_string(), "The request (9000 tokens) does not fit the model's 8192-token context");
+        assert_eq!(InferenceError::Sidecar(SidecarFailure::Truncated).to_string(), "The model server stopped the reply before finishing it");
+    }
+}
+
+#[cfg(test)]
+mod load_failure_tests {
+    use super::explain_load_failure;
+
+    #[test]
+    fn loader_messages_become_causes() {
+        // Verbatim from llama.cpp b10809 loading registry files.
+        let packed = "E llama_model_load: error loading model: done_getting_tensors: wrong number of tensors; expected 2012, got 601";
+        assert!(explain_load_failure(packed).unwrap().contains("vision or audio tower"));
+        let missing = "E llama_model_load: error loading model: error loading model hyperparameters: key not found in model: gemma3.attention.layer_norm_rms_epsilon";
+        assert!(explain_load_failure(missing).unwrap().contains("missing metadata"));
+        let shape = "check_tensor_dims: tensor 'token_embd.weight' has wrong shape; expected   2560, 262145, got   2560, 262144";
+        assert!(explain_load_failure(shape).unwrap().contains("shape"));
+        assert!(explain_load_failure("CUDA error: out of memory").is_none());
+        let log = "0.00.266 I srv    load_model: loading model 'm.gguf'\n0.00.684 E llama_model_load: error loading model: done_getting_tensors: wrong number of tensors\n0.01.039 E srv  llama_server: exiting due to model loading error";
+        assert_eq!(super::last_runtime_error(log).as_deref(), Some("srv  llama_server: exiting due to model loading error"));
+        assert_eq!(super::last_runtime_error("0.1 I all fine"), None);
+        let message = format!("The model file is packaged wrongly.{}{log}", super::RUNTIME_DIAGNOSTIC_MARKER);
+        assert_eq!(super::without_runtime_diagnostic(&message), "The model file is packaged wrongly.");
+        assert_eq!(super::without_runtime_diagnostic("no log"), "no log");
+    }
+}
+
+#[cfg(test)]
 mod template_shape_tests {
     use super::{template_safe_turns, ChatTurn};
     use crate::inference::ChatTemplateShape;
@@ -1514,7 +2128,7 @@ mod tests {
     #[test]
     fn args_contain_model_ctx_threads_gpu_layers() {
         let cfg = InferenceConfig {
-            model_path: PathBuf::from("models/qwen/model.gguf"),
+            model_path: PathBuf::from("models/example/model.gguf"),
             n_ctx: 32768,
             n_batch: 512,
             n_threads: 16,
@@ -1523,7 +2137,7 @@ mod tests {
         };
         let a = server_args(&cfg, 3888);
         let has = |k: &str, v: &str| a.windows(2).any(|w| w[0] == k && w[1] == v);
-        assert!(has("-m", "models/qwen/model.gguf"));
+        assert!(has("-m", "models/example/model.gguf"));
         assert!(has("--ctx-size", "32768"));
         assert!(has("--threads", "16"));
         assert!(has("--n-gpu-layers", "45"));
@@ -1649,6 +2263,115 @@ mod tests {
     }
 
     #[test]
+    fn the_structured_envelope_fixes_each_tools_name_and_required_arguments() {
+        let schema = SidecarClient::structured_action_schema();
+        let alternatives = schema["schema"]["anyOf"].as_array().unwrap();
+        assert_eq!(alternatives.len(), crate::tools::registry().len() + 1, "one per tool plus the final answer");
+        assert_eq!(alternatives[0]["properties"]["kind"]["const"], "final");
+        let write = alternatives.iter().find(|alternative| alternative["properties"]["name"]["const"] == "write_file").unwrap();
+        assert_eq!(write["properties"]["args"]["required"], serde_json::json!(["path", "content"]));
+        assert_eq!(write["properties"]["answer"]["const"], "");
+        assert!(alternatives.iter().all(|alternative| alternative["properties"]["name"]["const"].is_string()));
+        // Generation follows the serialized property order: the tool is chosen before its arguments.
+        for alternative in alternatives {
+            let order: Vec<&str> = alternative["properties"].as_object().unwrap().keys().map(String::as_str).collect();
+            assert_eq!(order, ["kind", "name", "args", "answer"]);
+        }
+        let text = schema.to_string();
+        assert!(text.find("\"kind\"").unwrap() < text.find("\"answer\"").unwrap());
+    }
+
+    #[test]
+    fn a_file_without_a_template_is_launched_with_its_built_in_format() {
+        let gemma = server_args(&InferenceConfig { builtin_chat_format: Some("gemma".into()), ..InferenceConfig::default() }, 3888);
+        assert!(gemma.contains(&"--no-jinja".to_string()));
+        assert!(gemma.windows(2).any(|pair| pair[0] == "--chat-template" && pair[1] == "gemma"));
+        let chatml = server_args(&InferenceConfig { builtin_chat_format: Some("chatml".into()), ..InferenceConfig::default() }, 3888);
+        assert!(!chatml.contains(&"--no-jinja".to_string()), "ChatML is the runtime's own fallback");
+        let own = server_args(&InferenceConfig::default(), 3888);
+        assert!(!own.contains(&"--chat-template".to_string()) && !own.contains(&"--no-jinja".to_string()));
+    }
+
+    #[test]
+    fn built_in_chat_formats_are_read_from_the_runtime_help() {
+        // The pinned runtime's layout: the list wraps over indented lines and
+        // ends at the option's environment variable.
+        let help = "--chat-template JINJA_TEMPLATE          set custom jinja chat template\n\
+                                        list of built-in templates:\n\
+                                        bailing, chatml,\n\
+                                        command-r, gemma, gpt-oss, hunyuan-dense, hunyuan-moe, llama4,\n\
+                                        seed_oss, zephyr\n\
+                                        (env: LLAMA_ARG_CHAT_TEMPLATE)\n\
+--chat-template-file JINJA_TEMPLATE_FILE\n";
+        let listed = listed_builtin_chat_templates(help);
+        assert_eq!(listed.first().map(String::as_str), Some("bailing"));
+        assert_eq!(listed.last().map(String::as_str), Some("zephyr"));
+        for architecture in ["gemma3", "qwen3", "llama4", "command-r", "gpt-oss", "hunyuan-moe", "hunyuan-dense", "seed_oss"] {
+            let format = crate::models::builtin_chat_format(architecture).unwrap();
+            assert!(listed.iter().any(|name| name == format), "{architecture} -> {format}");
+        }
+        assert!(listed_builtin_chat_templates("no list here").is_empty());
+    }
+
+    #[test]
+    fn a_draft_head_is_passed_with_its_draft_length() {
+        let head = server_args(
+            &InferenceConfig {
+                speculative: crate::inference::DRAFT_HEAD_SPECULATIVE.into(),
+                spec_draft_n_max: Some(3),
+                ..InferenceConfig::default()
+            },
+            3888,
+        );
+        assert!(head.windows(2).any(|pair| pair[0] == "--spec-type" && pair[1] == "draft-mtp,ngram-simple"));
+        assert!(head.windows(2).any(|pair| pair[0] == "--spec-draft-n-max" && pair[1] == "3"));
+        let off = server_args(&InferenceConfig { speculative: "none".into(), spec_draft_n_max: Some(3), ..InferenceConfig::default() }, 3888);
+        assert!(!off.contains(&"--spec-draft-n-max".to_string()), "no drafting, no draft length");
+        let ngram = server_args(&InferenceConfig::default(), 3888);
+        assert!(!ngram.contains(&"--spec-draft-n-max".to_string()));
+        assert!(!ngram.contains(&"--spec-ngram-simple-size-m".to_string()), "the runtime's default length unless chosen");
+        let split = server_args(&InferenceConfig { spec_ngram_length: Some(24), ..InferenceConfig::default() }, 3888);
+        assert!(split.windows(2).any(|pair| pair[0] == "--spec-ngram-simple-size-m" && pair[1] == "24"));
+        assert!(split.windows(2).any(|pair| pair[0] == "--spec-ngram-simple-size-n" && pair[1] == "12"));
+        let off = server_args(&InferenceConfig { speculative: "none".into(), spec_ngram_length: Some(24), ..InferenceConfig::default() }, 3888);
+        assert!(!off.contains(&"--spec-ngram-simple-size-m".to_string()), "no drafting, no length");
+    }
+
+    #[test]
+    fn args_carry_the_micro_batch_and_keep_the_batch_at_least_as_large() {
+        let args_for = |n_batch: u32, micro_batch: Option<u32>| {
+            server_args(&InferenceConfig { n_batch, micro_batch, ..InferenceConfig::default() }, 3888)
+        };
+        let value = |args: &[String], key: &str| args.windows(2).find(|pair| pair[0] == key).map(|pair| pair[1].clone());
+
+        let automatic = args_for(0, Some(1024));
+        assert_eq!(value(&automatic[..], "--ubatch-size").as_deref(), Some("1024"));
+        assert_eq!(value(&automatic[..], "--batch-size"), None, "the runtime's default logical batch (2,048) already holds it");
+
+        let above_default = args_for(0, Some(4096));
+        assert_eq!(value(&above_default[..], "--batch-size").as_deref(), Some("4096"), "llama.cpp would cap the micro-batch at 2,048");
+        assert_eq!(value(&above_default[..], "--ubatch-size").as_deref(), Some("4096"));
+
+        let small_batch = args_for(512, Some(1024));
+        assert_eq!(value(&small_batch[..], "--batch-size").as_deref(), Some("1024"), "raised to the micro-batch");
+        let large_batch = args_for(4096, Some(1024));
+        assert_eq!(value(&large_batch[..], "--batch-size").as_deref(), Some("4096"), "a larger batch is kept");
+
+        let unset = args_for(512, None);
+        assert_eq!(value(&unset[..], "--batch-size").as_deref(), Some("512"));
+        assert!(!unset.contains(&"--ubatch-size".to_string()), "no choice leaves llama-server's micro-batch");
+    }
+
+    #[test]
+    fn args_load_without_mmap_only_when_chosen() {
+        let mapped = server_args(&InferenceConfig::default(), 3888);
+        assert!(!mapped.contains(&"--load-mode".to_string()));
+        let pinned = server_args(&InferenceConfig { load_without_mmap: true, ..InferenceConfig::default() }, 3888);
+        assert!(pinned.windows(2).any(|pair| pair[0] == "--load-mode" && pair[1] == "none"));
+        assert!(!pinned.contains(&"--no-mmap".to_string()), "deprecated in the pinned runtime");
+    }
+
+    #[test]
     fn sse_frame_splitter_handles_lf_crlf_and_partial_frames() {
         let mut frames = SseFrames::new();
         frames.push(b"data: a\n\ndata: b\r\n\r\ndata: ");
@@ -1737,6 +2460,19 @@ mod tests {
     }
 
     #[test]
+    fn the_runtime_is_found_at_the_installation_root_wherever_the_models_are() {
+        std::env::remove_var("COMPANION_LLAMA_SERVER_BIN");
+        let root = std::env::temp_dir().join(format!("companion-root-{}", uuid::Uuid::new_v4()));
+        let bin = runtime_dir(&root);
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = if cfg!(windows) { "llama-server.exe" } else { "llama-server" };
+        std::fs::write(bin.join(exe), b"").unwrap();
+        let found = SidecarBinary::detect(&bin).unwrap();
+        assert_eq!(found.0, bin.join(exe));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn missing_binary_error_is_actionable() {
         std::env::remove_var("COMPANION_LLAMA_SERVER_BIN");
         // Point PATH at an empty temp dir so detection deterministically fails.
@@ -1744,7 +2480,7 @@ mod tests {
         std::fs::create_dir_all(&empty).unwrap();
         let old_path = std::env::var_os("PATH");
         std::env::set_var("PATH", &empty);
-        let err = SidecarBinary::detect(Path::new("/nonexistent-models")).unwrap_err();
+        let err = SidecarBinary::detect(&runtime_dir(Path::new("/nonexistent-install"))).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("llama-server"), "{msg}");
         assert!(msg.contains("COMPANION_LLAMA_SERVER_BIN"), "{msg}");
@@ -1802,7 +2538,8 @@ mod tests {
             .chat("hi", 10, &InferenceConfig::default())
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("400"), "{err}");
+        // A plain-text 400 is a rejected request, typed, with the server's words.
+        assert!(matches!(err.sidecar(), Some(SidecarFailure::BadRequest(detail)) if detail == "context overflow"), "{err}");
     }
 
     #[tokio::test]
@@ -2039,16 +2776,8 @@ mod tests {
         );
         assert_eq!(
             requests[0]["response_format"],
-            serde_json::json!({
-                "type":"json_object", "schema": {
-                    "type":"object", "properties": {
-                        "kind":{"type":"string","enum":["tool","final"]},
-                        "name":{"type":"string"},
-                        "args":{"type":"object","additionalProperties":true},
-                        "answer":{"type":"string"}
-                    }, "required":["kind","name","args","answer"], "additionalProperties":false
-                }
-            })
+            SidecarClient::structured_action_schema(),
+            "the per-tool envelope"
         );
         for request in &requests[1..] {
             assert!(

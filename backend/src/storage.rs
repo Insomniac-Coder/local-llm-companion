@@ -309,7 +309,26 @@ impl Storage {
               CREATE INDEX IF NOT EXISTS message_activities_by_message ON message_activities(message_id);
               CREATE TABLE IF NOT EXISTS session_task_context(
                   conversation_id TEXT PRIMARY KEY, workspace TEXT NOT NULL,
-                  task TEXT NOT NULL, run_id TEXT NOT NULL, status TEXT NOT NULL);",
+                  task TEXT NOT NULL, run_id TEXT NOT NULL, status TEXT NOT NULL);
+              CREATE TABLE IF NOT EXISTS runtime_calibrations(
+                  id TEXT PRIMARY KEY, model_id TEXT NOT NULL, model_key TEXT NOT NULL,
+                  created_at TEXT NOT NULL, calibration_json TEXT NOT NULL);
+              CREATE INDEX IF NOT EXISTS runtime_calibrations_by_model
+                  ON runtime_calibrations(model_id, model_key, created_at);
+              CREATE TABLE IF NOT EXISTS model_requests(
+                  id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL DEFAULT '',
+                  owner_id TEXT NOT NULL DEFAULT '', seq INTEGER NOT NULL DEFAULT 0,
+                  kind TEXT NOT NULL, request_json TEXT NOT NULL, raw_output TEXT NOT NULL DEFAULT '',
+                  finish_reason TEXT, outcome TEXT NOT NULL, failure TEXT,
+                  prompt_tokens INTEGER NOT NULL DEFAULT 0, cached_tokens INTEGER NOT NULL DEFAULT 0,
+                  generated_tokens INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
+              CREATE INDEX IF NOT EXISTS model_requests_by_conversation
+                  ON model_requests(conversation_id, owner_id, seq);
+              CREATE INDEX IF NOT EXISTS model_requests_by_time ON model_requests(created_at);
+              CREATE TABLE IF NOT EXISTS model_template_caps(
+                  model_key TEXT PRIMARY KEY, caps_json TEXT NOT NULL, updated_at TEXT NOT NULL);
+              CREATE TABLE IF NOT EXISTS runtime_fit_decisions(
+                  fit_key TEXT PRIMARY KEY, decision_json TEXT NOT NULL, updated_at TEXT NOT NULL);",
         )?;
         // Lightweight forward migration for DBs created before a column existed.
         for (table, column, ddl) in [
@@ -1112,6 +1131,143 @@ impl Storage {
 
     // ---- Stage 33 generation metrics ----
 
+    /// Keep a calibration. Older ones stay: they are what a later run is
+    /// compared against to detect a regression.
+    pub fn save_calibration(&self, calibration: &crate::calibration::Calibration) -> rusqlite::Result<()> {
+        let json = serde_json::to_string(calibration)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO runtime_calibrations(id,model_id,model_key,created_at,calibration_json) VALUES(?,?,?,?,?)",
+            params![calibration.id, calibration.model_id, calibration.model_key, calibration.created_at, json],
+        )?;
+        Ok(())
+    }
+
+    /// Calibrations of one model file, newest first.
+    pub fn calibrations_for(
+        &self,
+        model_id: &str,
+        model_key: &str,
+    ) -> rusqlite::Result<Vec<crate::calibration::Calibration>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT calibration_json FROM runtime_calibrations WHERE model_id=? AND model_key=? ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map(params![model_id, model_key], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            if let Ok(calibration) = serde_json::from_str(&row?) {
+                out.push(calibration);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Keep what one model request carried and returned, then trim the table
+    /// to the newest `MODEL_REQUEST_ROWS` rows and about `MODEL_REQUEST_BYTES`
+    /// of text, oldest first.
+    pub fn record_model_request(&self, r: &ModelRequestRecord) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO model_requests(id,conversation_id,owner_id,seq,kind,request_json,raw_output,finish_reason,outcome,failure,prompt_tokens,cached_tokens,generated_tokens,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            params![
+                r.id, r.conversation_id, r.owner_id, r.seq as i64, r.kind, r.request_json, r.raw_output,
+                r.finish_reason, r.outcome, r.failure, r.prompt_tokens as i64, r.cached_tokens as i64,
+                r.generated_tokens as i64, r.created_at
+            ],
+        )?;
+        self.conn.execute(
+            "DELETE FROM model_requests WHERE id IN (SELECT id FROM model_requests ORDER BY created_at DESC, seq DESC LIMIT -1 OFFSET ?)",
+            params![MODEL_REQUEST_ROWS as i64],
+        )?;
+        loop {
+            let bytes: i64 = self.conn.query_row(
+                "SELECT COALESCE(SUM(LENGTH(request_json) + LENGTH(raw_output)), 0) FROM model_requests",
+                [],
+                |row| row.get(0),
+            )?;
+            if bytes <= MODEL_REQUEST_BYTES as i64 {
+                break;
+            }
+            let removed = self.conn.execute(
+                "DELETE FROM model_requests WHERE id = (SELECT id FROM model_requests ORDER BY created_at ASC, seq ASC LIMIT 1)",
+                [],
+            )?;
+            if removed == 0 {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Remember what the runtime reported for a model file (`model_key`: file
+    /// name and size), so the model list can show it before the next load.
+    pub fn save_template_caps(&self, model_key: &str, caps: &crate::inference::TemplateCaps) -> rusqlite::Result<()> {
+        let json = serde_json::to_string(caps)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO model_template_caps(model_key,caps_json,updated_at) VALUES(?,?,?)",
+            params![model_key, json, chrono::Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn template_caps_for(&self, model_key: &str) -> rusqlite::Result<Option<crate::inference::TemplateCaps>> {
+        let mut stmt = self.conn.prepare("SELECT caps_json FROM model_template_caps WHERE model_key=?")?;
+        let mut rows = stmt.query(params![model_key])?;
+        Ok(match rows.next()? {
+            Some(row) => serde_json::from_str(&row.get::<_, String>(0)?).ok(),
+            None => None,
+        })
+    }
+
+    /// Remember a fit decision under its key (`runtime_fit::fit_memory_key`).
+    pub fn save_fit_decision(&self, fit_key: &str, decision: &crate::runtime_fit::FitDecision) -> rusqlite::Result<()> {
+        let json = serde_json::to_string(decision)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO runtime_fit_decisions(fit_key,decision_json,updated_at) VALUES(?,?,?)",
+            params![fit_key, json, chrono::Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// The remembered fit decision for a key; None when there is none or it no
+    /// longer reads as a decision (a format from an older version).
+    pub fn fit_decision_for(&self, fit_key: &str) -> rusqlite::Result<Option<crate::runtime_fit::FitDecision>> {
+        let mut stmt = self.conn.prepare("SELECT decision_json FROM runtime_fit_decisions WHERE fit_key=?")?;
+        let mut rows = stmt.query(params![fit_key])?;
+        Ok(match rows.next()? {
+            Some(row) => serde_json::from_str(&row.get::<_, String>(0)?).ok(),
+            None => None,
+        })
+    }
+
+    /// The recorded model requests of one conversation, oldest first.
+    pub fn model_requests_for(&self, conversation_id: &str, limit: usize) -> rusqlite::Result<Vec<ModelRequestRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id,conversation_id,owner_id,seq,kind,request_json,raw_output,finish_reason,outcome,failure,prompt_tokens,cached_tokens,generated_tokens,created_at
+             FROM model_requests WHERE conversation_id=? ORDER BY created_at ASC, seq ASC LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![conversation_id, limit as i64], |row| {
+            Ok(ModelRequestRecord {
+                id: row.get(0)?,
+                conversation_id: row.get(1)?,
+                owner_id: row.get(2)?,
+                seq: row.get::<_, i64>(3)? as u32,
+                kind: row.get(4)?,
+                request_json: row.get(5)?,
+                raw_output: row.get(6)?,
+                finish_reason: row.get(7)?,
+                outcome: row.get(8)?,
+                failure: row.get(9)?,
+                prompt_tokens: row.get::<_, i64>(10)? as u32,
+                cached_tokens: row.get::<_, i64>(11)? as u32,
+                generated_tokens: row.get::<_, i64>(12)? as u32,
+                created_at: row.get(13)?,
+            })
+        })?;
+        rows.collect()
+    }
+
     pub fn record_metric(&self, m: &GenerationMetric) -> rusqlite::Result<()> {
         let timing_json = m
             .timing
@@ -1191,9 +1347,118 @@ impl Storage {
     }
 }
 
+/// Rows kept in `model_requests`, newest first.
+pub const MODEL_REQUEST_ROWS: usize = 300;
+/// Text kept in `model_requests` (request plus output), about 50 MB.
+pub const MODEL_REQUEST_BYTES: usize = 50_000_000;
+
+/// What one model request carried and returned: enough to rebuild the exact
+/// request that produced an output, and to replay it as a test fixture.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ModelRequestRecord {
+    pub id: String,
+    pub conversation_id: String,
+    /// The reply message or agent run the request belonged to.
+    pub owner_id: String,
+    /// Order within the owner.
+    pub seq: u32,
+    /// chat | agent | classify | compaction
+    pub kind: String,
+    /// The request body as sent, with image data replaced by a placeholder.
+    pub request_json: String,
+    /// The visible text returned (native reasoning text is not kept).
+    pub raw_output: String,
+    pub finish_reason: Option<String>,
+    /// completed | early_stopped | cancelled | failed
+    pub outcome: String,
+    pub failure: Option<String>,
+    pub prompt_tokens: u32,
+    pub cached_tokens: u32,
+    pub generated_tokens: u32,
+    pub created_at: String,
+}
+
+#[cfg(test)]
+mod model_request_tests {
+    use super::*;
+
+    fn record(id: &str, at: &str, text_len: usize) -> ModelRequestRecord {
+        ModelRequestRecord {
+            id: id.into(),
+            conversation_id: "c".into(),
+            owner_id: "m".into(),
+            seq: 0,
+            kind: "chat".into(),
+            request_json: "{}".into(),
+            raw_output: "x".repeat(text_len),
+            finish_reason: Some("stop".into()),
+            outcome: "completed".into(),
+            failure: None,
+            prompt_tokens: 10,
+            cached_tokens: 4,
+            generated_tokens: 2,
+            created_at: at.into(),
+        }
+    }
+
+    fn at(i: usize) -> String {
+        format!("2026-09-16T{:02}:{:02}:{:02}Z", i / 3600, (i / 60) % 60, i % 60)
+    }
+
+    #[test]
+    fn requests_round_trip_and_the_oldest_go_first_when_the_table_is_full() {
+        let storage = Storage::open_in_memory().unwrap();
+        for i in 0..(MODEL_REQUEST_ROWS + 5) {
+            storage.record_model_request(&record(&format!("r{i:04}"), &at(i), 10)).unwrap();
+        }
+        let kept = storage.model_requests_for("c", 1_000).unwrap();
+        assert_eq!(kept.len(), MODEL_REQUEST_ROWS);
+        assert_eq!(kept[0].id, "r0005", "the five oldest were removed");
+        let newest = MODEL_REQUEST_ROWS + 4;
+        assert_eq!(kept.last().unwrap(), &record(&format!("r{newest:04}"), &at(newest), 10));
+    }
+
+    #[test]
+    fn the_text_cap_removes_the_oldest_large_records() {
+        let storage = Storage::open_in_memory().unwrap();
+        let big = MODEL_REQUEST_BYTES / 3 + 1;
+        for i in 0..3 {
+            storage.record_model_request(&record(&format!("big{i}"), &at(i), big)).unwrap();
+        }
+        let kept: Vec<String> = storage.model_requests_for("c", 10).unwrap().into_iter().map(|r| r.id).collect();
+        assert_eq!(kept, vec!["big1", "big2"]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fit_decision_is_remembered_by_key() {
+        let storage = Storage::open_in_memory().unwrap();
+        let decision = crate::runtime_fit::FitDecision {
+            requested: 32_768,
+            context: 22_528,
+            cache: "q8_0".into(),
+            margin: 256,
+            micro_batch: Some(512),
+            fit: crate::runtime_fit::Fit::AllLayers,
+            placement: "gpu".into(),
+            placement_at_default: "gpu".into(),
+            draft_head_dropped: false,
+            notes: vec!["searched".into()],
+            micro_batch_note: None,
+            free_vram_mib: Some(10_900),
+        };
+        assert_eq!(storage.fit_decision_for("key").unwrap(), None);
+        storage.save_fit_decision("key", &decision).unwrap();
+        assert_eq!(storage.fit_decision_for("key").unwrap(), Some(decision.clone()));
+        let wider = crate::runtime_fit::FitDecision { context: 32_768, ..decision };
+        storage.save_fit_decision("key", &wider).unwrap();
+        assert_eq!(storage.fit_decision_for("key").unwrap(), Some(wider));
+        assert_eq!(storage.fit_decision_for("other").unwrap(), None);
+    }
 
     #[test]
     fn task_continuation_is_durable_and_old_runs_cannot_overwrite_newer_goals() {
@@ -1373,6 +1638,30 @@ mod tests {
         .unwrap();
         assert_eq!(s.list_conversations().unwrap().len(), 1);
         assert_eq!(s.messages_for("c1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn calibrations_are_kept_newest_first_per_model_file() {
+        use crate::calibration::*;
+        let storage = Storage::open_in_memory().unwrap();
+        let make = |id: &str, at: &str, key: &str| Calibration {
+            id: id.into(),
+            model_id: "m".into(),
+            model_key: key.into(),
+            created_at: at.into(),
+            environment: Environment::default(),
+            plan: plan(8, 8, Placement::Cpu, 0),
+            measurements: vec![],
+            profiles: vec![],
+            regression: None,
+            micro_batches: vec![],
+            micro_batch: None,
+        };
+        storage.save_calibration(&make("old", "2026-09-01T00:00:00Z", "m.gguf:1")).unwrap();
+        storage.save_calibration(&make("new", "2026-09-02T00:00:00Z", "m.gguf:1")).unwrap();
+        storage.save_calibration(&make("other-file", "2026-09-03T00:00:00Z", "m.gguf:2")).unwrap();
+        let found = storage.calibrations_for("m", "m.gguf:1").unwrap();
+        assert_eq!(found.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), vec!["new", "old"]);
     }
 
     #[test]

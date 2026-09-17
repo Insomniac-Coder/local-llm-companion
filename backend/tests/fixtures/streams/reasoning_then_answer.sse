@@ -1,0 +1,12 @@
+data: {"id": "chatcmpl-fixture", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": "Thinking about the question. "}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-fixture", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": "Done thinking."}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-fixture", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": "The answer is 42."}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-fixture", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": "stop"}]}
+
+data: {"id": "chatcmpl-fixture", "object": "chat.completion.chunk", "choices": [], "usage": {"prompt_tokens": 18, "completion_tokens": 20, "total_tokens": 38}, "timings": {"cache_n": 0, "prompt_n": 18, "prompt_ms": 120.0, "prompt_per_second": 1000.0, "predicted_n": 20, "predicted_ms": 400.0, "predicted_per_second": 50.0}}
+
+data: [DONE]
+

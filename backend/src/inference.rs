@@ -17,6 +17,67 @@ pub mod thiserror_stub {
         InsufficientMemory { required_gb: f64, available_gb: f64 },
         ContextOverflow { used: u32, limit: u32 },
         Generation(String),
+        /// The model server received the request and refused it or could not
+        /// finish it, classified so callers recover by kind instead of by
+        /// reading message text.
+        Sidecar(SidecarFailure),
+    }
+
+    impl InferenceError {
+        pub fn sidecar(&self) -> Option<&SidecarFailure> {
+            match self {
+                Self::Sidecar(failure) => Some(failure),
+                _ => None,
+            }
+        }
+    }
+
+    /// Why a model-server request failed. Classified from the HTTP status and
+    /// llama-server's own error object (`{"error": {"code", "message", "type",
+    /// ...}}`, e.g. `exceed_context_size_error` with `n_prompt_tokens` and
+    /// `n_ctx`), or from the transport when no response arrived.
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum SidecarFailure {
+        /// The prompt does not fit the loaded context. Nothing was generated.
+        /// Counts are 0 when the server did not report them.
+        ContextExceeded { prompt_tokens: u32, context: u32 },
+        /// No usable response: connection refused or reset, or the server is
+        /// loading or restarting.
+        Unavailable(String),
+        /// The request timed out.
+        Timeout,
+        /// The reply stream ended before the server finished it.
+        Truncated,
+        /// The server rejected the request as invalid.
+        BadRequest(String),
+        /// The server failed while handling the request.
+        Server(String),
+    }
+
+    impl SidecarFailure {
+        /// Worth repeating unchanged after a short wait: the request itself
+        /// was not the problem.
+        pub fn is_transient(&self) -> bool {
+            matches!(self, Self::Unavailable(_) | Self::Timeout | Self::Truncated)
+        }
+    }
+
+    impl std::fmt::Display for SidecarFailure {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::ContextExceeded { prompt_tokens, context } if *prompt_tokens > 0 && *context > 0 => write!(
+                    f,
+                    "the request ({prompt_tokens} tokens) does not fit the model's {context}-token context"
+                ),
+                Self::ContextExceeded { .. } => write!(f, "the request does not fit the model's context"),
+                Self::Unavailable(detail) if detail.is_empty() => write!(f, "the model server did not respond"),
+                Self::Unavailable(detail) => write!(f, "the model server did not respond ({detail})"),
+                Self::Timeout => write!(f, "the model server did not answer in time"),
+                Self::Truncated => write!(f, "the model server stopped the reply before finishing it"),
+                Self::BadRequest(detail) => write!(f, "the model server rejected the request: {detail}"),
+                Self::Server(detail) => write!(f, "the model server failed while answering: {detail}"),
+            }
+        }
     }
 
     impl std::fmt::Display for InferenceError {
@@ -50,11 +111,68 @@ pub mod thiserror_stub {
                      Summarize older messages or raise the context size in Settings."
                 ),
                 Self::Generation(msg) => write!(f, "Generation failed: {msg}"),
+                Self::Sidecar(failure) => {
+                    let text = failure.to_string();
+                    let mut chars = text.chars();
+                    match chars.next() {
+                        Some(first) => write!(f, "{}{}", first.to_uppercase(), chars.as_str()),
+                        None => Ok(()),
+                    }
+                }
             }
         }
     }
 
     impl std::error::Error for InferenceError {}
+}
+
+/// Whether the loaded runtime reported a template capability. `Unknown` when
+/// it did not say: callers claim less for an unknown capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Support {
+    Yes,
+    No,
+    #[default]
+    Unknown,
+}
+
+/// What llama-server reports the model's chat template can render
+/// (`GET /props` → `chat_template_caps`), read once per load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TemplateCaps {
+    pub tools: Support,
+    pub tool_calls: Support,
+    pub system_role: Support,
+    pub parallel_tool_calls: Support,
+    pub preserve_reasoning: Support,
+}
+
+impl TemplateCaps {
+    pub fn from_props(props: &serde_json::Value) -> Option<Self> {
+        let caps = props.get("chat_template_caps")?.as_object()?;
+        let read = |key: &str| match caps.get(key).and_then(|value| value.as_bool()) {
+            Some(true) => Support::Yes,
+            Some(false) => Support::No,
+            None => Support::Unknown,
+        };
+        Some(Self {
+            tools: read("supports_tools"),
+            tool_calls: read("supports_tool_calls"),
+            system_role: read("supports_system_role"),
+            parallel_tool_calls: read("supports_parallel_tool_calls"),
+            preserve_reasoning: read("supports_preserve_reasoning"),
+        })
+    }
+
+    /// The template renders a tool list or tool calls.
+    pub fn tools_supported(&self) -> Support {
+        match (self.tools, self.tool_calls) {
+            (Support::Yes, _) | (_, Support::Yes) => Support::Yes,
+            (Support::No, Support::No) => Support::No,
+            _ => Support::Unknown,
+        }
+    }
 }
 
 /// Restrictions a chat template places on the message list. Both defaults
@@ -92,6 +210,39 @@ pub struct InferenceConfig {
     pub n_ctx: u32,
     pub n_batch: u32,
     pub n_threads: u32,
+    /// Prompt-processing threads (`--threads-batch`); 0 means the same as
+    /// `n_threads`. Separate because prompts come in short bursts that can use
+    /// every core, while generation runs long and can leave the machine room.
+    #[serde(default)]
+    pub n_threads_batch: u32,
+    /// `--poll` (0-100): how much worker threads spin-wait between operations.
+    /// None leaves the runtime default.
+    #[serde(default)]
+    pub poll: Option<u8>,
+    /// `--prio`: -1 lets other applications take the CPU first.
+    #[serde(default)]
+    pub priority: Option<i8>,
+    /// `--fit-target` in MiB: VRAM llama-server's load-time fit leaves free.
+    /// None leaves the server default (1024).
+    #[serde(default)]
+    pub fit_target_mib: Option<u32>,
+    /// `--cache-ram` in MiB: llama-server's RAM prompt cache for switching
+    /// between conversations. None leaves the server default (8192 MiB).
+    #[serde(default)]
+    pub cache_ram_mib: Option<u32>,
+    /// `--ubatch-size`: tokens computed per step while reading a prompt. None
+    /// leaves llama-server's default (512). Chosen in automatic modes only, by
+    /// the owner's speed rule (`runtime_fit::default_micro_batch` or the
+    /// model's calibration); a larger micro-batch reads prompts faster but its
+    /// compute buffer takes VRAM the model could use.
+    #[serde(default)]
+    pub micro_batch: Option<u32>,
+    /// `--load-mode none`: read the weights into RAM instead of mapping the
+    /// model file. Set in automatic modes for placements that keep weights in
+    /// RAM while using the GPU, when RAM has room for the copy
+    /// (`runtime_fit::load_without_mmap`).
+    #[serde(default)]
+    pub load_without_mmap: bool,
     pub n_gpu_layers: i32, // -1 = auto, 0 = CPU, 999 = full offload
     pub flash_attn: bool,
     #[serde(default = "default_true")]
@@ -115,6 +266,21 @@ pub struct InferenceConfig {
     /// rewrites and repeated tool envelopes produce. Lossless by construction.
     #[serde(default = "default_speculative")]
     pub speculative: String,
+    /// `--spec-draft-n-max`: tokens a draft model or built-in draft head
+    /// proposes per step. None leaves the runtime's default; n-gram drafting
+    /// ignores it (its length is `--spec-ngram-simple-size-m`).
+    #[serde(default)]
+    pub spec_draft_n_max: Option<u32>,
+    /// `--spec-ngram-simple-size-m`: tokens n-gram drafting proposes at once.
+    /// None leaves the runtime's default (48). Chosen by the load path from
+    /// the placement (`runtime_fit::ngram_draft_length`), automatic modes only.
+    #[serde(default)]
+    pub spec_ngram_length: Option<u32>,
+    /// llama.cpp's built-in chat format (`--no-jinja --chat-template NAME`)
+    /// for a model file without a chat template; None uses the file's own
+    /// template. Set by the load path from `models::builtin_chat_format`.
+    #[serde(default)]
+    pub builtin_chat_format: Option<String>,
     /// What the model's own chat template accepts. Gemma 2 and some Llama 2
     /// derivatives refuse a system role outright and raise unless user and
     /// assistant turns strictly alternate, so the message list that works
@@ -122,6 +288,10 @@ pub struct InferenceConfig {
     /// load; the default is permissive, as almost every modern template is.
     #[serde(default)]
     pub chat_template: ChatTemplateShape,
+    /// Capabilities the runtime reported for the loaded template; None until
+    /// read (older runtimes do not report them).
+    #[serde(default)]
+    pub template_caps: Option<TemplateCaps>,
     pub temperature: f32,
     pub top_p: f32,
     pub top_k: u32,
@@ -136,7 +306,14 @@ impl Default for InferenceConfig {
             projector_path: None,
             n_ctx: 32768,
             n_batch: 512,
-            n_threads: 8,
+            n_threads: 0,
+            n_threads_batch: 0,
+            poll: None,
+            priority: None,
+            cache_ram_mib: None,
+            fit_target_mib: None,
+            micro_batch: None,
+            load_without_mmap: false,
             n_gpu_layers: -1,
             flash_attn: true,
             flash_attn_auto: true,
@@ -146,7 +323,11 @@ impl Default for InferenceConfig {
             runtime_policy: None,
             cache_reuse: default_cache_reuse(),
             speculative: default_speculative(),
+            spec_draft_n_max: None,
+            spec_ngram_length: None,
+            builtin_chat_format: None,
             chat_template: ChatTemplateShape::default(),
+            template_caps: None,
             temperature: 0.7,
             top_p: 0.9,
             top_k: 40,
@@ -169,6 +350,32 @@ fn default_cache_reuse() -> u32 {
 /// had no measurable cost on novel prose and a 12-15x gain on file rewrites.
 pub fn default_speculative() -> String {
     "ngram-simple".into()
+}
+
+/// Drafting for a model whose GGUF carries a built-in next-token prediction
+/// layer (`<arch>.nextn_predict_layers`): the draft head plus n-gram drafting.
+/// Measured on a 27B model with one such layer (all layers on the GPU, 8K
+/// context): prose 34.9 → 52.9 tok/s, file rewrites 35.3 → 88.3 tok/s against
+/// no drafting (n-gram alone: 36.0 and 62.3), at +0.9 GB of VRAM.
+pub const DRAFT_HEAD_SPECULATIVE: &str = "draft-mtp,ngram-simple";
+/// Tokens the draft head proposes per step: 3 was fastest measured (1: 48.6
+/// prose tok/s, 2: 52.4, 3: 53.7; the runtime's default is also 3).
+pub const DRAFT_HEAD_TOKENS: u32 = 3;
+/// VRAM the draft head's layer and context take at `DRAFT_HEAD_TOKENS` (+0.9 GB
+/// measured). `llama-fit-params` does not include it, so the load path's
+/// probes leave this much more free when the draft head is on.
+pub const DRAFT_HEAD_RESERVE_MIB: u32 = 1024;
+
+/// The drafting a load uses: off when the owner turned it off; the draft head
+/// with n-gram drafting when the model has one; n-gram drafting otherwise.
+pub fn speculative_for(model: Option<&crate::models::ModelMetadata>, turned_off: bool) -> (String, Option<u32>) {
+    if turned_off {
+        return ("none".into(), None);
+    }
+    match model.and_then(|model| model.draft_head_layers) {
+        Some(layers) if layers > 0 => (DRAFT_HEAD_SPECULATIVE.into(), Some(DRAFT_HEAD_TOKENS)),
+        _ => (default_speculative(), None),
+    }
 }
 
 /// Engine-reported timings for one completion, straight from llama-server's
@@ -243,6 +450,9 @@ pub struct ResolvedRuntimePolicy {
     pub cache_reuse: u32,
     #[serde(default = "default_speculative")]
     pub speculative: String,
+    /// `--spec-draft-n-max` for the draft head; None otherwise.
+    #[serde(default)]
+    pub spec_draft_n_max: Option<u32>,
     /// Context ceiling applied if the load falls back to the CPU, sized from
     /// free system RAM (8192 when RAM is plentiful or unknown).
     #[serde(default = "default_cpu_context_cap")]
@@ -580,11 +790,7 @@ pub fn resolve_runtime_policy_for_machine(
             }
         }
     }
-    let speculative = if tuning.speculative == "off" {
-        "none".to_string()
-    } else {
-        default_speculative()
-    };
+    let (speculative, spec_draft_n_max) = speculative_for(model, tuning.speculative == "off");
     let cache_reuse = if tuning.cache_reuse {
         default_cache_reuse()
     } else {
@@ -599,8 +805,10 @@ pub fn resolve_runtime_policy_for_machine(
         "llama.cpp uses this model's GGUF metadata and chat template to construct its native attention, sliding-window or recurrent state.".into(),
         "Every model load uses a fresh process/cache; subsequent requests rebuild context from saved messages using the selected model's tokenizer and template.".into(),
     ];
-    if speculative != "none" {
-        notes.push(format!("Self-speculative decoding ({speculative}) drafts tokens already present in the context and verifies them in one batch. Output is identical to plain decoding; it is faster when the reply repeats context (code edits, file rewrites, tool envelopes)."));
+    if speculative == DRAFT_HEAD_SPECULATIVE {
+        notes.push(format!("This model carries a built-in draft head (a next-token prediction layer): it drafts {DRAFT_HEAD_TOKENS} tokens per step, and n-gram drafting adds tokens already in the context. Measured on a 27B model: prose 35 → 53 tok/s and file rewrites 35 → 88 tok/s, for about 0.9 GB more VRAM, which the memory fit reserves. The model still chooses every token; verifying several at once can flip a near-tied token, so text can differ slightly from plain decoding."));
+    } else if speculative != "none" {
+        notes.push(format!("Self-speculative decoding ({speculative}) drafts tokens already present in the context and verifies them in one batch. The model still chooses every token; verifying several at once can very rarely flip a near-tied token, so text can differ slightly from plain decoding. It is faster when the reply repeats context (code edits, file rewrites, tool envelopes)."));
     }
     if cache_reuse > 0 {
         notes.push(format!("Prompt-cache chunk reuse ({cache_reuse}-token minimum) keeps the unchanged tail of a transcript in the KV cache when earlier turns are pruned, so only the changed part is re-prefilled."));
@@ -619,6 +827,16 @@ pub fn resolve_runtime_policy_for_machine(
     if model.is_none() {
         notes.push("Model metadata is unavailable; no model context limit can be verified. Native load validation remains authoritative.".into());
     }
+    // llama.cpp cannot create a context with a quantized value cache when
+    // Flash Attention is off (measured: "failed to create context"). Settings
+    // now refuse that pairing; a save from before keeps the 8-bit key cache
+    // and stores values at f16 rather than failing to load.
+    let cache_type_v = if !automatic && !requested.flash_attn && cache_type != "f16" {
+        notes.push(format!("Flash Attention is off, which a {cache_type} value cache requires, so values are cached at f16 and keys at {cache_type}. Turn Flash Attention on to halve the value cache too."));
+        "f16".to_string()
+    } else {
+        cache_type.clone()
+    };
     if automatic {
         notes.push("The installed runtime is checked for usable devices at load time, including supported integrated GPUs. With no usable GPU, automatic CPU settings are selected; GPU initialization failures retry once on CPU. CPU operation caps context at 8192 without changing saved preferences; all physical cores are used, which measured faster than performance cores alone on a hybrid CPU.".into());
     }
@@ -632,8 +850,8 @@ pub fn resolve_runtime_policy_for_machine(
             .unwrap_or_else(|| "unknown".into()),
         requested_context,
         effective_context,
-        cache_type_k: cache_type.clone(),
-        cache_type_v: cache_type,
+        cache_type_k: cache_type,
+        cache_type_v,
         flash_attention: if automatic {
             "auto"
         } else if requested.flash_attn {
@@ -667,6 +885,7 @@ pub fn resolve_runtime_policy_for_machine(
         },
         cache_reuse,
         speculative,
+        spec_draft_n_max,
         cpu_context_cap: cpu_cap,
         placement: placement.into(),
         cache_rebuild: "fresh_process".into(),
@@ -675,11 +894,42 @@ pub fn resolve_runtime_policy_for_machine(
     }
 }
 
+/// RAM for llama-server's prompt cache (`--cache-ram`, MiB). The server's
+/// default of 8 GiB is kept only when free RAM allows it after the model memory
+/// that lives in RAM and a 2 GiB margin for the system; otherwise half of what
+/// is left, and 0 (cache off) under 256 MiB, so the cache can never push the
+/// weights into paging.
+pub fn prompt_cache_ram_mib(ram_available_bytes: u64, ram_side_model_bytes: u64) -> u32 {
+    const MIB: u64 = 1_048_576;
+    let spare = ram_available_bytes
+        .saturating_sub(ram_side_model_bytes)
+        .saturating_sub(2048 * MIB);
+    let mib = (spare / 2 / MIB).min(8192) as u32;
+    if mib < 256 {
+        0
+    } else {
+        mib
+    }
+}
+
 impl ResolvedRuntimePolicy {
     pub fn apply_to(&self, cfg: &mut InferenceConfig) {
         cfg.n_ctx = self.effective_context;
         cfg.n_batch = self.batch_size;
         cfg.n_threads = self.threads;
+        if self.mode == "automatic" {
+            // Manual-only launch values do not leak into automatic loads; a
+            // calibrated profile sets its own afterwards.
+            cfg.n_threads_batch = 0;
+            cfg.poll = None;
+            cfg.priority = None;
+        }
+        // Chosen after the policy, from the runtime's fit or a calibration, and
+        // only in automatic modes: a policy never carries an earlier choice,
+        // and Manual keeps llama-server's defaults.
+        cfg.micro_batch = None;
+        cfg.load_without_mmap = false;
+        cfg.spec_ngram_length = None;
         cfg.n_gpu_layers = self.gpu_layers;
         cfg.flash_attn_auto = self.flash_attention == "auto";
         cfg.flash_attn = self.flash_attention != "off";
@@ -688,6 +938,7 @@ impl ResolvedRuntimePolicy {
         cfg.kv_cache_type_v = self.cache_type_v.clone();
         cfg.cache_reuse = self.cache_reuse;
         cfg.speculative = self.speculative.clone();
+        cfg.spec_draft_n_max = self.spec_draft_n_max;
         cfg.runtime_policy = Some(self.clone());
     }
 }
@@ -1091,6 +1342,18 @@ mod tests {
     }
 
     #[test]
+    fn a_model_with_a_draft_head_drafts_with_it() {
+        let mut model = policy_test_model("qwen35", 32768);
+        assert_eq!(speculative_for(Some(&model), false), ("ngram-simple".to_string(), None));
+        model.draft_head_layers = Some(1);
+        assert_eq!(speculative_for(Some(&model), false), (DRAFT_HEAD_SPECULATIVE.to_string(), Some(DRAFT_HEAD_TOKENS)));
+        assert_eq!(speculative_for(Some(&model), true), ("none".to_string(), None), "the owner's off switch wins");
+        model.draft_head_layers = Some(0);
+        assert_eq!(speculative_for(Some(&model), false).0, "ngram-simple");
+        assert_eq!(speculative_for(None, false).0, "ngram-simple");
+    }
+
+    #[test]
     fn runtime_policy_is_recomputed_for_each_model_without_mutating_preferences() {
         let requested = InferenceConfig {
             n_ctx: 32768,
@@ -1329,10 +1592,15 @@ mod tests {
             kv_cache_gpu: false,
             kv_cache_type_k: "q8_0".into(),
             kv_cache_type_v: "q4_0".into(),
+            // A choice left over from an automatic load.
+            micro_batch: Some(1024),
+            load_without_mmap: true,
             ..InferenceConfig::default()
         };
         let policy = resolve_runtime_policy(None, &requested, false);
         policy.apply_to(&mut requested);
+        assert_eq!(requested.micro_batch, None, "Manual keeps llama-server's micro-batch");
+        assert!(!requested.load_without_mmap, "Manual keeps llama-server's load mode");
         assert_eq!(requested.n_threads, 6);
         assert_eq!(requested.n_gpu_layers, 0);
         assert_eq!(requested.n_batch, 256);
@@ -1342,6 +1610,54 @@ mod tests {
         assert_eq!(requested.kv_cache_type_k, "f16");
         assert_eq!(requested.kv_cache_type_v, "f16");
         assert_eq!(requested.runtime_policy.unwrap().mode, "manual");
+    }
+
+    #[test]
+    fn template_capabilities_are_read_from_the_runtime_props() {
+        let props = serde_json::json!({"chat_template_caps": {
+            "supports_tools": false, "supports_tool_calls": false, "supports_system_role": true
+        }});
+        let caps = TemplateCaps::from_props(&props).unwrap();
+        assert_eq!(caps.tools_supported(), Support::No);
+        assert_eq!(caps.system_role, Support::Yes);
+        assert_eq!(caps.parallel_tool_calls, Support::Unknown, "absent means unknown, never no");
+        let with_calls = serde_json::json!({"chat_template_caps": {"supports_tools": false, "supports_tool_calls": true}});
+        assert_eq!(TemplateCaps::from_props(&with_calls).unwrap().tools_supported(), Support::Yes);
+        assert_eq!(TemplateCaps::from_props(&serde_json::json!({"chat_template_caps": {}})).unwrap().tools_supported(), Support::Unknown);
+        assert!(TemplateCaps::from_props(&serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn the_prompt_cache_never_takes_ram_the_model_needs() {
+        const GIB: u64 = 1_073_741_824;
+        assert_eq!(prompt_cache_ram_mib(40 * GIB, 0), 8192, "plenty of RAM keeps the server default");
+        assert_eq!(prompt_cache_ram_mib(12 * GIB, 6 * GIB), 2048, "half of what is left after the model and 2 GiB");
+        assert_eq!(prompt_cache_ram_mib(4 * GIB, 2 * GIB), 0, "no room: the cache is off");
+        assert_eq!(prompt_cache_ram_mib(0, 5 * GIB), 0);
+    }
+
+    #[test]
+    fn an_old_manual_save_never_pairs_a_quantized_value_cache_with_flash_attention_off() {
+        let mut requested = InferenceConfig {
+            n_ctx: 4096,
+            n_threads: 6,
+            flash_attn: false,
+            ..InferenceConfig::default()
+        };
+        let tuning = crate::settings::RuntimeSettings {
+            kv_cache: "q8_0".into(),
+            ..Default::default()
+        };
+        let policy = resolve_runtime_policy_with(None, &requested, false, &tuning);
+        assert_eq!(policy.cache_type_k, "q8_0");
+        assert_eq!(policy.cache_type_v, "f16", "llama.cpp cannot create this context");
+        assert!(policy.notes.iter().any(|note| note.contains("Flash Attention is off")));
+        policy.apply_to(&mut requested);
+        assert_eq!(requested.kv_cache_type_v, "f16");
+
+        requested.flash_attn = true;
+        let policy = resolve_runtime_policy_with(None, &requested, false, &tuning);
+        assert_eq!(policy.cache_type_v, "q8_0");
     }
 
     #[test]

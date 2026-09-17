@@ -4,6 +4,8 @@
 # Keep the folder in fresh clones, but never track downloaded model/runtime files.
 /models/*
 !/models/.gitkeep
+# The model downloader is project code, not a downloaded artefact.
+!/models/modeldownloader.py
 /backups/
 /backend/backups/
 *.db
@@ -15,6 +17,10 @@
 *.safetensors
 
 # Build products and installed dependencies (keep lockfiles in Git).
+# The llama.cpp runtime is built from runtime/llama.cpp.lock.json; only the lock is tracked.
+/build/
+/runtime/*
+!/runtime/llama.cpp.lock.json
 /backend/target/
 node_modules/
 /frontend/dist/
@@ -45,3 +51,8 @@ Thumbs.db
 Desktop.ini
 *.swp
 *.swo
+
+# The showcase model is committed, split into parts under 2 GB and stored with Git LFS
+# (night decisions 51 and 55). Other models stay local.
+!/models/gemma-4-e4b-it-qat/
+!/models/gemma-4-e4b-it-qat/*.gguf

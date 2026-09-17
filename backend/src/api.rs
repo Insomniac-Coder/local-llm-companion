@@ -13,7 +13,7 @@ use crate::llamaserver::{
     DEFAULT_SIDECAR_PORT,
 };
 use crate::models::ModelManager;
-use crate::permissions::{AutonomyLevel, PermissionManager};
+use crate::permissions::PermissionManager;
 use crate::settings::AppSettings;
 use crate::storage::{Conversation, Message, Storage};
 use crate::tools;
@@ -94,6 +94,9 @@ pub struct AppState {
     runtime_update: Arc<tokio::sync::Mutex<()>>,
     pub storage: Arc<tokio::sync::Mutex<Storage>>,
     pub models_dir: PathBuf,
+    /// The installation root (runtime/bin, plugins). Set from the resolved
+    /// configuration; test states use the models folder's parent.
+    pub install_root: PathBuf,
     pub attachments_dir: PathBuf,
     /// Stage 21: staged model-load progress (validating → loading → ready).
     pub load_progress: Arc<tokio::sync::RwLock<LoadProgress>>,
@@ -101,6 +104,8 @@ pub struct AppState {
     pub repo_index: Arc<
         tokio::sync::RwLock<std::collections::HashMap<String, (u64, crate::repo_index::RepoIndex)>>,
     >,
+    /// The fit search ahead of each model's first load.
+    pub fit_preparation: Arc<FitPreparation>,
 }
 
 /// Stage 21 load progress with truthful stages (§174 rule: no fake %).
@@ -116,6 +121,110 @@ pub struct LoadProgress {
 
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+/// Request context that changes during a conversation (the project listing,
+/// saved memory, the reasoning instruction, attachment excerpts) goes after
+/// the saved history instead of before it, so the system prompt and every
+/// earlier turn stay byte-identical between requests and llama-server reuses
+/// their cache instead of re-reading them on the user's hardware. Setting
+/// COMPANION_LEGACY_PROMPT_ORDER restores the previous layout; it exists only
+/// for the before/after measurement and is removed after it.
+pub(crate) fn legacy_prompt_order() -> bool {
+    std::env::var_os("COMPANION_LEGACY_PROMPT_ORDER").is_some()
+}
+
+/// Stands in for the project listing inside the stable system prompt.
+const LISTING_IN_LATEST_MESSAGE: &str =
+    "(The project's current directory listing is attached to the latest message.)";
+
+/// The changing context for the latest user turn.
+fn changing_context_block(snapshot: &str, memory: &str) -> String {
+    let mut block = String::new();
+    if !snapshot.trim().is_empty() {
+        block.push_str(&format!("\n\n[Linked project: current directory listing]\n{}", snapshot.trim_end()));
+    }
+    if !memory.trim().is_empty() {
+        block.push_str("\n\n");
+        block.push_str(memory.trim());
+    }
+    block
+}
+
+/// The user message an attachment was sent with: the first user message
+/// saved at or after the upload (the pending message counts as latest).
+pub(crate) fn attachment_owner<'a>(history: &'a [Message], attachment: &crate::storage::Attachment) -> Option<&'a str> {
+    let uploaded = chrono::DateTime::parse_from_rfc3339(&attachment.created_at).ok();
+    history
+        .iter()
+        .filter(|message| message.role == "user")
+        .find(|message| {
+            if message.id == "pending" || message.created_at.is_empty() {
+                return true;
+            }
+            match (uploaded, chrono::DateTime::parse_from_rfc3339(&message.created_at).ok()) {
+                (Some(uploaded), Some(sent)) => sent >= uploaded,
+                _ => message.created_at >= attachment.created_at,
+            }
+        })
+        .map(|message| message.id.as_str())
+}
+
+/// The turn an attachment belongs on: its own message when that message is in
+/// the window; the latest user turn when no message owns it yet; None when its
+/// message has left the window.
+fn attachment_turn(
+    turns: &[ChatTurn],
+    ids: &[String],
+    history: &[Message],
+    attachment: &crate::storage::Attachment,
+) -> Option<usize> {
+    match attachment_owner(history, attachment) {
+        Some(owner) => ids.iter().position(|id| id == owner),
+        None => turns.iter().rposition(|turn| turn.role == "user"),
+    }
+}
+
+/// Store every request a client sends for `owner_id` (a reply or an agent
+/// run), when Privacy > "Keep a record of model requests" is on. Writes happen
+/// after the response, on their own task, and never fail the request.
+pub(crate) fn request_recorder(
+    state: &AppState,
+    conversation_id: &str,
+    owner_id: &str,
+    kind: &'static str,
+) -> crate::llamaserver::RequestRecorder {
+    let state = state.clone();
+    let conversation_id = conversation_id.to_string();
+    let owner_id = owner_id.to_string();
+    let seq = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    Arc::new(move |request: crate::llamaserver::RecordedRequest| {
+        let state = state.clone();
+        let record = crate::storage::ModelRequestRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            conversation_id: conversation_id.clone(),
+            owner_id: owner_id.clone(),
+            seq: seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+            kind: kind.to_string(),
+            request_json: request.body.to_string(),
+            raw_output: request.output,
+            finish_reason: request.finish_reason,
+            outcome: request.outcome.to_string(),
+            failure: request.failure,
+            prompt_tokens: request.prompt_tokens,
+            cached_tokens: request.cached_tokens,
+            generated_tokens: request.generated_tokens,
+            created_at: now_rfc3339(),
+        };
+        tokio::spawn(async move {
+            if !state.settings.read().await.privacy.record_model_requests {
+                return;
+            }
+            if let Err(error) = state.storage.lock().await.record_model_request(&record) {
+                tracing::warn!("could not keep the model request record: {error}");
+            }
+        });
+    })
 }
 
 impl AppState {
@@ -149,11 +258,7 @@ impl AppState {
             .normalized();
         // Only the explicit global preference is durable. Temporary grants and
         // one-time approvals belong to the old process and are never restored.
-        let permissions = PermissionManager::new(if settings.agent.autonomous_enabled {
-            AutonomyLevel::Autonomous
-        } else {
-            AutonomyLevel::Assisted
-        });
+        let permissions = PermissionManager::new(crate::permissions::autonomy_for_mode(&settings.agent.permission_mode));
         Self {
             models: Arc::new(tokio::sync::RwLock::new(ModelManager::new())),
             inference: Arc::new(tokio::sync::RwLock::new(StubEngine::new())),
@@ -180,6 +285,11 @@ impl AppState {
             settings_update: Arc::new(tokio::sync::Mutex::new(())),
             runtime_update: Arc::new(tokio::sync::Mutex::new(())),
             storage: Arc::new(tokio::sync::Mutex::new(storage)),
+            install_root: models_dir
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from(".")),
             models_dir,
             attachments_dir,
             artifacts_dir,
@@ -191,7 +301,18 @@ impl AppState {
                 cancel_requested: false,
             })),
             repo_index: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            fit_preparation: Arc::new(FitPreparation::default()),
         }
+    }
+
+    /// The installation root the runtime and plugins are found under.
+    pub fn with_install_root(mut self, root: PathBuf) -> Self {
+        self.install_root = root;
+        self
+    }
+
+    pub fn runtime_dir(&self) -> PathBuf {
+        crate::llamaserver::runtime_dir(&self.install_root)
     }
 }
 
@@ -301,7 +422,6 @@ pub fn router(state: AppState) -> Router {
         .route("/api/models/:id", get(model_detail).delete(delete_model))
         .route("/api/models/:id/recommend", get(model_recommend))
         .route("/api/chat", post(chat_sse))
-        .route("/api/chat/classify", post(classify_request))
         .route("/api/chat/stop", post(chat_stop))
         .route(
             "/api/conversations",
@@ -426,6 +546,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/system/capabilities", get(capability_db))
         .route("/api/system/calibrate", post(calibrate))
         .route("/api/models/:id/optimize", get(model_optimize))
+        .route("/api/models/:id/calibration", get(model_calibration))
+        .route("/api/models/:id/calibrate", post(calibrate_model))
         // Stage 32: repo index.
         .route("/api/workspaces/:id/index", get(workspace_index))
         // Stage 35: local knowledge.
@@ -515,19 +637,38 @@ async fn health() -> Json<serde_json::Value> {
 async fn list_models(State(s): State<AppState>) -> Json<Vec<crate::models::ModelMetadata>> {
     // Keep the selector in sync with files dropped into models/ while the app
     // is already running. Registration preserves the currently loaded model.
+    // Reconciled, not only added to: a folder deleted by hand leaves the list
+    // on the next read, including when the models folder is now empty.
     let (found, warnings) = crate::models::scan_models_dir(&s.models_dir);
-    if !found.is_empty() {
-        let mut models = s.models.write().await;
-        for model in found {
-            if let Err(error) = models.register(model) {
-                tracing::warn!("skipping discovered model: {error}");
-            }
-        }
+    let known: std::collections::HashSet<String> = s.models.read().await.list().into_iter().map(|model| model.id).collect();
+    let added = found.iter().any(|model| !known.contains(&model.id));
+    let (removed, register_warnings) = s.models.write().await.reconcile(found);
+    if added {
+        // A model added while the app runs gets its fit ahead of its first load.
+        spawn_fit_preparation(&s, std::time::Duration::from_secs(3));
     }
-    for warning in warnings {
+    if !removed.is_empty() {
+        tracing::info!(?removed, "models removed from the list: their files are gone");
+    }
+    for warning in warnings.into_iter().chain(register_warnings) {
         tracing::warn!("{warning}");
     }
-    Json(s.models.read().await.list())
+    let mut list = s.models.read().await.list();
+    // Tool support as llama.cpp reported it for each file when it was last
+    // loaded; the chat template's own source only until then.
+    let st = s.storage.lock().await;
+    for model in &mut list {
+        let key = crate::calibration::model_key(&model.gguf_path());
+        match st.template_caps_for(&key) {
+            Ok(Some(caps)) if caps.tools_supported() != crate::inference::Support::Unknown => {
+                model.tool_calling = caps.tools_supported() == crate::inference::Support::Yes;
+                model.tool_support_source = Some("runtime".into());
+            }
+            _ if model.tool_calling => model.tool_support_source = Some("template".into()),
+            _ => {}
+        }
+    }
+    Json(list)
 }
 
 #[derive(Deserialize)]
@@ -579,10 +720,10 @@ async fn load_model(
     .await;
     let out = load_model_by_id(&s, req.id.trim()).await;
     match &out {
-        Ok(id) => set_progress(&s, id, "ready", "Model loaded and ready for inference.").await,
+        Ok((id, _)) => set_progress(&s, id, "ready", "Model loaded and ready for inference.").await,
         Err(e) => set_progress(&s, req.id.trim(), "error", &e.message).await,
     }
-    out.map(|id| Json(serde_json::json!({"loaded": id})))
+    out.map(|(id, notices)| Json(serde_json::json!({"loaded": id, "notices": notices})))
 }
 
 async fn unload_models(State(s): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
@@ -592,6 +733,7 @@ async fn unload_models(State(s): State<AppState>) -> Result<Json<serde_json::Val
     s.inference.write().await.unload();
     s.llama.write().await.stop().await;
     tracing::info!("models unloaded");
+    spawn_fit_preparation(&s, std::time::Duration::from_secs(5));
     Ok(Json(serde_json::json!({"unloaded": true})))
 }
 
@@ -601,7 +743,7 @@ async fn inference_status(State(s): State<AppState>) -> Json<InferenceStatus> {
     let running = llama.is_running();
     let base_url = llama.base_url();
     let last_error = llama.last_error.clone();
-    let binary_found = SidecarBinary::detect(&s.models_dir).is_ok();
+    let binary_found = SidecarBinary::detect(&s.runtime_dir()).is_ok();
     let (engine, model, ctx) = if running {
         let m = s.models.read().await.current().map(|m| m.id.clone());
         let c = llama.running.as_ref().map(|r| r.cfg.n_ctx).unwrap_or(0);
@@ -768,6 +910,769 @@ async fn guard_agent_running(s: &AppState, force: bool) -> Result<(), ApiError> 
     Ok(())
 }
 
+/// Choose the context, cache precision and fit margin from the runtime's own
+/// memory fit, and record why.
+///
+/// The automatic policy's context comes from a formula over the model header
+/// that overstates the cache of hybrid-attention and sliding-window models;
+/// llama.cpp's fit is exact for every architecture it loads. Owner speed rule
+/// (`speed_rule`): the combination with every layer on the GPU measured fastest
+/// at both generation and prompt reading (see `runtime_fit::FIT_COMBINATIONS`).
+/// "Fit" mode shrinks the context only when
+/// no combination keeps every layer on the GPU at the requested size; "use my
+/// size" keeps the request with the combination that puts the most on the GPU.
+/// When the probe is unavailable the policy's result stands.
+///
+/// The combination is chosen at the runtime's default micro-batch (512). The
+/// micro-batch comes next, on that same combination: this model's calibrated
+/// size (with the extra expert blocks the calibration measured it move to RAM)
+/// when `calibrated_micro_batch` is given and this load's change is no larger
+/// than the measured one (`runtime_fit::calibrated_micro_batch_fits`),
+/// otherwise the safe default (`runtime_fit::default_micro_batch`, one more
+/// probe at 1,024, reused when the calibrated size was 1,024). Automatic modes
+/// only; the caller never runs this in Manual.
+///
+/// The decision is remembered (owner decision 2026-09-17: a 14B model's search
+/// took 24 s of a 30 s load). A later load with the same model file, runtime,
+/// request and GPU confirms it with one probe (`runtime_fit::fit_reuse`) and
+/// searches again only when that probe disagrees, or when a compromise might
+/// improve because more VRAM is free now. `FitPurpose::Prepare` (the search
+/// ahead of a model's first load) skips a model that already has a decision.
+///
+/// Returns the fit the load gets at the chosen micro-batch (the load-mode
+/// decision needs it), or None when the runtime's fit was unavailable.
+#[allow(clippy::too_many_arguments)]
+async fn fit_context_with_runtime(
+    s: &AppState,
+    purpose: FitPurpose,
+    server: &std::path::Path,
+    model: &crate::models::ModelMetadata,
+    gguf: &std::path::Path,
+    requested: u32,
+    tuning: &crate::settings::RuntimeSettings,
+    calibrated_micro_batch: Option<(u32, u32)>,
+    vram: Option<&crate::inference::VramState>,
+    cfg: &mut InferenceConfig,
+) -> Option<crate::runtime_fit::Fit> {
+    use crate::runtime_fit::{fit_combinations, fit_memory_key, fit_reuse, probe, FitReuse, DEFAULT_MICRO_BATCH, FIT_PROBE_CONCURRENCY};
+    let fit_tool = crate::calibration::runtime_tool(server, "llama-fit-params")?;
+    let requested = requested.min(model.context_length.max(1)).max(1);
+    let draft_head = cfg.speculative == crate::inference::DRAFT_HEAD_SPECULATIVE;
+    let free_vram_mib = vram.map(|vram| vram.total_bytes.saturating_sub(vram.used_bytes) / 1_048_576);
+    let key = fit_memory_key(
+        gguf,
+        &fit_tool,
+        requested,
+        &tuning.kv_cache,
+        tuning.keeps_requested_context(),
+        calibrated_micro_batch,
+        draft_head,
+        vram.map(|vram| vram.total_bytes / 1_048_576),
+    );
+    let remembered = s.storage.lock().await.fit_decision_for(&key).unwrap_or_else(|error| {
+        tracing::warn!("could not read the remembered fit: {error}");
+        None
+    });
+    if let Some(remembered) = remembered {
+        if purpose == FitPurpose::Prepare {
+            return Some(remembered.fit);
+        }
+        let preferred = fit_combinations(&tuning.kv_cache).first().copied().unwrap_or(("f16", 1024));
+        if fit_reuse(&remembered, free_vram_mib, preferred) == FitReuse::Confirm {
+            let reserve = if draft_head && !remembered.draft_head_dropped { crate::inference::DRAFT_HEAD_RESERVE_MIB } else { 0 };
+            let started = std::time::Instant::now();
+            let confirmed = probe(
+                &fit_tool,
+                gguf,
+                remembered.context,
+                &remembered.cache,
+                remembered.margin + reserve,
+                remembered.micro_batch.unwrap_or(DEFAULT_MICRO_BATCH),
+            )
+            .await;
+            if confirmed.as_ref() == Ok(&remembered.fit) {
+                apply_fit_decision(&remembered, requested, cfg, Some(started.elapsed()));
+                return Some(remembered.fit);
+            }
+            tracing::info!(model = %model.id, "the remembered fit no longer holds; searching again");
+        }
+    }
+    let started = std::time::Instant::now();
+    let mut searched = search_fit(&fit_tool, model, gguf, requested, tuning, calibrated_micro_batch, draft_head, FIT_PROBE_CONCURRENCY).await;
+    let disagreed = match &searched {
+        Ok((decision, true)) => !batched_fit_holds(&fit_tool, gguf, requested, tuning, draft_head, decision).await,
+        _ => false,
+    };
+    if disagreed {
+        tracing::info!(model = %model.id, "fit probes run together disagreed with probes run alone; searching one probe at a time");
+        searched = search_fit(&fit_tool, model, gguf, requested, tuning, calibrated_micro_batch, draft_head, 1).await;
+    }
+    match searched {
+        Ok((mut decision, _)) => {
+            decision.free_vram_mib = free_vram_mib;
+            tracing::info!(model = %model.id, seconds = started.elapsed().as_secs_f64(), context = decision.context, "fit searched");
+            if let Err(error) = s.storage.lock().await.save_fit_decision(&key, &decision) {
+                tracing::warn!("could not remember the fit: {error}");
+            }
+            apply_fit_decision(&decision, requested, cfg, None);
+            Some(decision.fit)
+        }
+        Err(notes) => {
+            if let Some(policy) = cfg.runtime_policy.as_mut() {
+                policy.notes.extend(notes);
+            }
+            None
+        }
+    }
+}
+
+/// Why the fit is being looked up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FitPurpose {
+    /// A model load: a remembered decision is confirmed with one probe.
+    Load,
+    /// The search ahead of a model's first load: a remembered decision is left
+    /// alone.
+    Prepare,
+}
+
+/// Whether a search that ran probes together holds when checked with probes
+/// run alone. Each probe measures free VRAM with its own GPU context, so
+/// probes running together can only have seen too little: the chosen setting
+/// must give the same fit alone, a smaller context must still be the largest
+/// (the next step does not fit), and a draft head turned off must still cost
+/// layers.
+async fn batched_fit_holds(
+    fit_tool: &std::path::Path,
+    gguf: &std::path::Path,
+    requested: u32,
+    tuning: &crate::settings::RuntimeSettings,
+    draft_head: bool,
+    decision: &crate::runtime_fit::FitDecision,
+) -> bool {
+    use crate::runtime_fit::{fit_combinations, probe, Fit, DEFAULT_MICRO_BATCH};
+    let reserve = if draft_head && !decision.draft_head_dropped { crate::inference::DRAFT_HEAD_RESERVE_MIB } else { 0 };
+    let chosen = probe(fit_tool, gguf, decision.context, &decision.cache, decision.margin + reserve, decision.micro_batch.unwrap_or(DEFAULT_MICRO_BATCH)).await;
+    if chosen.as_ref() != Ok(&decision.fit) {
+        return false;
+    }
+    let combinations = fit_combinations(&tuning.kv_cache);
+    if decision.placement_at_default == "gpu" && decision.context < requested {
+        if let Some((cache, margin)) = combinations.last() {
+            let next = (decision.context + 1024).min(requested);
+            if probe(fit_tool, gguf, next, cache, margin + reserve, DEFAULT_MICRO_BATCH).await == Ok(Fit::AllLayers) {
+                return false;
+            }
+        }
+    }
+    if draft_head && decision.draft_head_dropped {
+        for (cache, margin) in &combinations {
+            if probe(fit_tool, gguf, requested, cache, margin + crate::inference::DRAFT_HEAD_RESERVE_MIB, DEFAULT_MICRO_BATCH).await == Ok(Fit::AllLayers) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// The fit search (see `fit_context_with_runtime`), with probes run up to
+/// `concurrency` at a time where their answers do not depend on each other.
+/// The preferred combination is probed alone first: most models fit with it.
+/// Ok carries the decision and whether any probes ran together; Err the notes
+/// explaining why the runtime's fit was unavailable.
+#[allow(clippy::too_many_arguments)]
+async fn search_fit(
+    fit_tool: &std::path::Path,
+    model: &crate::models::ModelMetadata,
+    gguf: &std::path::Path,
+    requested: u32,
+    tuning: &crate::settings::RuntimeSettings,
+    calibrated_micro_batch: Option<(u32, u32)>,
+    draft_head: bool,
+    concurrency: usize,
+) -> Result<(crate::runtime_fit::FitDecision, bool), Vec<String>> {
+    use crate::runtime_fit::{
+        calibrated_micro_batch_fits, default_micro_batch, fastest_combination, fit_combinations, free_expert_blocks,
+        largest_full_gpu_context, probe_in_order, Fit, FitDecision, ProbeRequest, BALANCED_MICRO_BATCH,
+        DEFAULT_MICRO_BATCH, MICRO_BATCH_NOTE_PREFIX,
+    };
+    let floor = requested.min(4096);
+    let combinations = fit_combinations(&tuning.kv_cache);
+    let unavailable = |error: String| vec![format!("The runtime's memory fit was unavailable ({error}); the estimated plan was used.")];
+    let mut batched = false;
+    let mut note_parts = Vec::new();
+    // The draft head's VRAM is not in llama-fit-params' estimate (llama-server
+    // counts it when it loads): the probes leave that much more free, while
+    // the server keeps the plain margin.
+    let mut draft_reserve = if draft_head { crate::inference::DRAFT_HEAD_RESERVE_MIB } else { 0 };
+    let mut draft_head_dropped = false;
+
+    // Every combination at the requested size, stopping at the first that
+    // keeps every layer on the GPU. With the draft head, first with its
+    // reserve: it stays on only if some combination still keeps every layer
+    // on the GPU at the requested context. Measured on a 27B model at 32K,
+    // where every layer only just fits: with the draft head, 6 layers moved to
+    // the CPU and generation fell from 37.2 to 32.2 tok/s (prose), 66.9 to
+    // 50.4 (rewrites) and 33.9 to 22.0 deep in the context; with every layer
+    // on the GPU and the head as well, the server ran out of memory. At 8K,
+    // with room for it, the head gave +42% prose and +41% rewrites.
+    let all_layers = |result: &Result<Fit, String>| matches!(result, Ok(Fit::AllLayers) | Err(_));
+    let at_requested = loop {
+        let requests: Vec<ProbeRequest> = combinations
+            .iter()
+            .map(|(cache, margin)| ProbeRequest { context: requested, cache, margin_mib: margin + draft_reserve, micro_batch: DEFAULT_MICRO_BATCH })
+            .collect();
+        let mut results = probe_in_order(fit_tool, gguf, &requests[..requests.len().min(1)], 1, all_layers).await;
+        if concurrency > 1 && requests.len() > 1 && !results.iter().any(all_layers) {
+            batched = true;
+        }
+        if !results.iter().any(all_layers) {
+            results.extend(probe_in_order(fit_tool, gguf, &requests[1..], concurrency, all_layers).await);
+        }
+        let mut at_requested = Vec::new();
+        for (combination, result) in combinations.iter().zip(results) {
+            let fit = result.map_err(unavailable)?;
+            at_requested.push((*combination, fit));
+            if fit == Fit::AllLayers {
+                break;
+            }
+        }
+        let head_costs_layers = draft_reserve > 0 && !at_requested.is_empty() && !at_requested.iter().any(|(_, fit)| *fit == Fit::AllLayers);
+        if !head_costs_layers {
+            break at_requested;
+        }
+        draft_reserve = 0;
+        draft_head_dropped = true;
+        note_parts.push(format!(
+            "This model's built-in draft head is off for this load: its extra ~0.9 GB of VRAM would move layers to the CPU at {} tokens, which measured slower on a 27B model at 32K (generation 37.2 → 32.2 tok/s, 33.9 → 22.0 deep in the context). N-gram drafting stays on; a smaller context leaves room for the head.",
+            group_thousands(requested)
+        ));
+    };
+    let best_at_requested = fastest_combination(&at_requested);
+
+    // (context, cache, margin, placement, fit at the default micro-batch)
+    let decision: (u32, &'static str, u32, &'static str, Fit) = match best_at_requested {
+        None => return Err(note_parts),
+        Some(((cache, margin), Fit::AllLayers)) => (requested, cache, margin, "gpu", Fit::AllLayers),
+        Some(((cache, margin), fit)) if tuning.keeps_requested_context() => {
+            note_parts.push(match fit {
+                Fit::ExpertsOnCpu { .. } => format!("Context kept at {requested} tokens as set; the runtime keeps some expert weights of this mixture-of-experts model in RAM, where the CPU runs only the experts each token uses."),
+                Fit::Layers(layers) => format!("Context kept at {requested} tokens as set; at that size the runtime fits {layers} layers on the GPU and runs the rest on the CPU, which is much slower (measured: two layers on the CPU cost an 8B model 28% of its speed)."),
+                Fit::AllLayers => String::new(),
+            });
+            (requested, cache, margin, "hybrid", fit)
+        }
+        Some((fallback, fallback_fit)) => {
+            // Fit mode: the largest context at which some combination keeps
+            // every layer on the GPU, searched with the most permissive one,
+            // then the most headroom that still fits at that size.
+            let permissive = *combinations.last().expect("at least one combination");
+            if concurrency > 1 {
+                batched = true;
+            }
+            let found = largest_full_gpu_context(requested, floor, 1024, concurrency, |contexts: Vec<u32>| {
+                let fit_tool = fit_tool.to_path_buf();
+                let gguf = gguf.to_path_buf();
+                async move {
+                    let requests: Vec<ProbeRequest> = contexts
+                        .iter()
+                        .map(|context| ProbeRequest { context: *context, cache: permissive.0, margin_mib: permissive.1 + draft_reserve, micro_batch: DEFAULT_MICRO_BATCH })
+                        .collect();
+                    probe_in_order(&fit_tool, &gguf, &requests, concurrency, |_| false).await
+                }
+            })
+            .await;
+            match found {
+                Ok(Some(context)) => {
+                    let earlier: Vec<ProbeRequest> = combinations
+                        .iter()
+                        .take_while(|combination| **combination != permissive)
+                        .map(|(cache, margin)| ProbeRequest { context, cache, margin_mib: margin + draft_reserve, micro_batch: DEFAULT_MICRO_BATCH })
+                        .collect();
+                    let results = probe_in_order(fit_tool, gguf, &earlier, concurrency, |result| result == &Ok(Fit::AllLayers)).await;
+                    let chosen = combinations
+                        .iter()
+                        .zip(results)
+                        .find(|(_, result)| result == &Ok(Fit::AllLayers))
+                        .map(|(combination, _)| *combination)
+                        .unwrap_or(permissive);
+                    (context, chosen.0, chosen.1, "gpu", Fit::AllLayers)
+                }
+                // Not even the smallest context keeps every layer on the GPU:
+                // the request stays, with the most on the GPU.
+                Ok(None) => {
+                    if let Fit::Layers(layers) = fallback_fit {
+                        note_parts.push(format!("No setting keeps every layer on the GPU even at {floor} tokens; the runtime fits {layers} layers and runs the rest on the CPU."));
+                    }
+                    (requested, fallback.0, fallback.1, "hybrid", fallback_fit)
+                }
+                Err(error) => return Err(unavailable(error)),
+            }
+        }
+    };
+    let (context, cache, margin, placement_at_default, fit_at_default) = decision;
+
+    // The micro-batch, on the combination just chosen. A placement with
+    // nothing on the GPU keeps the runtime's (512 measured best on the CPU).
+    // The calibrated size and 1,024 are probed together when both are needed.
+    let rule = "the speed rule: at most 5% of generation given up, for at least 5x as much prompt reading gained";
+    let (micro_batch, fit, micro_batch_note) = if !fit_at_default.uses_gpu() {
+        (None, fit_at_default, None)
+    } else {
+        let calibrated_size = calibrated_micro_batch.filter(|(size, _)| *size > 0 && *size != DEFAULT_MICRO_BATCH);
+        let mut sizes = Vec::new();
+        if let Some((size, _)) = calibrated_size {
+            sizes.push(size);
+        }
+        // A calibrated 512 is the default itself and needs no probe at 1,024.
+        let calibrated_default = matches!(calibrated_micro_batch, Some((size, _)) if size == DEFAULT_MICRO_BATCH);
+        if !calibrated_default && !sizes.contains(&BALANCED_MICRO_BATCH) {
+            sizes.push(BALANCED_MICRO_BATCH);
+        }
+        let requests: Vec<ProbeRequest> = sizes
+            .iter()
+            .map(|size| ProbeRequest { context, cache, margin_mib: margin + draft_reserve, micro_batch: *size })
+            .collect();
+        if concurrency > 1 && requests.len() > 1 {
+            batched = true;
+        }
+        let fits_at: Vec<(u32, Option<Fit>)> = sizes
+            .iter()
+            .copied()
+            .zip(probe_in_order(fit_tool, gguf, &requests, concurrency, |_| false).await.into_iter().map(Result::ok))
+            .collect();
+        let fit_at = |size: u32| fits_at.iter().find(|(probed, _)| *probed == size).and_then(|(_, fit)| *fit);
+        let mut calibration_set_aside = None;
+        let calibrated = match calibrated_micro_batch.filter(|(size, _)| *size > 0) {
+            Some((size, _)) if size == DEFAULT_MICRO_BATCH => Some((size, fit_at_default)),
+            Some((size, measured_extra_blocks)) => match fit_at(size) {
+                Some(at_size) if calibrated_micro_batch_fits(fit_at_default, at_size, measured_extra_blocks) => Some((size, at_size)),
+                _ => {
+                    calibration_set_aside = Some(size);
+                    None
+                }
+            },
+            None => None,
+        };
+        match calibrated {
+            Some((size, at_size)) => (
+                Some(size),
+                at_size,
+                Some(format!(
+                    "{}{} tokens while reading prompts, from this model's calibration: each size was measured on this machine with its own placement and this one chosen by {rule}.",
+                    MICRO_BATCH_NOTE_PREFIX,
+                    group_thousands(size)
+                )),
+            ),
+            None => {
+                let at_balanced = fit_at(BALANCED_MICRO_BATCH);
+                let size = default_micro_batch(fit_at_default, at_balanced, model.block_count);
+                let at_size = if size == BALANCED_MICRO_BATCH { at_balanced.unwrap_or(fit_at_default) } else { fit_at_default };
+                let reason = match (size == BALANCED_MICRO_BATCH, at_size) {
+                    (true, Fit::AllLayers) => "every layer still fits on the GPU at that size, so prompts are read in larger steps at no cost to generation, which does not use the micro-batch.".to_string(),
+                    (true, Fit::ExpertsOnCpu { blocks, .. }) if at_size == fit_at_default || matches!(fit_at_default, Fit::ExpertsOnCpu { blocks: default_blocks, .. } if default_blocks == blocks) => {
+                        "the GPU keeps the same layers and expert weights at that size, so prompts are read in larger steps at no cost to generation.".to_string()
+                    }
+                    (true, Fit::ExpertsOnCpu { .. }) => format!(
+                        "its larger compute buffer moves the experts of at most {} more block(s) to RAM, which {rule} allows (measured on a mixture-of-experts model: one more block cost 2.1% of generation for 46% faster prompt reading).",
+                        free_expert_blocks(model.block_count)
+                    ),
+                    (true, Fit::Layers(layers)) => format!("the GPU keeps the same {layers} layers at that size, so prompts are read in larger steps at no cost to generation."),
+                    (false, _) if at_balanced.is_none() => "the runtime's default; the fit at 1,024 could not be measured.".to_string(),
+                    (false, _) => format!("the runtime's default; 1,024 would move more of this model off the GPU than {rule} allows (a whole layer costs about 8% of generation, an expert block 2-5%)."),
+                };
+                let set_aside = calibration_set_aside
+                    .map(|calibrated| format!(" This model's calibration chose {}, but at this load's context and cache that size would move more of the model off the GPU than the calibration measured (or could not be checked), so the default rule decided.", group_thousands(calibrated)))
+                    .unwrap_or_default();
+                (
+                    Some(size),
+                    at_size,
+                    Some(format!("{}{} tokens while reading prompts: {reason}{set_aside}", MICRO_BATCH_NOTE_PREFIX, group_thousands(size))),
+                )
+            }
+        }
+    };
+    // The class of placement can change with the micro-batch (a calibrated
+    // size may keep some expert tensors in RAM that 512 keeps on the GPU).
+    let placement = if fit == fit_at_default {
+        placement_at_default
+    } else if fit == Fit::AllLayers {
+        "gpu"
+    } else {
+        "hybrid"
+    };
+    if placement_at_default == "gpu" && placement == "hybrid" {
+        note_parts.push("Every layer fits on the GPU at the runtime's default micro-batch; the chosen micro-batch keeps some of the model in RAM, a trade measured for this model.".to_string());
+    }
+    Ok((
+        FitDecision {
+            requested,
+            context,
+            cache: cache.to_string(),
+            margin,
+            micro_batch,
+            fit,
+            placement: placement.to_string(),
+            placement_at_default: placement_at_default.to_string(),
+            draft_head_dropped,
+            notes: note_parts,
+            micro_batch_note,
+            free_vram_mib: None,
+        },
+        batched,
+    ))
+}
+
+/// Write a fit decision, searched now or remembered, into the load's
+/// configuration and its explanation. `confirmed_in` is how long the one probe
+/// took when the decision was remembered.
+fn apply_fit_decision(
+    decision: &crate::runtime_fit::FitDecision,
+    requested: u32,
+    cfg: &mut InferenceConfig,
+    confirmed_in: Option<std::time::Duration>,
+) {
+    if decision.draft_head_dropped && cfg.speculative == crate::inference::DRAFT_HEAD_SPECULATIVE {
+        cfg.speculative = crate::inference::default_speculative();
+        cfg.spec_draft_n_max = None;
+        if let Some(policy) = cfg.runtime_policy.as_mut() {
+            policy.speculative = cfg.speculative.clone();
+            policy.spec_draft_n_max = None;
+            policy.notes.retain(|note| !note.starts_with("This model carries a built-in draft head"));
+        }
+    }
+    let mut note_parts = decision.notes.clone();
+    let (context, cache, margin, placement) = (decision.context, decision.cache.as_str(), decision.margin, decision.placement.as_str());
+    let estimated = cfg.n_ctx;
+    cfg.n_ctx = context;
+    cfg.kv_cache_type_k = cache.to_string();
+    cfg.kv_cache_type_v = cache.to_string();
+    cfg.fit_target_mib = Some(margin);
+    cfg.micro_batch = decision.micro_batch;
+    let headroom = if margin < 1024 {
+        format!(" and {margin} MiB of VRAM left free (the runtime's default leaves 1024; less headroom was measured to put more of the model on the GPU)")
+    } else {
+        String::new()
+    };
+    if placement == "gpu" {
+        note_parts.push(if context == requested {
+            format!("Every layer fits on the GPU at the full {context}-token context with a {cache} cache{headroom}, measured by the runtime's own memory fit.")
+        } else {
+            format!(
+                "Context set to {context} tokens with a {cache} cache{headroom}: the largest size at which every layer stays on the GPU, measured by the runtime's own memory fit (the header estimate allowed {estimated}). The saved preference is unchanged; a smaller model or quantization allows more."
+            )
+        });
+    } else if !headroom.is_empty() || cache != "f16" {
+        note_parts.push(format!("Cache {cache}{headroom}: the combination that puts the most of this model on the GPU."));
+    }
+    if let Some(elapsed) = confirmed_in {
+        note_parts.push(format!(
+            "This placement was found by an earlier fit search for this model on this machine and confirmed with one check at load ({:.1} s) instead of searching again.",
+            elapsed.as_secs_f64()
+        ));
+    }
+    if let Some(policy) = cfg.runtime_policy.as_mut() {
+        policy.effective_context = context;
+        policy.cache_type_k = cache.to_string();
+        policy.cache_type_v = cache.to_string();
+        policy.placement = placement.to_string();
+        let fitted_note = note_parts.join(" ");
+        if (context < requested || placement != "gpu") && !fitted_note.is_empty() {
+            policy.context_note = Some(fitted_note.clone());
+        } else {
+            policy.context_note = None;
+        }
+        // Replace the estimate's explanation rather than contradict it.
+        policy.notes.retain(|note| !note.starts_with("Context reduced") && !note.starts_with("Context kept at") && !note.starts_with("The weights ("));
+        if !fitted_note.is_empty() {
+            policy.notes.push(fitted_note);
+        }
+        policy.notes.extend(decision.micro_batch_note.clone());
+    }
+}
+
+/// The load configuration from settings, before the runtime policy and the
+/// fit adjust it. Shared by loads and the fit search ahead of a first load.
+fn base_inference_config(
+    settings: &AppSettings,
+    model: Option<&crate::models::ModelMetadata>,
+    gguf: PathBuf,
+    n_ctx: Option<u32>,
+    n_gpu_layers: Option<i32>,
+    n_threads: Option<u32>,
+) -> InferenceConfig {
+    let projector_path = model
+        .and_then(|m| m.projector_file.as_ref().map(|p| m.dir.join(p)))
+        .filter(|p| p.is_file());
+    InferenceConfig {
+        model_path: gguf,
+        projector_path,
+        n_ctx: n_ctx.unwrap_or(settings.inference.context_size),
+        n_batch: settings.inference.batch_size,
+        n_threads: n_threads.unwrap_or(settings.hardware.cpu_threads),
+        n_threads_batch: settings.hardware.threads_batch,
+        poll: settings.hardware.poll,
+        priority: settings.hardware.priority,
+        n_gpu_layers: n_gpu_layers.unwrap_or(settings.hardware.gpu_layers),
+        flash_attn: settings.hardware.flash_attention,
+        kv_cache_gpu: settings.hardware.kv_cache_gpu,
+        temperature: settings.inference.temperature,
+        top_p: settings.inference.top_p,
+        top_k: settings.inference.top_k,
+        repeat_penalty: settings.inference.repeat_penalty,
+        seed: None,
+        // A template that refuses a system turn or demands strict alternation
+        // has to be respected in every request this model serves, or it
+        // answers 400 to all of them.
+        chat_template: model.map(|m| m.chat_template).unwrap_or_default(),
+        ..InferenceConfig::default()
+    }
+}
+
+/// The calibrated micro-batch and the extra expert blocks its calibration
+/// measured, when the latest calibration still describes this machine.
+fn calibrated_micro_batch_of(calibration: Option<&(crate::calibration::Calibration, bool)>) -> Option<(u32, u32)> {
+    calibration
+        .filter(|(_, comparable)| *comparable)
+        .and_then(|(latest, _)| latest.micro_batch.map(|size| (size, crate::calibration::measured_extra_blocks(&latest.micro_batches, size))))
+}
+
+/// The fit search ahead of each model's first load (owner decision
+/// 2026-09-17). It runs while no model is loaded, so the VRAM it measures is
+/// what a load will have, and it is cancelled the moment a load or a
+/// calibration starts.
+#[derive(Default)]
+pub struct FitPreparation {
+    running: std::sync::atomic::AtomicBool,
+    rerun: std::sync::atomic::AtomicBool,
+    searching: std::sync::atomic::AtomicBool,
+    generation: std::sync::atomic::AtomicU64,
+    cancelled: tokio::sync::Notify,
+}
+
+impl FitPreparation {
+    /// Stop a search in progress; returns once its probes have been dropped
+    /// (at most about two seconds).
+    pub async fn cancel(&self) {
+        use std::sync::atomic::Ordering;
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.cancelled.notify_waiters();
+        for _ in 0..100 {
+            if !self.searching.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+}
+
+/// Start the fit search ahead of first loads after `delay`, or have the one
+/// running go over the models again when it ends. Triggered at startup, when
+/// models are added, when settings that decide the fit change, after an
+/// unload and after a calibration.
+pub fn spawn_fit_preparation(s: &AppState, delay: std::time::Duration) {
+    use std::sync::atomic::Ordering;
+    if cfg!(test) {
+        return;
+    }
+    let preparation = s.fit_preparation.clone();
+    if preparation.running.swap(true, Ordering::SeqCst) {
+        preparation.rerun.store(true, Ordering::SeqCst);
+        return;
+    }
+    let s = s.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        loop {
+            preparation.rerun.store(false, Ordering::SeqCst);
+            prepare_fits(&s).await;
+            if preparation.rerun.load(Ordering::SeqCst) {
+                continue;
+            }
+            preparation.running.store(false, Ordering::SeqCst);
+            // A trigger that arrived after the last check but before the
+            // flag was cleared would otherwise be lost.
+            if !(preparation.rerun.load(Ordering::SeqCst) && !preparation.running.swap(true, Ordering::SeqCst)) {
+                break;
+            }
+        }
+    });
+}
+
+async fn prepare_fits(s: &AppState) {
+    use std::sync::atomic::Ordering;
+    let settings = s.settings.read().await.clone();
+    if !settings.runtime_auto {
+        return;
+    }
+    let Ok(binary) = SidecarBinary::detect(&s.runtime_dir()) else {
+        return;
+    };
+    if crate::calibration::runtime_tool(&binary.0, "llama-fit-params").is_none() || s.llama.write().await.is_running() {
+        return;
+    }
+    if !matches!(binary.devices().await, crate::runtime_selection::Devices::Available) {
+        return;
+    }
+    let mut models = s.models.read().await.list();
+    // The default model first: it is the one most likely loaded next.
+    models.sort_by_key(|model| model.id != settings.general.default_model);
+    let preparation = &s.fit_preparation;
+    for model in models {
+        let gguf = model.gguf_path();
+        if !gguf.is_file() || !model.load_issues.is_empty() {
+            continue;
+        }
+        let generation = preparation.generation.load(Ordering::SeqCst);
+        let cancelled = preparation.cancelled.notified();
+        tokio::pin!(cancelled);
+        cancelled.as_mut().enable();
+        // Something loaded, loading or calibrating holds the GPU: stop; the
+        // next unload or calibration starts the search again.
+        if preparation.generation.load(Ordering::SeqCst) != generation
+            || s.llama.write().await.is_running()
+            || s.runtime_update.try_lock().is_err()
+        {
+            return;
+        }
+        preparation.searching.store(true, Ordering::SeqCst);
+        let outcome = tokio::select! {
+            _ = &mut cancelled => None,
+            prepared = prepare_fit(s, &binary, &settings, &model, &gguf) => Some(prepared),
+        };
+        preparation.searching.store(false, Ordering::SeqCst);
+        match outcome {
+            None => return,
+            Some(Some(summary)) => tracing::info!(model = %model.id, "{summary}"),
+            Some(None) => {}
+        }
+    }
+}
+
+/// One model's fit, built the way its load builds it.
+async fn prepare_fit(
+    s: &AppState,
+    binary: &SidecarBinary,
+    settings: &AppSettings,
+    model: &crate::models::ModelMetadata,
+    gguf: &std::path::Path,
+) -> Option<String> {
+    let mut cfg = base_inference_config(settings, Some(model), gguf.to_path_buf(), None, None, None);
+    let requested_context = cfg.n_ctx;
+    let vram = tokio::task::spawn_blocking(current_vram_state).await.ok().flatten();
+    let ram_available = (hardware::detect().ram.available_gb * 1_073_741_824.0) as u64;
+    let policy = crate::inference::resolve_runtime_policy_for_machine(Some(model), &cfg, true, &settings.runtime, vram, Some(ram_available));
+    policy.apply_to(&mut cfg);
+    let calibration = latest_calibration(s, model, &binary.0).await;
+    let started = std::time::Instant::now();
+    let fit = fit_context_with_runtime(
+        s,
+        FitPurpose::Prepare,
+        &binary.0,
+        model,
+        gguf,
+        requested_context,
+        &settings.runtime,
+        calibrated_micro_batch_of(calibration.as_ref()),
+        vram.as_ref(),
+        &mut cfg,
+    )
+    .await?;
+    Some(format!("fit ready ahead of the first load in {:.1} s: {:?}", started.elapsed().as_secs_f64(), fit))
+}
+
+/// Send a splitter's pieces to the chat stream: prose as `token` events and
+/// into the visible text, actions as `action` events carrying only the tool
+/// name and state.
+fn send_split_pieces(
+    pieces: Vec<crate::stream_split::Piece>,
+    visible: &std::sync::Arc<std::sync::Mutex<String>>,
+    tx: &tokio::sync::mpsc::UnboundedSender<Result<Event, Infallible>>,
+) {
+    use crate::stream_split::Piece;
+    for piece in pieces {
+        let (state, name) = match piece {
+            Piece::Prose(text) => {
+                visible.lock().expect("lock").push_str(&text);
+                let _ = tx.send(Ok(Event::default().event("token").safe_data(text)));
+                continue;
+            }
+            Piece::ActionStarted { name } => ("started", name),
+            Piece::ActionFinished { name } => ("finished", name),
+            Piece::ActionIncomplete { name } => ("incomplete", name),
+        };
+        let _ = tx.send(Ok(Event::default()
+            .event("action")
+            .safe_data(serde_json::json!({"state": state, "name": name}).to_string())));
+    }
+}
+
+/// A round the host rejected (and asks the model to redo) must not stay in
+/// the saved reply: cut the visible text back to where the round began and
+/// tell the client the text it should now show.
+fn discard_round_text(
+    visible: &std::sync::Arc<std::sync::Mutex<String>>,
+    round_start: usize,
+    tx: &tokio::sync::mpsc::UnboundedSender<Result<Event, Infallible>>,
+) {
+    let text = {
+        let mut visible = visible.lock().expect("lock");
+        let keep = round_start.min(visible.len());
+        visible.truncate(keep);
+        visible.clone()
+    };
+    let _ = tx.send(Ok(Event::default().event("replace").safe_data(text)));
+}
+
+/// Remove the oldest saved-history turns until at least `tokens` are freed
+/// (counted at 3 bytes per token, which over- rather than under-frees), never
+/// the leading system turns or the latest user message and anything after it.
+/// Returns how many turns were removed.
+fn drop_oldest_history(turns: &mut Vec<ChatTurn>, tokens: u32) -> usize {
+    let first = turns.iter().take_while(|turn| turn.role == "system").count();
+    let Some(last_user) = turns.iter().rposition(|turn| turn.role == "user") else {
+        return 0;
+    };
+    let mut freed = 0usize;
+    let mut end = first;
+    while end < last_user && freed < tokens as usize {
+        freed += turns[end].content.len().div_ceil(3);
+        end += 1;
+    }
+    // Keep roles alternating from a user turn: a history that would start with
+    // an assistant reply drops that reply too.
+    while end < last_user && turns[end].role != "user" {
+        end += 1;
+    }
+    let removed = end - first;
+    turns.drain(first..end);
+    removed
+}
+
+/// The notice for a requested context the model does not support, or None.
+fn context_limit_notice(model_name: &str, requested: u32, model_limit: u32) -> Option<String> {
+    (model_limit > 0 && requested > model_limit).then(|| {
+        format!(
+            "{model_name} supports at most {} tokens of context. Your context size of {} was reduced to {} for this model; the setting itself is unchanged and applies in full to models that support it.",
+            group_thousands(model_limit),
+            group_thousands(requested),
+            group_thousands(model_limit)
+        )
+    })
+}
+
+fn group_thousands(value: u32) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// Shared sidecar starter used by inference/start and prepare-context (§172).
 /// Includes the vision projector when the model metadata names one (§176).
 async fn start_sidecar(
@@ -780,6 +1685,8 @@ async fn start_sidecar(
     n_threads: Option<u32>,
 ) -> Result<serde_json::Value, ApiError> {
     use crate::llamaserver::RunningSidecar;
+    // The fit search ahead of first loads holds the GPU's memory readings: stop it.
+    s.fit_preparation.cancel().await;
     let _update = s.runtime_update.lock().await;
     guard_agent_running(s, false).await?;
 
@@ -795,36 +1702,43 @@ async fn start_sidecar(
         Some(id) => s.models.read().await.get(id).cloned(),
         None => None,
     };
-    let projector_path = model
+    let mut cfg = base_inference_config(&settings, model.as_ref(), gguf.clone(), n_ctx, n_gpu_layers, n_threads);
+    // A context larger than the model was trained for is capped by the
+    // policy below. That used to be one line among the runtime notes; the
+    // person who asked for the larger window is told at load instead.
+    let context_notice = model
         .as_ref()
-        .and_then(|m| m.projector_file.as_ref().map(|p| m.dir.join(p)))
-        .filter(|p| p.is_file());
-    let mut cfg = InferenceConfig {
-        model_path: gguf.clone(),
-        projector_path,
-        n_ctx: n_ctx.unwrap_or(settings.inference.context_size),
-        n_batch: settings.inference.batch_size,
-        n_threads: n_threads.unwrap_or(settings.hardware.cpu_threads),
-        n_gpu_layers: n_gpu_layers.unwrap_or(settings.hardware.gpu_layers),
-        flash_attn: settings.hardware.flash_attention,
-        kv_cache_gpu: settings.hardware.kv_cache_gpu,
-        temperature: settings.inference.temperature,
-        top_p: settings.inference.top_p,
-        top_k: settings.inference.top_k,
-        repeat_penalty: settings.inference.repeat_penalty,
-        seed: None,
-        // A template that refuses a system turn or demands strict alternation
-        // has to be respected in every request this model serves, or it
-        // answers 400 to all of them.
-        chat_template: model.as_ref().map(|m| m.chat_template).unwrap_or_default(),
-        ..InferenceConfig::default()
-    };
-    let binary = match SidecarBinary::detect(&s.models_dir) {
+        .and_then(|m| context_limit_notice(&m.name, cfg.n_ctx, m.context_length));
+    let binary = match SidecarBinary::detect(&s.runtime_dir()) {
         Ok(b) => b,
         Err(e) => {
             s.llama.write().await.last_error = Some(e.to_string());
-            return Err(ApiError::not_found(e.to_string()));
+            // Not a wrong id: the message already says how to build or point at the runtime.
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                e.to_string(),
+                "The model is fine; the app needs its llama.cpp runtime first.",
+            ));
         }
+    };
+    // A file without a chat template: the architecture's built-in format, when
+    // this runtime lists it (see `models::builtin_chat_format`). ChatML is the
+    // runtime's own fallback and needs nothing.
+    let chat_format_notice = match model.as_ref().and_then(|m| m.builtin_chat_format.clone().map(|format| (format, m.architecture.clone()))) {
+        Some((format, _)) if format == "chatml" => None,
+        Some((format, architecture)) => {
+            if binary.builtin_chat_templates().await.iter().any(|name| *name == format) {
+                cfg.builtin_chat_format = Some(format.clone());
+                Some(format!(
+                    "This model file carries no chat template, so llama.cpp's built-in \"{format}\" chat format for the {architecture} architecture is used. The runtime's generic format would leave the model without its own end-of-turn marker, and replies would run on to the output limit."
+                ))
+            } else {
+                Some(format!(
+                    "This model file carries no chat template, and the installed runtime does not list the built-in \"{format}\" format for the {architecture} architecture, so its generic format is used: replies may be garbled or run on. Rebuilding the runtime with scripts/build-runtime usually adds it."
+                ))
+            }
+        }
+        None => None,
     };
 
     // Stop any previous sidecar before starting (§15 switch semantics).
@@ -842,6 +1756,7 @@ async fn start_sidecar(
         None
     };
     let ram_available = (hardware::detect().ram.available_gb * 1_073_741_824.0) as u64;
+    let requested_context = cfg.n_ctx;
     let policy = crate::inference::resolve_runtime_policy_for_machine(
         model.as_ref(),
         &cfg,
@@ -856,6 +1771,105 @@ async fn start_sidecar(
     } else {
         crate::runtime_selection::Devices::Unknown
     };
+    let runtime_fit_applies = settings.runtime_auto && matches!(devices, crate::runtime_selection::Devices::Available);
+    // This model's latest calibration and whether it still describes this
+    // machine. The Fastest/Balanced/Light profiles and, when the runtime's fit
+    // runs, the measured micro-batch come from it; Manual never reads it.
+    // Looked up once: checking the environment starts the runtime to read its
+    // version.
+    let calibration = match model.as_ref() {
+        Some(model) if settings.runtime.profile_name().is_some() || runtime_fit_applies => {
+            latest_calibration(s, model, &binary.0).await
+        }
+        _ => None,
+    };
+    if let (Some(profile), Some(_)) = (settings.runtime.profile_name(), model.as_ref()) {
+        let note = apply_calibrated_profile(profile, calibration.as_ref(), &mut cfg);
+        if let Some(policy) = cfg.runtime_policy.as_mut() {
+            policy.notes.push(note);
+        }
+    }
+    // The fit the load gets, for the prompt-cache sizing below.
+    let mut load_fit: Option<crate::runtime_fit::Fit> = None;
+    if runtime_fit_applies {
+        if let Some(model) = model.as_ref() {
+            let fit = fit_context_with_runtime(
+                s,
+                FitPurpose::Load,
+                &binary.0,
+                model,
+                &gguf,
+                requested_context,
+                &settings.runtime,
+                calibrated_micro_batch_of(calibration.as_ref()),
+                vram.as_ref(),
+                &mut cfg,
+            )
+            .await;
+            load_fit = fit;
+            // Shorter n-gram drafts when weights stay in RAM (see
+            // `runtime_fit::ngram_draft_length`).
+            if let Some(length) = fit.and_then(|fit| crate::runtime_fit::ngram_draft_length(fit, &cfg.speculative)) {
+                cfg.spec_ngram_length = Some(length);
+                if let Some(policy) = cfg.runtime_policy.as_mut() {
+                    policy.notes.push(format!(
+                        "{} of at most {length} tokens: with part of the model in RAM, a rejected long draft costs a verification step on the CPU (measured on a mixture-of-experts model: file rewrites 42% faster than the runtime's default of 48, prose unchanged). Models fully on the GPU keep the default, which measured marginally faster there.",
+                        crate::runtime_fit::NGRAM_LENGTH_NOTE_PREFIX
+                    ));
+                }
+            }
+            // Load without mmap when the placement keeps weights in RAM while
+            // using the GPU, RAM has room for the copy (see
+            // `runtime_fit::load_without_mmap`), and this runtime knows the
+            // argument. Start time measured: +0.1 s on a 5.5 s load.
+            let file_bytes = crate::models::model_set_bytes(&gguf);
+            if let Some(fit) = fit.filter(|fit| crate::runtime_fit::load_without_mmap(*fit, ram_available, file_bytes)) {
+                if binary.supports_argument("--load-mode").await {
+                    cfg.load_without_mmap = true;
+                    if let Some(policy) = cfg.runtime_policy.as_mut() {
+                        policy.notes.push(format!(
+                            "{}: the runtime is asked to read the {} that stay in RAM into pinned memory instead of mapping them from the {:.1} GB file, so the GPU copies them faster while reading prompts (measured on a mixture-of-experts model: about 48% faster prompt reading at the same generation speed, 0.1 s longer start). Free RAM ({:.1} GB) holds the copy with at least 4 GB to spare. If pinned memory cannot be allocated the runtime uses ordinary memory.",
+                            crate::runtime_fit::LOAD_MODE_NOTE_PREFIX,
+                            match fit {
+                                crate::runtime_fit::Fit::ExpertsOnCpu { .. } => "expert weights",
+                                _ => "layers",
+                            },
+                            file_bytes as f64 / 1e9,
+                            ram_available as f64 / 1e9
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    // The server keeps up to 8 GiB of conversations in RAM by default. Size it
+    // from the RAM left after the model memory that lives there.
+    if let Some(model) = model.as_ref() {
+        let weights = model.weights_bytes.unwrap_or(0);
+        let cache = model
+            .kv_bytes_per_token
+            .unwrap_or(0)
+            .saturating_mul(u64::from(cfg.n_ctx));
+        let placement = cfg.runtime_policy.as_ref().map(|p| p.placement.clone()).unwrap_or_default();
+        let ram_side = match (placement.as_str(), load_fit) {
+            ("gpu", _) => 0,
+            // The weights the runtime's fit keeps in RAM (mapped or pinned
+            // alike), estimated from the placement, and the cache.
+            ("hybrid", Some(fit)) => crate::runtime_fit::weights_in_ram_bytes(fit, weights, model.block_count) + cache,
+            // Without the runtime's fit: half the weights and the cache.
+            ("hybrid", None) => weights / 2 + cache,
+            _ => weights + cache,
+        };
+        let mib = crate::inference::prompt_cache_ram_mib(ram_available, ram_side);
+        cfg.cache_ram_mib = Some(mib);
+        if let Some(policy) = cfg.runtime_policy.as_mut() {
+            policy.notes.push(if mib == 0 {
+                "The RAM prompt cache is off: free RAM is needed for the model itself. Switching conversations re-reads their history.".into()
+            } else {
+                format!("Prompt cache in RAM: up to {mib} MiB (llama.cpp's default is 8192), sized from the free RAM at load so that switching conversations cannot push the model into paging.")
+            });
+        }
+    }
     match crate::runtime_selection::load_with_fallback(
         cfg,
         settings.runtime_auto,
@@ -864,8 +1878,22 @@ async fn start_sidecar(
     )
     .await
     {
-        Ok((sidecar, notice)) => {
+        Ok((mut sidecar, notice)) => {
             let base_url = sidecar.base_url.clone();
+            // What this template can render, as the runtime itself reports it.
+            let caps = match SidecarClient::new(base_url.clone()) {
+                Ok(client) => client.template_caps().await,
+                Err(_) => None,
+            };
+            sidecar.cfg.template_caps = caps;
+            // A new tokenizer: the token estimate relearns its ratio.
+            crate::agent::reset_chars_per_token();
+            if let Some(caps) = caps {
+                let key = crate::calibration::model_key(&sidecar.cfg.model_path);
+                if let Err(error) = s.storage.lock().await.save_template_caps(&key, &caps) {
+                    tracing::warn!("could not remember the template capabilities: {error}");
+                }
+            }
             let cfg = sidecar.cfg.clone();
             s.llama.write().await.running = Some(sidecar);
             s.llama.write().await.last_error = None;
@@ -878,15 +1906,34 @@ async fn start_sidecar(
             }
             tracing::info!(model = ?model_id, url = %base_url, "inference started");
             Ok(
-                serde_json::json!({"started": true, "base_url": base_url, "model": model_id, "notice": notice, "runtime_policy": cfg.runtime_policy}),
+                serde_json::json!({
+                    "started": true,
+                    "base_url": base_url,
+                    "model": model_id,
+                    "notice": notice,
+                    // Everything the person loading the model should be told.
+                    "notices": notice.iter().cloned().chain(context_notice).chain(chat_format_notice).collect::<Vec<String>>(),
+                    "runtime_policy": cfg.runtime_policy,
+                }),
             )
         }
         Err(e) => {
-            let msg = e.to_string();
-            s.llama.write().await.last_error = Some(msg.clone());
-            Err(ApiError::internal(format!(
-                "could not start inference: {msg}"
-            )))
+            // One plain sentence for the person loading; the runtime's log
+            // lines go to the app log, which exported sessions include.
+            let full = e.to_string();
+            let plain = crate::llamaserver::without_runtime_diagnostic(&full)
+                .trim_start_matches("Generation failed: ")
+                .to_string();
+            if plain.len() < full.len() {
+                tracing::warn!("model load failed: {full}");
+            }
+            s.llama.write().await.last_error = Some(plain.clone());
+            Err(ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                // Callers that add their own "failed to load" prefix show it once.
+                plain,
+                "The runtime's own log lines are in the app log, which exported sessions include.",
+            ))
         }
     }
 }
@@ -898,26 +1945,23 @@ async fn inference_stop(State(s): State<AppState>) -> Result<Json<serde_json::Va
     s.llama.write().await.last_error = None;
     s.inference.write().await.unload();
     s.models.write().await.unload_all();
+    // With the GPU free again, models without a fit get one.
+    spawn_fit_preparation(&s, std::time::Duration::from_secs(5));
     Ok(Json(serde_json::json!({"stopped": true})))
 }
 
 /// Re-scan the models directory (§9–§10). Registers new valid entries.
 async fn scan_models(State(s): State<AppState>) -> Json<serde_json::Value> {
     let dir = s.models_dir.clone();
-    let (found, warnings) = crate::models::scan_models_dir(&dir);
-    let mut registered = 0usize;
-    {
-        let mut mm = s.models.write().await;
-        for m in found {
-            if mm.register(m).is_ok() {
-                registered += 1;
-            }
-        }
-    }
+    let (found, mut warnings) = crate::models::scan_models_dir(&dir);
+    let discovered = found.len();
+    let (removed, register_warnings) = s.models.write().await.reconcile(found);
+    let registered = discovered.saturating_sub(register_warnings.len());
+    warnings.extend(register_warnings);
     for w in &warnings {
         tracing::warn!("{w}");
     }
-    Json(serde_json::json!({"registered": registered, "warnings": warnings}))
+    Json(serde_json::json!({"registered": registered, "removed": removed, "warnings": warnings}))
 }
 
 /// Usable VRAM: measured via nvidia-smi when present, else the (stubbed)
@@ -1175,9 +2219,6 @@ async fn cancel_download(
 /// conversation_id is supplied (§20, §83).
 #[derive(Deserialize)]
 struct ChatReq {
-    /// The UI has already obtained a model classification with conversation context.
-    #[serde(default)]
-    classified: bool,
     #[serde(default)]
     conversation_id: String,
     message: String,
@@ -1189,12 +2230,6 @@ struct ChatReq {
     reasoning: Option<bool>,
     #[serde(default)]
     search: Option<bool>,
-}
-
-#[derive(Deserialize)]
-struct ClassifyReq {
-    conversation_id: String,
-    message: String,
 }
 
 /// Everything every model request for one conversation shares: the identity
@@ -1338,35 +2373,45 @@ pub(crate) async fn assemble_request_context_with(
         .as_ref()
         .map(|(_, name, root)| workspace_snapshot(&root.to_string_lossy(), name))
         .unwrap_or_default();
-    let mut sys_prompt = build_system_prompt(&conv.mode, &snapshot, &model_name);
-    sys_prompt.push_str(
-        &st.memory_context(cid, &conv.workspace)
-            .map_err(|error| ApiError::internal(format!("Could not read saved memory: {error}")))?
-            .text,
-    );
-    let budget = history_char_budget(n_ctx, sys_prompt.len());
+    let memory = st
+        .memory_context(cid, &conv.workspace)
+        .map_err(|error| ApiError::internal(format!("Could not read saved memory: {error}")))?
+        .text;
+    let legacy = legacy_prompt_order();
+    let listing = if legacy || snapshot.is_empty() { snapshot.as_str() } else { LISTING_IN_LATEST_MESSAGE };
+    let mut sys_prompt = build_system_prompt(&conv.mode, listing, &model_name);
+    let changing = if legacy {
+        sys_prompt.push_str(&memory);
+        String::new()
+    } else {
+        changing_context_block(&snapshot, &memory)
+    };
+    let budget = history_char_budget(n_ctx, sys_prompt.len() + changing.len());
     let history_chars: usize = history.iter().map(|message| message.content.len()).sum();
     let history_room_chars = history_room_for(budget, &attachments);
-    let mut turns = build_turns_budgeted(&history, &attachments, budget);
+    let (mut turns, turn_ids) = build_turns_with_owners(&history, &attachments, budget);
+    if !changing.is_empty() {
+        match turns.iter_mut().rev().find(|turn| turn.role == "user") {
+            Some(latest) => latest.content.push_str(&changing),
+            None => turns.push(ChatTurn::text("user", changing.trim_start().to_string())),
+        }
+    }
     let mut images_skipped = 0usize;
     if vision_ok && load_images {
-        let mut urls = vec![];
-        for a in attachments.iter().filter(|a| a.kind == "image").take(4) {
-            let p = s.attachments_dir.join(cid).join(&a.filename);
-            match std::fs::read(&p)
-                .map_err(|e| e.to_string())
-                .and_then(|b| crate::vision::prepare_image(&b))
-            {
-                Ok(prep) => urls.push(prep.data_url),
-                Err(e) => {
-                    tracing::warn!("vision prepare failed for {}: {e}", a.filename);
-                    images_skipped += 1;
-                }
-            }
-        }
+        let (urls, skipped) = prepare_conversation_images(&s.attachments_dir, cid, &attachments);
+        images_skipped += skipped;
         if !urls.is_empty() {
-            if let Some(last_user) = turns.iter_mut().rev().find(|t| t.role == "user") {
-                last_user.images = urls;
+            if legacy {
+                if let Some(last_user) = turns.iter_mut().rev().find(|t| t.role == "user") {
+                    last_user.images = urls.into_iter().map(|(_, url)| url).collect();
+                }
+            } else {
+                // Each image on the message it was sent with.
+                for (attachment, url) in urls {
+                    if let Some(index) = attachment_turn(&turns, &turn_ids, &history, attachment) {
+                        turns[index].images.push(url);
+                    }
+                }
             }
         }
     } else {
@@ -1386,100 +2431,6 @@ pub(crate) async fn assemble_request_context_with(
     })
 }
 
-async fn classify_request(
-    State(s): State<AppState>,
-    Json(req): Json<ClassifyReq>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    validate_content(&req.message)?;
-    let _runtime = s.runtime_update.try_lock().map_err(|_| {
-        ApiError::new(
-            StatusCode::CONFLICT,
-            "The model is busy updating or classifying a request.",
-            "Please try again shortly.",
-        )
-    })?;
-    guard_agent_running(&s, false).await?;
-    let runtime = {
-        let mut llama = s.llama.write().await;
-        if llama.is_running() {
-            llama
-                .running
-                .as_ref()
-                .map(|r| (r.base_url.clone(), r.cfg.clone()))
-        } else {
-            None
-        }
-    };
-    let Some((url, cfg)) = runtime else {
-        return Err(ApiError::bad(
-            "No model loaded.",
-            "Load a model before sending a message.",
-        ));
-    };
-    // The routing request is the chat request's prefix plus one instruction
-    // turn, so the reply that follows re-prefills only the instruction.
-    let context = assemble_request_context(
-        &s,
-        Some(req.conversation_id.as_str()),
-        Some(&req.message),
-        cfg.n_ctx,
-    )
-    .await?;
-    let mut turns = vec![ChatTurn::text("system", context.sys_prompt)];
-    turns.extend(context.turns);
-    let turns = crate::request_router::classification_turns_from_prefix(turns);
-    let client = SidecarClient::new(url).map_err(|e| ApiError::internal(e.to_string()))?;
-    // The routing reply is a few tokens; the wait is the prefill of a new
-    // Code session's prefix, which the answer reuses from the cache anyway.
-    // A CPU-only or spilled machine prefills at a tenth of the speed.
-    let on_gpu = cfg
-        .runtime_policy
-        .as_ref()
-        .map(|policy| policy.placement == "gpu")
-        .unwrap_or(true);
-    let routing_wait = std::time::Duration::from_secs(if on_gpu { 60 } else { 240 });
-    let result = tokio::time::timeout(routing_wait, client.classify_request(&turns, &cfg)).await;
-    let decision = match result {
-        Ok(Ok(completion)) => {
-            let decision = crate::request_router::parse_decision(&completion);
-            if decision.is_none() {
-                // Diagnosable from the console: what the model produced and
-                // why it did not count (cut off, thinking, empty).
-                tracing::warn!(
-                    finish = ?completion.finish_reason,
-                    reasoning = completion.reasoning_present,
-                    generated = completion.metrics.generated_tokens,
-                    text = %completion.text.chars().take(300).collect::<String>(),
-                    "request routing: the model's decision could not be read; routing by wording instead"
-                );
-            }
-            decision
-        }
-        Ok(Err(error)) => {
-            tracing::warn!("request routing failed: {error}; routing by wording instead");
-            None
-        }
-        Err(_) => {
-            tracing::warn!(
-                "request routing timed out after {} s; routing by wording instead",
-                routing_wait.as_secs()
-            );
-            None
-        }
-    };
-    // Routing never fails the message: without a model decision the wording
-    // decides, and anything ambiguous is answered as a question.
-    let (intent, source) = match decision {
-        Some(intent) => (intent, "model"),
-        None => (
-            crate::request_router::heuristic_intent(&req.message),
-            "heuristic",
-        ),
-    };
-    Ok(Json(serde_json::json!({ "intent": intent, "source": source })))
-}
-
-
 /// Resolved reasoning mode for one request (§§110–113).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReasoningMode {
@@ -1492,13 +2443,33 @@ enum ReasoningMode {
 
 /// System prompt (§22): identity + capability truth. The model never sees
 /// raw OS access; it sees a workspace and deterministic commands.
+/// The standing instructions for a chat or code session.
+///
+/// They describe only what that session can really do and teach no tool
+/// protocol it does not use. Chat used to carry a complete fenced
+/// `create_document` example on every request: a small model then wrapped an
+/// ordinary answer in an invented tool call 10 times out of 10 ("write a
+/// simple rust program" became `{"name":"rust_program",...}`), and with the
+/// example removed, 0 times out of 10. The identity line also claimed project
+/// access and tool use in chat, where neither exists, and the model offered to
+/// "compile and run it in your project" instead of writing the code. Tool
+/// instructions a request needs are added to that request alone
+/// (`document_tool_note`), which also keeps this prefix byte-stable for the
+/// prompt cache.
 fn build_system_prompt(mode: &str, snapshot: &str, model_name: &str) -> String {
-    let mut p = format!(
-        "You are the Local Companion, a local-first AI assistant running entirely on the user's PC (model: {model_name}). \
-         You are NOT a cloud chatbot: you can see the user's linked project and files described below, and the app can run approved tools for you. \
-         Never claim you cannot interact with the user's project — describe what you can see and what to do next. \
-         Be concise. Format code with fenced blocks."
-    );
+    let mut p = if mode == "code" {
+        format!(
+            "You are the Local Companion, a local-first AI assistant running entirely on the user's PC (model: {model_name}). \
+             You are NOT a cloud chatbot: you can see the user's linked project and files described below, and the app can run approved tools for you. \
+             Never claim you cannot interact with the user's project — describe what you can see and what to do next. \
+             Be concise. Format code with fenced blocks."
+        )
+    } else {
+        format!(
+            "You are the Local Companion, a local-first AI assistant running entirely on the user's PC (model: {model_name}). \
+             Be concise. Format code with fenced blocks."
+        )
+    };
     if mode == "code" {
         if snapshot.is_empty() {
             p.push_str("\n\n[Code session: no project linked yet. Ask the user to link a project directory, then offer /init to inspect it.]");
@@ -1531,20 +2502,131 @@ fn build_system_prompt(mode: &str, snapshot: &str, model_name: &str) -> String {
                  do not inspect unrelated siblings just because they appear in the tree.\n\
                  Writes, edits, builds, commits and commands need approval: do NOT emit those tools here; \
                  instead tell the user which command runs them: /init (inspect), /review [path], /plan <task>, \
-                 /build, /test [filter], /run <cmd>, /diff. \
-                 One exception: when the user asks for a document, spreadsheet, presentation or PDF about the project, gather what it needs with reads, then produce the file with create_document (pasting slide or document text into the chat does not fulfil such a request), e.g. \
-                 {{\"name\":\"create_document\",\"args\":{{\"filename\":\"overview.pptx\",\"title\":\"Project overview\",\"slides\":[{{\"title\":\"Scope\",\"bullets\":[\"…\"]}}]}}}} \
-                 (xlsx = sheets[{{name,rows}}]; docx and pdf = title + paragraphs[]; md/txt = text; csv = rows). It lands in the Artifacts panel, never in the project."
+                 /build, /test [filter], /run <cmd>, /diff."
             ));
         }
     } else {
-        p.push_str("\n\n[Chat session: general assistant. Attached files appear as excerpts. Web search happens only when the user enables it.]\n\
-             When the user asks for a document, spreadsheet, presentation or PDF, produce the file: emit exactly one tool call and wait for its result. Use this complete format with fence markers on separate lines:\n\
-             ```tool\n{\"name\":\"create_document\",\"args\":{\"filename\":\"report.xlsx\",\"sheets\":[{\"name\":\"Data\",\"rows\":[[\"Item\",\"Amount\"],[\"Example\",1]]}]}}\n```\n\
-             Spec by file type: xlsx = sheets[{name,rows}]; docx and pdf = title + paragraphs[] (plain paragraphs); pptx = title + slides[{title,bullets[]}]; md/txt = text; csv = rows; html = title + html; json = data. \
-             Put the complete content in the spec, never placeholders. The file appears in the conversation's Artifacts panel with Open and Save; after the result, tell the user it is ready and summarise what it contains. Answer in the chat unless a file was asked for.");
+        p.push_str("\n\n[Chat session: general assistant. Attached files appear as excerpts. Web search happens only when the user enables it.]");
     }
     p
+}
+
+/// Document kinds a model without tool support can still produce: it writes
+/// the file's content as its reply and the host saves it (owner decision,
+/// 2026-09-16). Structured kinds need the create_document tool's spec.
+const PLAIN_DOCUMENT_KINDS: &[&str] = &["txt", "md", "csv", "html", "json"];
+
+fn plain_document_note(kind: &str) -> String {
+    format!("\n\n[The user asked for a .{kind} file. Reply with only the complete content of that file: no introduction, no explanation and no code fence around it. The app saves your reply as the file.]")
+}
+
+fn structured_document_notice(kind: &str) -> String {
+    format!("This model can't create .{kind} files: its chat template has no tool support, which that file type needs. It can still create plain-text documents (.txt, .md, .csv, .html or .json); ask for one of those, or load a model that supports tools.\n\n")
+}
+
+/// A plain document reply's content: the inside of one surrounding code
+/// fence when the model added one anyway.
+fn plain_document_body(reply: &str) -> String {
+    let text = reply.trim();
+    if let Some(rest) = text.strip_prefix("```") {
+        if let Some(newline) = rest.find('\n') {
+            if let Some(inner) = rest[newline + 1..].trim_end().strip_suffix("```") {
+                return inner.trim_end().to_string();
+            }
+        }
+    }
+    text.to_string()
+}
+
+/// A file name from the words of the request, without the request's verbs.
+fn plain_document_filename(message: &str, kind: &str) -> String {
+    const SKIP: &[&str] = &[
+        "write", "create", "make", "generate", "give", "please", "file", "document", "the", "and",
+        "for", "with", "about", "into", "that", "this", "markdown", "text", "csv", "html", "json", "txt",
+        "can", "you", "new",
+    ];
+    let words: Vec<String> = message
+        .split(|c: char| !c.is_alphanumeric())
+        .map(str::to_lowercase)
+        .filter(|word| word.len() > 2 && !SKIP.contains(&word.as_str()))
+        .take(4)
+        .collect();
+    let stem = if words.is_empty() { "document".to_string() } else { words.join("-") };
+    format!("{stem}.{kind}")
+}
+
+/// The document tool, offered only on a request that asks for a document.
+/// Added to that request's user turn rather than the standing instructions:
+/// a model shown a tool it has no use for reaches for it anyway.
+fn document_tool_note() -> &'static str {
+    "\n\n[This request asks for a file. Produce it with exactly one tool call and wait for its result, in this complete format with the fence markers on separate lines:\n\
+     ```tool\n{\"name\":\"create_document\",\"args\":{\"filename\":\"report.xlsx\",\"sheets\":[{\"name\":\"Data\",\"rows\":[[\"Item\",\"Amount\"],[\"Example\",1]]}]}}\n```\n\
+     Spec by file type: xlsx = sheets[{name,rows}]; docx and pdf = title + paragraphs[] (plain paragraphs); pptx = title + slides[{title,bullets[]}]; md/txt = text; csv = rows; html = title + html; json = data. \
+     Put the complete content in the spec, never placeholders. The file appears in the conversation's Artifacts panel; after the result, tell the user it is ready and summarise what it contains.]"
+}
+
+/// The tools one chat request offers the model. Only an offered tool may run,
+/// end the stream early, or earn a correction when its call is unreadable:
+/// anything else a model writes in a tool fence is its answer text.
+#[derive(Debug, Clone, Default)]
+struct ChatToolOffer {
+    names: Vec<&'static str>,
+}
+
+impl ChatToolOffer {
+    fn for_request(has_workspace: bool, document_requested: bool) -> Self {
+        let mut names = Vec::new();
+        if has_workspace {
+            names.extend([
+                "list_directory",
+                "read_file",
+                "search_text",
+                "system_info",
+                "list_processes",
+                "manage_context",
+            ]);
+        }
+        if document_requested {
+            names.push("create_document");
+        }
+        Self { names }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    fn offers(&self, name: &str) -> bool {
+        self.names.iter().any(|offered| *offered == name)
+    }
+
+    /// The offered call in `text`, if the text holds one.
+    fn call_in(&self, text: &str) -> Option<crate::agent_runner::ToolCall> {
+        crate::agent_runner::parse_tool_block(text).filter(|call| self.offers(&call.name))
+    }
+
+    /// Whether an unreadable action in `text` was an attempt at an offered
+    /// tool, judged by the name it gives when that much is legible. With
+    /// nothing offered there is nothing to correct toward.
+    fn attempted_in(&self, text: &str) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+        match tool_name_in(text) {
+            Some(name) => self.offers(&name),
+            None => true,
+        }
+    }
+}
+
+/// The tool name an action block gives, read leniently so a call whose JSON
+/// is broken elsewhere still says which tool it meant.
+fn tool_name_in(text: &str) -> Option<String> {
+    let at = text.find("\"name\"")?;
+    let rest = text[at + "\"name\"".len()..].trim_start().strip_prefix(':')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
 }
 
 /// Capped project snapshot for code-mode chats: tree + build + instructions.
@@ -1717,6 +2799,7 @@ async fn run_chat_tool_round(
     s: &AppState,
     conv: &Option<String>,
     chat_ws: &Option<(String, String, std::path::PathBuf)>,
+    offer: &ChatToolOffer,
     round_text: &str,
     turns: &mut Vec<ChatTurn>,
     memory: &mut crate::inspection_context::InspectionContext,
@@ -1731,14 +2814,20 @@ async fn run_chat_tool_round(
     let status = |msg: &str| {
         let _ = tx_status.send(Ok(Event::default().event("status").safe_data(msg.to_string())));
     };
-    // Documents render into the app's artifacts folder, so they need no
-    // linked project; every other chat tool inspects the workspace.
-    let is_document = call.name == "create_document";
     let ws_path = chat_ws.as_ref().map(|(_, _, path)| path.clone());
-    if !is_document && ws_path.is_none() {
+    let is_document = call.name == "create_document";
+    let offered = offer.offers(&call.name);
+    // What a request did not offer is not an action. The one exception is a
+    // real tool a code session withholds (a write, a command): the model is
+    // told it needs approval, or it keeps asking. A tool name nothing in the
+    // registry answers to, or any call in plain chat, is the model's text.
+    let withheld = !offered
+        && ws_path.is_some()
+        && crate::tools::registry().iter().any(|tool| tool.name == call.name);
+    if !offered && !withheld {
         return false;
     }
-    if call.name != "manage_context" && !crate::tools::chat_safe(&call.name) {
+    if withheld || (call.name != "manage_context" && !crate::tools::chat_safe(&call.name)) {
         emit_chat_activity(s, message_id, tx_status, crate::agent::AgentEvent::tool_activity(
             "tool_error", AgentState::Observing, "This action was not run. Ask mode only permits safe inspection; choose Agent to request changes.".into(),
             iteration, call.name.clone(), call.args.clone(), None, None,
@@ -2101,11 +3190,7 @@ async fn chat_sse(
             "Wait for the model to finish loading, then send your message.",
         )
     })?;
-    let intent = if req.classified {
-        MessageIntent::Task
-    } else {
-        message_intent(&req.message)
-    };
+    let intent = answering_intent(&s, conv_id.as_deref().unwrap_or_default(), &req.message).await;
     if matches!(
         intent,
         MessageIntent::Acknowledgement | MessageIntent::Greeting
@@ -2296,7 +3381,11 @@ async fn chat_sse(
     let bg_persisted = persisted.clone();
     let bg_tracker = s.generations.clone();
     let handle = tokio::spawn(async move {
+        // `full_cb` is what the user sees and what is saved (and what Stop
+        // keeps): prose only. `raw_cb` is every round's text as generated,
+        // which is what actions are parsed from.
         let full_cb = bg_partial.clone();
+        let raw_cb = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let tx_tok = tx.clone();
         let tx_status = tx.clone();
         let cancel_cb = bg_cancel.clone();
@@ -2417,21 +3506,46 @@ async fn chat_sse(
         let mut turns = bg_turns;
         turns.insert(0, ChatTurn::text("system", bg_sys));
         if reasoning != ReasoningMode::Off {
-            turns.insert(
-                1,
-                ChatTurn::text(
-                    "system",
-                    reasoning_preface(
-                        &settings.reasoning.budget,
-                        reasoning == ReasoningMode::Native,
-                    ),
-                ),
-            );
+            let preface = reasoning_preface(&settings.reasoning.budget, reasoning == ReasoningMode::Native);
+            if legacy_prompt_order() {
+                turns.insert(1, ChatTurn::text("system", preface));
+            } else if let Some(latest) = turns.iter_mut().rev().find(|t| t.role == "user") {
+                // After the history: turning Reasoning on or off no longer
+                // changes the bytes in front of every earlier turn.
+                latest.content.push_str(&format!("\n\n{preface}"));
+            }
         }
         if !web_block.is_empty() {
             if let Some(last_user) = turns.iter_mut().rev().find(|t| t.role == "user") {
                 last_user.content.push_str(&web_block);
             }
+        }
+        // A request for a file is only fulfilled by a file: one correction for
+        // an unreadable tool call and one nudge to produce the document, so a
+        // small model that pastes the content into the chat still delivers.
+        let requested_kind = crate::documents::requested_document_kind(&req.message);
+        let tools_supported = cfg
+            .template_caps
+            .map(|caps| caps.tools_supported())
+            .unwrap_or_default();
+        // A model whose template has no tool support is never taught a tool:
+        // a plain-text document comes from its reply, a structured one is
+        // declined plainly.
+        let no_tools = tools_supported == crate::inference::Support::No;
+        let plain_document = requested_kind.filter(|kind| no_tools && PLAIN_DOCUMENT_KINDS.contains(kind));
+        let declined_document = requested_kind.filter(|kind| no_tools && !PLAIN_DOCUMENT_KINDS.contains(kind));
+        let document_requested = requested_kind.is_some() && !no_tools;
+        if let Some(last_user) = turns.iter_mut().rev().find(|t| t.role == "user") {
+            if document_requested {
+                last_user.content.push_str(document_tool_note());
+            } else if let Some(kind) = plain_document {
+                last_user.content.push_str(&plain_document_note(kind));
+            } else if let Some(kind) = declined_document {
+                last_user.content.push_str(&format!("\n\n[This model cannot create .{kind} files and the user has already been told. Answer the rest of the request in plain text; do not paste a file.]"));
+            }
+        }
+        if let Some(kind) = declined_document {
+            send_split_pieces(vec![crate::stream_split::Piece::Prose(structured_document_notice(kind))], &full_cb, &tx_tok);
         }
         let reasoning_label = match reasoning {
             ReasoningMode::Off => "off",
@@ -2513,16 +3627,30 @@ async fn chat_sse(
         let mut truncated = false;
         let mut reasoning_seen = false;
         let mut failed: Option<String> = None;
-        // A request for a file is only fulfilled by a file: one correction for
-        // an unreadable tool call and one nudge to produce the document, so a
-        // small model that pastes the content into the chat still delivers.
-        let document_requested = crate::documents::requested_document_kind(&req.message).is_some();
+        // A code session's reads do not depend on the template's own tool
+        // support: its system prompt always teaches the app's text envelope,
+        // which the app parses itself (agent runs serve such models with a
+        // structured action format). Measured live: a 4B model whose runtime
+        // reported no tool support asked about a project, issued a correct
+        // read_file call, was refused as "needs approval", and then guessed
+        // the file's contents. Plain chat keeps the gate: there a 2B model
+        // taught a tool wrote broken tool blocks in 10 of 10 replies.
+        let tool_offer = ChatToolOffer::for_request(
+            chat_ws.as_ref().is_some_and(|(_, _, path)| path.is_dir()),
+            document_requested,
+        );
         let artifacts_before = chat_artifact_count(&bg_state, &bg_conv).await;
         let mut document_created = false;
         let mut corrections = 0u32;
         let mut nudges = 0u32;
+        let mut overflow_retried = false;
         let client = match SidecarClient::new(base_url) {
-            Ok(c) => Some(c),
+            Ok(c) => Some(c.with_recorder(request_recorder(
+                &bg_state,
+                bg_conv.as_deref().unwrap_or_default(),
+                &bg_id,
+                "chat",
+            ))),
             Err(e) => {
                 failed = Some(format!("sidecar client failed: {e}"));
                 None
@@ -2563,20 +3691,25 @@ async fn chat_sse(
                 let gen_start = std::time::Instant::now();
                 let round_offset_ms = request_started.elapsed().as_millis() as u64;
                 let full_r = full_cb.clone();
+                let raw_r = raw_cb.clone();
+                let splitter = std::sync::Arc::new(std::sync::Mutex::new(crate::stream_split::StreamSplitter::new()));
+                let splitter_r = splitter.clone();
                 let tx_r = tx_tok.clone();
                 let tx_reason = tx_tok.clone();
                 let tx_phase = tx_status.clone();
                 let round = tool_uses + 1;
                 let cancel_r = cancel_cb.clone();
-                let round_base = full_cb.lock().expect("lock").len();
+                let round_base = raw_cb.lock().expect("lock").len();
+                let visible_base = full_cb.lock().expect("lock").len();
                 // A complete action ends the round wherever a tool can run
                 // (project inspection in code sessions, documents anywhere):
                 // the runtime is released instead of generating text after it.
-                let stop_on_action = chat_ws.is_some() || !code_activity;
+                let stop_offer = tool_offer.clone();
                 let handlers = crate::llamaserver::StreamHandlers {
                     on_token: Box::new(move |tok: &str| {
-                        full_r.lock().expect("lock").push_str(tok);
-                        let _ = tx_r.send(Ok(Event::default().event("token").safe_data(tok.to_string())));
+                        raw_r.lock().expect("lock").push_str(tok);
+                        let pieces = splitter_r.lock().expect("lock").push(tok);
+                        send_split_pieces(pieces, &full_r, &tx_r);
                     }),
                     on_reasoning: Box::new(move |text: &str| {
                         let _ = tx_reason
@@ -2591,15 +3724,18 @@ async fn chat_sse(
                         cancel_r.load(std::sync::atomic::Ordering::SeqCst)
                     }),
                     should_stop: Box::new(move |text: &str| {
-                        stop_on_action
+                        !stop_offer.is_empty()
                             && text.contains("```tool")
-                            && crate::agent_runner::parse_tool_block(text).is_some()
+                            && stop_offer.call_in(text).is_some()
                     }),
                 };
                 let out = client
                     .stream(&turns, max_tokens, &cfg, &request_options, handlers)
                     .await;
                 let gen_ms = gen_start.elapsed().as_millis().max(1) as u64;
+                // Whatever the splitter still held is decided now.
+                let tail = splitter.lock().expect("lock").finish();
+                send_split_pieces(tail, &full_cb, &tx_tok);
                 match out {
                     Ok(outcome) => {
                         let m = &outcome.metrics;
@@ -2610,8 +3746,8 @@ async fn chat_sse(
                         if let Some(round_timing) = m.timing.as_ref() {
                             timing.add_round(round_timing, round_offset_ms);
                         }
-                        let round_text = full_cb.lock().expect("lock")[round_base..].to_string();
-                        let has_tool = crate::agent_runner::parse_tool_block(&round_text).is_some();
+                        let round_text = raw_cb.lock().expect("lock")[round_base..].to_string();
+                        let has_tool = tool_offer.call_in(&round_text).is_some();
                         if outcome.finish_reason.as_deref() == Some("length")
                             && !outcome.early_stopped
                             && !has_tool
@@ -2651,6 +3787,7 @@ async fn chat_sse(
                                 &bg_state,
                                 &bg_conv,
                                 &chat_ws,
+                                &tool_offer,
                                 &round_text,
                                 &mut turns,
                                 &mut inspection_memory,
@@ -2675,11 +3812,17 @@ async fn chat_sse(
                             // The model tried to act but the call could not be
                             // read: say what was wrong and let it re-emit once,
                             // as the agent loop does.
+                            // Only a failed attempt at a tool this request offered
+                            // earns a correction. Asking a model that invented a tool
+                            // to "re-emit the envelope" taught it the answer was a
+                            // tool call, and it repeated the same block.
                             if let Some(problem) =
-                                crate::agent_runner::action_problem(&round_text)
-                                    .filter(|_| corrections == 0)
+                                crate::agent_runner::action_problem(&round_text).filter(|_| {
+                                    corrections == 0 && tool_offer.attempted_in(&round_text)
+                                })
                             {
                                 corrections += 1;
+                                discard_round_text(&full_cb, visible_base, &tx_status);
                                 turns.push(ChatTurn::text("assistant", round_text.clone()));
                                 turns.push(ChatTurn::text(
                                     "user",
@@ -2692,6 +3835,7 @@ async fn chat_sse(
                             }
                             if document_requested && !document_created && nudges == 0 {
                                 nudges += 1;
+                                discard_round_text(&full_cb, visible_base, &tx_status);
                                 turns.push(ChatTurn::text("assistant", round_text.clone()));
                                 turns.push(ChatTurn::text(
                                     "user",
@@ -2706,6 +3850,28 @@ async fn chat_sse(
                         break;
                     }
                     Err(e) => {
+                        // The server measured the prompt and it did not fit:
+                        // nothing was generated, so leaving out the oldest
+                        // saved messages and asking once more repeats no
+                        // visible work. Only before any tool round, whose
+                        // recorded positions would shift.
+                        if let Some(crate::inference::thiserror_stub::SidecarFailure::ContextExceeded {
+                            prompt_tokens,
+                            context,
+                        }) = e.sidecar().cloned()
+                        {
+                            if !overflow_retried && tool_uses == 0 {
+                                overflow_retried = true;
+                                let excess = prompt_tokens.saturating_sub(context).saturating_add(512);
+                                let dropped = drop_oldest_history(&mut turns, excess);
+                                if dropped > 0 {
+                                    let _ = tx_status.send(Ok(Event::default().event("status").safe_data(format!(
+                                        "The conversation did not fit the model's context; leaving out the {dropped} oldest message(s) and trying again…"
+                                    ))));
+                                    continue;
+                                }
+                            }
+                        }
                         failed = Some(e.to_string());
                         break;
                     }
@@ -2733,6 +3899,33 @@ async fn chat_sse(
                 std::sync::atomic::Ordering::SeqCst,
             )
             .is_ok();
+        // A plain-text document from a model without tool support: its reply
+        // is the file.
+        if let (Some(kind), None, false) = (plain_document, failed.as_ref(), bg_cancel.load(std::sync::atomic::Ordering::SeqCst)) {
+            let reply = bg_partial.lock().expect("lock").clone();
+            let body = plain_document_body(&reply);
+            if !body.trim().is_empty() {
+                let filename = plain_document_filename(&req.message, kind);
+                match crate::documents::save_plain_document(
+                    &bg_state.storage,
+                    &bg_state.artifacts_dir,
+                    bg_conv.as_deref().unwrap_or("direct"),
+                    &filename,
+                    kind,
+                    &body,
+                )
+                .await
+                {
+                    Ok(saved) => {
+                        let note = format!("\n\nSaved as {saved} in this conversation's Artifacts panel.");
+                        send_split_pieces(vec![crate::stream_split::Piece::Prose(note)], &full_cb, &tx_tok);
+                    }
+                    Err(error) => {
+                        let _ = tx_status.send(Ok(Event::default().event("status").safe_data(format!("The file could not be saved: {error}"))));
+                    }
+                }
+            }
+        }
         let full = bg_partial.lock().expect("lock").clone();
         // Citations persist with the answer so reloads keep their sources (§121).
         let stored = if cite_block.is_empty() {
@@ -3126,6 +4319,44 @@ pub(crate) fn build_turns_budgeted(
     attachments: &[crate::storage::Attachment],
     max_chars: usize,
 ) -> Vec<ChatTurn> {
+    build_turns_with_owners(history, attachments, max_chars).0
+}
+
+/// The history turns within budget and, for each, the id of the saved message
+/// it came from (for placing images on their own messages).
+/// The conversation's most recent images (at most four; attachments are
+/// stored oldest first), prepared for the model, each with its attachment.
+/// Shared by chat and agent runs. The count is images that could not be
+/// prepared.
+pub(crate) fn prepare_conversation_images<'a>(
+    attachments_dir: &std::path::Path,
+    conversation_id: &str,
+    attachments: &'a [crate::storage::Attachment],
+) -> (Vec<(&'a crate::storage::Attachment, String)>, usize) {
+    let mut urls = vec![];
+    let mut skipped = 0usize;
+    let images: Vec<_> = attachments.iter().filter(|a| a.kind == "image").collect();
+    for a in &images[images.len().saturating_sub(4)..] {
+        let p = attachments_dir.join(conversation_id).join(&a.filename);
+        match std::fs::read(&p)
+            .map_err(|e| e.to_string())
+            .and_then(|b| crate::vision::prepare_image(&b))
+        {
+            Ok(prep) => urls.push((*a, prep.data_url)),
+            Err(e) => {
+                tracing::warn!("vision prepare failed for {}: {e}", a.filename);
+                skipped += 1;
+            }
+        }
+    }
+    (urls, skipped)
+}
+
+pub(crate) fn build_turns_with_owners(
+    history: &[Message],
+    attachments: &[crate::storage::Attachment],
+    max_chars: usize,
+) -> (Vec<ChatTurn>, Vec<String>) {
     let summary = history
         .first()
         .filter(|message| message.id.starts_with("context-summary:"));
@@ -3156,37 +4387,68 @@ pub(crate) fn build_turns_budgeted(
         }
         window.remove(remove_at);
     }
-    let mut attach_block = String::new();
-    let mut remaining = ATTACH_CHARS_PER_TURN;
-    for a in attachments {
-        if remaining == 0 {
-            break;
-        }
-        let mut take = a.text_excerpt.len().min(remaining);
-        while !a.text_excerpt.is_char_boundary(take) {
-            take -= 1;
-        }
-        attach_block.push_str(&format!(
-            "\n\n[Attached file: {}]\n{}",
-            a.filename,
-            &a.text_excerpt[..take]
-        ));
-        remaining -= take;
-    }
-    window
+    let ids: Vec<String> = window.iter().map(|message| message.id.clone()).collect();
+    let turns = window
         .into_iter()
         .map(|m| {
             // llama.cpp's OpenAI dialect has no plain `tool` turn without a
             // tool_call_id; fold tool results into user turns explicitly.
             let (role, content) = match m.role.as_str() {
-                "assistant" => ("assistant", m.content.clone()),
+                // Prose only: a reply's tool envelopes, including rejected
+                // attempts, would teach the model to repeat them.
+                "assistant" => ("assistant", {
+                    let prose = crate::agent_runner::without_action_envelopes(&m.content);
+                    if prose.is_empty() {
+                        "[This reply only ran tools; their results were shown to the user.]".to_string()
+                    } else {
+                        prose
+                    }
+                }),
                 "tool" => ("user", format!("[tool result]\n{}", m.content)),
                 _ => ("user", m.content.clone()),
             };
             ChatTurn::text(role, content)
         })
-        .collect::<Vec<_>>()
-        .tap_append_attach(attach_block)
+        .collect::<Vec<_>>();
+    if legacy_prompt_order() {
+        let mut attach_block = String::new();
+        let mut remaining = ATTACH_CHARS_PER_TURN;
+        for a in attachments {
+            if remaining == 0 {
+                break;
+            }
+            let mut take = a.text_excerpt.len().min(remaining);
+            while !a.text_excerpt.is_char_boundary(take) {
+                take -= 1;
+            }
+            attach_block.push_str(&format!("\n\n[Attached file: {}]\n{}", a.filename, &a.text_excerpt[..take]));
+            remaining -= take;
+        }
+        return (turns.tap_append_attach(attach_block), ids);
+    }
+    // Each excerpt stays on the message it was sent with, so it is sent in the
+    // same place on every later request.
+    let mut turns = turns;
+    let mut used: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for a in attachments.iter().filter(|a| !a.text_excerpt.is_empty()) {
+        let Some(index) = attachment_turn(&turns, &ids, history, a) else {
+            continue;
+        };
+        let used_here = used.entry(index).or_insert(0);
+        let remaining = ATTACH_CHARS_PER_TURN.saturating_sub(*used_here);
+        if remaining == 0 {
+            continue;
+        }
+        let mut take = a.text_excerpt.len().min(remaining);
+        while !a.text_excerpt.is_char_boundary(take) {
+            take -= 1;
+        }
+        turns[index]
+            .content
+            .push_str(&format!("\n\n[Attached file: {}]\n{}", a.filename, &a.text_excerpt[..take]));
+        *used_here += take;
+    }
+    (turns, ids)
 }
 
 trait TapAttach {
@@ -3881,7 +5143,7 @@ async fn execute_tool(
         if req.grant_session && req.approved_once && risk == RiskLevel::Moderate {
             pm.grant_session(&req.tool, &ws_key);
         }
-        match pm.decide_in(&req.tool, risk, true, Some(&ws_key)) {
+        match pm.decide_call(&req.tool, &req.args, risk, true, Some(&ws_key)) {
             PermissionDecision::Allow => "auto",
             PermissionDecision::RequireApproval { .. } if req.approved_once => "once",
             PermissionDecision::RequireApproval { reason } => {
@@ -4079,8 +5341,6 @@ async fn list_tool_executions(
 
 #[derive(Deserialize)]
 struct AgentReq {
-    #[serde(default)]
-    classified: bool,
     workspace: String,
     task: String,
     #[serde(default)]
@@ -4169,6 +5429,40 @@ fn message_intent(text: &str) -> MessageIntent {
     }
 }
 
+/// `message_intent`, except that a short "yes" or "ok" answering a question
+/// the latest reply asked ("Would you like me to fix subtract?") is a request
+/// for the model, with the conversation, not a canned acknowledgement. The
+/// classifier used to route those; review found they were answered "Got it"
+/// after it was removed. ("Go ahead" and "do it" continue a saved task first:
+/// see `run_agent`.)
+async fn answering_intent(s: &AppState, conversation_id: &str, text: &str) -> MessageIntent {
+    let intent = message_intent(text);
+    if intent == MessageIntent::Acknowledgement && latest_reply_asks_in(s, conversation_id).await {
+        MessageIntent::Task
+    } else {
+        intent
+    }
+}
+
+async fn latest_reply_asks_in(s: &AppState, conversation_id: &str) -> bool {
+    !conversation_id.is_empty()
+        && latest_reply_asks(&s.storage.lock().await.messages_for(conversation_id).unwrap_or_default())
+}
+
+/// The latest assistant reply ends by asking the user something.
+fn latest_reply_asks(history: &[Message]) -> bool {
+    history
+        .iter()
+        .rev()
+        .find(|message| message.role == "assistant")
+        .map(|message| {
+            let tail: String = message.content.trim_end().chars().rev().take(240).collect::<Vec<_>>().into_iter().rev().collect();
+            let last_line = tail.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("");
+            last_line.trim_end_matches(|c: char| c.is_whitespace() || matches!(c, '*' | '_' | ')' | '"')).ends_with('?')
+        })
+        .unwrap_or(false)
+}
+
 async fn conversational_reply(
     s: &AppState,
     conversation_id: &str,
@@ -4229,7 +5523,7 @@ async fn resolve_continuation(
     }
     if let Some(run) = s.agents.read().await.get(&context.run_id) {
         match run.state() {
-            AgentState::Completed => context.status = if run.spec.mode == AgentMode::Plan { "planned" } else { "completed" }.into(),
+            AgentState::Completed => context.status = if run.spec.mode == AgentMode::Plan && run.plan_presented() { "planned" } else { "completed" }.into(),
             AgentState::Failed | AgentState::Cancelled => context.status = "interrupted".into(),
             AgentState::WaitingPermission => return Ok(Continuation::Reply("conversation", "The current task is waiting for your approval. Use its Allow or Deny controls; a chat reply does not approve an action.")),
             _ => return Ok(Continuation::Reply("conversation", "That task is already running. You can follow its progress in Activity.")),
@@ -4241,6 +5535,13 @@ async fn resolve_continuation(
         _ => Ok(Continuation::Reply("needs_task", "I cannot confirm an unfinished task to resume. Tell me the specific next step you want.")),
     }
 }
+
+/// The app's own git reads. A repository's config can name commands git runs
+/// on these (`diff.external`, textconv drivers, `core.fsmonitor`), and a project
+/// or an agent edit can set them, so the reads switch them off.
+const SAFE_GIT_DIFF_STAT: &str = "git -c core.fsmonitor=false diff --no-ext-diff --no-textconv --stat";
+const SAFE_GIT_DIFF_FULL: &str = "git -c core.fsmonitor=false diff --no-ext-diff --no-textconv --no-color --unified=3";
+const SAFE_GIT_STATUS: &str = "git -c core.fsmonitor=false status --short";
 
 /// §59: backend owns the loop; frontend only observes/controls.
 /// Spawns the LLM loop and returns immediately with a run id; the UI tails
@@ -4255,11 +5556,7 @@ async fn run_agent(
             "Describe what the agent should do.",
         ));
     }
-    let intent = if req.classified {
-        MessageIntent::Task
-    } else {
-        message_intent(&req.task)
-    };
+    let intent = answering_intent(&s, req.conversation_id.trim(), &req.task).await;
     if matches!(
         intent,
         MessageIntent::Acknowledgement | MessageIntent::Greeting
@@ -4301,6 +5598,11 @@ async fn run_agent(
     let task = if intent == MessageIntent::Continue {
         match resolve_continuation(&s, req.conversation_id.trim(), &ws_root).await? {
             Continuation::Task(task) => task,
+            // Nothing saved to continue, but the latest reply offered
+            // something ("Shall I add tests?"): "go ahead" accepts the offer.
+            Continuation::Reply("needs_task", _) if latest_reply_asks_in(&s, req.conversation_id.trim()).await => {
+                req.task.trim().to_string()
+            }
             Continuation::Reply(disposition, reply) => {
                 return conversational_reply(
                     &s,
@@ -4320,6 +5622,8 @@ async fn run_agent(
     // natural-language task in the transcript before orchestration starts.
     let mut conversation_reasoning = false;
     if !req.conversation_id.trim().is_empty() {
+        // Read before taking storage, the order the chat path uses.
+        let current_model = s.models.read().await.current().map(|model| model.id.clone()).unwrap_or_default();
         let st = s.storage.lock().await;
         match st.get_conversation(req.conversation_id.trim()) {
             Ok(Some(conversation)) => {
@@ -4350,6 +5654,12 @@ async fn run_agent(
                     created_at: chrono::Utc::now().to_rfc3339(),
                 })
                 .map_err(|error| ApiError::internal(format!("storage error: {error}")))?;
+                // This session is now worked on by the loaded model, as a chat
+                // reply records. Agent runs never did, so a code session last
+                // used with another model kept its "Last used with" notice.
+                if !current_model.is_empty() {
+                    let _ = st.set_last_model(req.conversation_id.trim(), &current_model);
+                }
             }
             Ok(None) => return Err(ApiError::not_found("conversation not found")),
             Err(error) => return Err(ApiError::internal(format!("storage error: {error}"))),
@@ -4453,7 +5763,7 @@ async fn spawn_agent_run(
                 if !journal_cid.is_empty() {
                     let _ = st.update_message_content(&journal_cid, &journal_mid, &event.message);
                     let status = match event.state {
-                        AgentState::Completed if mode == AgentMode::Plan => "planned",
+                        AgentState::Completed if mode == AgentMode::Plan && crate::agent_runner::presents_plan(&event) => "planned",
                         AgentState::Completed => "completed",
                         _ => "interrupted",
                     };
@@ -4824,9 +6134,13 @@ async fn run_slash_command(
                     None => "No model loaded. Usage: /model <id> (see /models)".into(),
                 }));
             }
-            load_model_by_id(s, args)
-                .await
-                .map(|id| O::Message(format!("Loaded {id}.")))
+            load_model_by_id(s, args).await.map(|(id, notices)| {
+                let mut message = format!("Loaded {id}.");
+                for notice in notices {
+                    message.push_str(&format!("\n{notice}"));
+                }
+                O::Message(message)
+            })
         }
         "status" => Ok(O::Message(system_status_text(s, conv_id.as_deref()).await)),
         "context" => {
@@ -4912,7 +6226,7 @@ async fn run_slash_command(
         }
         "diff" => {
             let ws = command_workspace(s, conv_id.as_deref(), None).await?;
-            match crate::terminal::run("git diff --stat", &ws, 30) {
+            match crate::terminal::run(SAFE_GIT_DIFF_STAT, &ws, 30) {
                 Ok(r) if r.exit_code == Some(0) && !r.stdout.trim().is_empty() => {
                     Ok(O::Message(format!(
                         "Workspace changes:\n```\n{}\n```",
@@ -4928,11 +6242,13 @@ async fn run_slash_command(
             let ws = command_workspace(s, conv_id.as_deref(), None).await?;
             let task = match name {
                 "review" => format!("Review {} without modifying any files. Report findings.", if args.is_empty() { "the workspace".to_string() } else { args.to_string() }),
+                // A plan run like the Plan mode's: read-only, and it ends
+                // with a plan the user approves before anything changes.
                 "plan" => {
                     if args.is_empty() {
                         return Err(ApiError::bad("task is empty", "Usage: /plan <task>"));
                     }
-                    format!("Create an implementation plan for: {args}. Do not modify files; reply with the plan.")
+                    args.to_string()
                 }
                 _ => "Inspect this repository (structure, build system, key files) and summarize the project. Do not modify anything.".into(),
             };
@@ -4941,7 +6257,7 @@ async fn run_slash_command(
                 s,
                 ws,
                 task,
-                AgentMode::CodeAssist,
+                if name == "plan" { AgentMode::Plan } else { AgentMode::CodeAssist },
                 conv_id.unwrap_or_default(),
                 false,
                 reasoning,
@@ -5146,7 +6462,10 @@ async fn config_text(s: &AppState, section: &str) -> String {
     }
 }
 
-async fn load_model_by_id(s: &AppState, id: &str) -> Result<String, ApiError> {
+/// Load a registered model. Returns its id and the notices the load produced
+/// (a CPU fallback, a context the model does not support), which callers must
+/// pass on: they were once dropped here, so nobody saw them.
+async fn load_model_by_id(s: &AppState, id: &str) -> Result<(String, Vec<String>), ApiError> {
     if id.trim().is_empty() {
         return Err(ApiError::bad(
             "model id is empty",
@@ -5162,7 +6481,7 @@ async fn load_model_by_id(s: &AppState, id: &str) -> Result<String, ApiError> {
         .ok_or_else(|| ApiError::not_found(format!("unknown model '{id}'")))?;
     // One operation replaces the worker and only publishes the model after
     // health succeeds. Never relabel an old process as the new model.
-    start_sidecar(
+    let started = start_sidecar(
         s,
         Some(model.id.clone()),
         model.gguf_path(),
@@ -5172,7 +6491,12 @@ async fn load_model_by_id(s: &AppState, id: &str) -> Result<String, ApiError> {
         None,
     )
     .await?;
-    Ok(model.id)
+    let notices = started
+        .get("notices")
+        .and_then(|value| value.as_array())
+        .map(|items| items.iter().filter_map(|item| item.as_str().map(str::to_owned)).collect())
+        .unwrap_or_default();
+    Ok((model.id, notices))
 }
 
 /// Summarize a prefix into a derived inference view. Never delete or rewrite
@@ -5341,7 +6665,9 @@ async fn compact_conversation_keeping(
             "Start inference first, then /compact.",
         ));
     };
-    let client = SidecarClient::new(base_url).map_err(|e| ApiError::internal(e.to_string()))?;
+    let client = SidecarClient::new(base_url)
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .with_recorder(request_recorder(s, cid, &format!("compaction-{}", uuid::Uuid::new_v4()), "compaction"));
     let previous = previous_summary
         .map(|text| {
             if text.starts_with(COMPACTION_HEADER) {
@@ -5713,7 +7039,7 @@ async fn create_workspace(
     if name.is_empty() {
         return Err(ApiError::bad(
             "name is empty",
-            "Name the project, e.g. RageV.",
+            "Name the project, e.g. My app.",
         ));
     }
     let pb = if req.create {
@@ -5869,10 +7195,10 @@ async fn workspace_diff(
             "Relink the project directory.",
         ));
     }
-    let stat = crate::terminal::run("git diff --stat", &root, 30)
+    let stat = crate::terminal::run(SAFE_GIT_DIFF_STAT, &root, 30)
         .map(|r| format!("{}\n{}", r.stdout, r.stderr))
         .unwrap_or_else(|e| format!("(no git diff: {e})"));
-    let full = crate::terminal::run("git diff --no-color --unified=3", &root, 30)
+    let full = crate::terminal::run(SAFE_GIT_DIFF_FULL, &root, 30)
         .map(|r| r.stdout)
         .unwrap_or_default();
     let truncated = full.len() > 100_000;
@@ -6193,7 +7519,7 @@ async fn workspace_git(
         "workspace": ws.name,
         "git": true,
         "branch": run("git branch --show-current").trim().to_string(),
-        "status": run("git status --short"),
+        "status": run(SAFE_GIT_STATUS),
         "log": run("git log --oneline -10"),
     })))
 }
@@ -6201,17 +7527,15 @@ async fn workspace_git(
 // ---- Stage 37 plugins ----
 
 fn plugins_dir(s: &AppState) -> std::path::PathBuf {
-    // Repo layout: <root>/plugins next to <root>/models; fall back to CWD.
-    if let Some(root) = s.models_dir.parent() {
-        let p = root.join("plugins");
-        if p.is_dir() {
-            return p;
-        }
-        // Dev layout: backend runs with CWD=backend/, repo root one up.
-        let up = std::path::PathBuf::from("..").join("plugins");
-        if up.is_dir() {
-            return up;
-        }
+    // <installation root>/plugins, wherever the models folder is; fall back to CWD.
+    let p = s.install_root.join("plugins");
+    if p.is_dir() {
+        return p;
+    }
+    // Dev layout: backend runs with CWD=backend/, repo root one up.
+    let up = std::path::PathBuf::from("..").join("plugins");
+    if up.is_dir() {
+        return up;
     }
     std::path::PathBuf::from("plugins")
 }
@@ -6388,7 +7712,7 @@ async fn doctor(State(s): State<AppState>) -> Json<serde_json::Value> {
             format!("{} registered, {} with GGUF on disk", list.len(), ggufs),
         );
     }
-    match SidecarBinary::detect(&s.models_dir) {
+    match SidecarBinary::detect(&s.runtime_dir()) {
         Ok(_) => row(
             "sidecar",
             "llama-server binary",
@@ -6517,7 +7841,7 @@ async fn setup_status(State(s): State<AppState>) -> Json<serde_json::Value> {
     let ggufs = list.iter().filter(|m| m.gguf_path().is_file()).count();
     let current = mm.current().map(|m| m.id.clone());
     drop(mm);
-    let binary = SidecarBinary::detect(&s.models_dir).is_ok();
+    let binary = SidecarBinary::detect(&s.runtime_dir()).is_ok();
     let running = s.llama.write().await.is_running();
     let convs = s
         .storage
@@ -7039,6 +8363,9 @@ async fn export_conversation(
     let activities = st.conversation_activities(&id).unwrap_or_default();
     let artifacts = st.artifacts_for(&id).unwrap_or_default();
     let attachments = st.attachments_for(&id).unwrap_or_default();
+    let model_requests = st
+        .model_requests_for(&id, crate::storage::MODEL_REQUEST_ROWS)
+        .unwrap_or_default();
     // What the log was produced on, so a run read on another machine can be
     // told apart from one produced there: a small window and a template that
     // refuses a system turn explain failures that look inexplicable without
@@ -7130,6 +8457,25 @@ async fn export_conversation(
             })
             .collect::<Vec<_>>(),
         "runtime": runtime_snapshot,
+        // Each model request as sent and what came back (owner decision: kept
+        // by default and exported). The request travels as JSON, not a string.
+        "model_requests": model_requests
+            .iter()
+            .map(|r| serde_json::json!({
+                "owner_id": r.owner_id,
+                "seq": r.seq,
+                "kind": r.kind,
+                "created_at": r.created_at,
+                "outcome": r.outcome,
+                "failure": r.failure,
+                "finish_reason": r.finish_reason,
+                "prompt_tokens": r.prompt_tokens,
+                "cached_tokens": r.cached_tokens,
+                "generated_tokens": r.generated_tokens,
+                "request": serde_json::from_str::<serde_json::Value>(&r.request_json).unwrap_or(serde_json::Value::Null),
+                "output": r.raw_output,
+            }))
+            .collect::<Vec<_>>(),
         // The application log as it stood at export. Not per-conversation:
         // the failures worth carrying between machines (a model that will not
         // load, a template that refuses every request) are logged before any
@@ -7354,10 +8700,7 @@ struct PermissionModeRequest {
 }
 
 async fn get_permission_mode(State(s): State<AppState>) -> Json<serde_json::Value> {
-    let mode = match s.permissions.read().await.autonomy {
-        AutonomyLevel::Autonomous => "auto",
-        _ => "ask",
-    };
+    let mode = s.settings.read().await.agent.permission_mode.clone();
     Json(serde_json::json!({ "mode": mode }))
 }
 
@@ -7365,14 +8708,14 @@ async fn put_permission_mode(
     State(s): State<AppState>,
     Json(req): Json<PermissionModeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let autonomy = match req.mode.as_str() {
-        "ask" => AutonomyLevel::Assisted,
-        "auto" => AutonomyLevel::Autonomous,
-        _ => return Err(ApiError::bad("unknown permission mode", "Use ask or auto.")),
-    };
+    if !crate::permissions::PERMISSION_MODES.contains(&req.mode.as_str()) {
+        return Err(ApiError::bad("unknown permission mode", "Use ask, accept_edits, plan or auto."));
+    }
+    let autonomy = crate::permissions::autonomy_for_mode(&req.mode);
     let _update = s.settings_update.lock().await;
     let mut next = s.settings.read().await.clone();
-    next.agent.autonomous_enabled = autonomy == AutonomyLevel::Autonomous;
+    next.agent.permission_mode = req.mode.clone();
+    next.agent.autonomous_enabled = req.mode == "auto";
     s.storage
         .lock()
         .await
@@ -7389,13 +8732,12 @@ async fn put_permission_mode(
 }
 
 /// Called while settings_update is held, after save-before-apply succeeds.
-/// Both settings entry points must honor the same explicit Auto preference,
-/// including already-waiting actions. This never widens a run's mode or Search
-/// scope and creates no session grants that could leak back into Ask mode.
+/// Both settings entry points must honor the same permission mode, including
+/// actions already waiting: switching to Accept edits releases a waiting file
+/// edit, switching to Auto releases everything the run's mode allows. This
+/// never widens a run's mode or Search scope and creates no session grants
+/// that could leak back into Ask mode.
 pub(crate) async fn resume_auto_approved_runs(s: &AppState) -> usize {
-    if s.permissions.read().await.autonomy != AutonomyLevel::Autonomous {
-        return 0;
-    }
     let search_denied = s.settings.read().await.search.autonomous == "deny";
     let mut resumed = 0usize;
     let waiting = {
@@ -7418,9 +8760,15 @@ pub(crate) async fn resume_auto_approved_runs(s: &AppState) -> usize {
         {
             continue;
         }
+        // Web search consent is its own prompt: only Auto releases it, never
+        // a session grant (review finding).
+        if pending.tool == "web_search" && s.permissions.read().await.autonomy != crate::permissions::AutonomyLevel::Autonomous {
+            continue;
+        }
         let allowed = matches!(
-            s.permissions.read().await.decide_in(
+            s.permissions.read().await.decide_call(
                 &pending.tool,
+                &pending.args,
                 risk,
                 true,
                 Some(&run.spec.workspace.to_string_lossy()),
@@ -7446,7 +8794,11 @@ async fn put_settings(
     State(s): State<AppState>,
     Json(next): Json<AppSettings>,
 ) -> Result<Json<AppSettings>, ApiError> {
-    let next = next.normalized();
+    // Held from the read of the replaced settings to the write, so two saves
+    // cannot each reconcile against a version the other has replaced.
+    let _update = s.settings_update.lock().await;
+    let previous = s.settings.read().await.clone();
+    let next = next.reconciled_with(&previous);
     if next.inference.context_size == 0 || next.inference.context_size > 1_048_576 {
         return Err(ApiError::bad(
             "context_size must be > 0",
@@ -7477,6 +8829,22 @@ async fn put_settings(
             || next.inference.batch_size > 8192)
     {
         return Err(ApiError::bad("Invalid manual hardware settings.", "Use 1–1024 threads, -1 for automatic GPU placement (or 0–10000 layers), and batch size 1–8192."));
+    }
+    if !next.runtime_auto
+        && (next.hardware.threads_batch > 1024
+            || next.hardware.poll.is_some_and(|poll| poll > 100)
+            || next.hardware.priority.is_some_and(|priority| !(-1..=3).contains(&priority)))
+    {
+        return Err(ApiError::bad(
+            "Invalid manual thread settings.",
+            "Use 0–1024 prompt threads (0 uses the generation threads), a wait of 0–100 and a priority from -1 (low) to 3 (realtime).",
+        ));
+    }
+    if !next.runtime_auto && !next.hardware.flash_attention && next.runtime.kv_cache == "q8_0" {
+        return Err(ApiError::bad(
+            "An 8-bit KV cache needs Flash Attention.",
+            "llama.cpp cannot create a context with an 8-bit value cache while Flash Attention is off. Turn Flash Attention on, or use the f16 cache.",
+        ));
     }
     if !(2..=200).contains(&next.memory.compaction_keep_turns) {
         return Err(ApiError::bad(
@@ -7535,19 +8903,21 @@ async fn put_settings(
             "Use ask, allow, or deny (§124).",
         ));
     }
-    let _update = s.settings_update.lock().await;
     s.storage
         .lock()
         .await
         .save_settings(&next)
         .map_err(|error| ApiError::internal(format!("Could not save settings: {error}")))?;
-    s.permissions.write().await.autonomy = if next.agent.autonomous_enabled {
-        AutonomyLevel::Autonomous
-    } else {
-        AutonomyLevel::Assisted
-    };
+    s.permissions.write().await.autonomy = crate::permissions::autonomy_for_mode(&next.agent.permission_mode);
     *s.settings.write().await = next.clone();
     resume_auto_approved_runs(&s).await;
+    // A different context, cache preference or fit mode needs its own fit.
+    if previous.inference.context_size != next.inference.context_size
+        || previous.runtime_auto != next.runtime_auto
+        || previous.runtime != next.runtime
+    {
+        spawn_fit_preparation(&s, std::time::Duration::from_secs(3));
+    }
     Ok(Json(next))
 }
 
@@ -8093,6 +9463,381 @@ fn current_device_profile(s: &AppState) -> crate::daio::DeviceProfile {
     p
 }
 
+// ---- Performance calibration (Settings > Performance profiles) ----
+
+/// What a calibration's measurements depend on, as this machine is now.
+async fn calibration_environment(s: &AppState, server: &std::path::Path) -> crate::calibration::Environment {
+    crate::calibration::Environment {
+        device_fingerprint: current_device_profile(s).fingerprint,
+        runtime_build: crate::calibration::runtime_build(server).await,
+        power_source: crate::calibration::power_source(),
+        gpu_driver: crate::calibration::gpu_driver().await,
+        cpu_topology: crate::cpu_topology::detect()
+            .map(|topology| topology.describe())
+            .unwrap_or_else(|| "not reported".into()),
+    }
+}
+
+/// The latest calibration of a model file, and whether it still describes
+/// this machine as it is now (same device, runtime build and power source).
+async fn model_calibration(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let model = s
+        .models
+        .read()
+        .await
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| ApiError::not_found(format!("unknown model '{id}'")))?;
+    let key = crate::calibration::model_key(&model.gguf_path());
+    let latest = s
+        .storage
+        .lock()
+        .await
+        .calibrations_for(&model.id, &key)
+        .map_err(|e| ApiError::internal(format!("storage error: {e}")))?
+        .into_iter()
+        .next();
+    let current = match SidecarBinary::detect(&s.runtime_dir()) {
+        Ok(binary) => Some(calibration_environment(&s, &binary.0).await),
+        Err(_) => None,
+    };
+    let comparable = match (&latest, &current) {
+        (Some(latest), Some(current)) => Some(latest.environment.comparable(current)),
+        _ => None,
+    };
+    Ok(Json(serde_json::json!({
+        "calibration": latest,
+        "current_environment": current,
+        "comparable": comparable,
+    })))
+}
+
+/// Measure this model on this machine and store the resulting profiles.
+/// Unloads the running model first: calibration loads the model itself, and
+/// two resident models could exhaust memory.
+async fn calibrate_model(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> Sse<futures::stream::BoxStream<'static, Result<Event, Infallible>>> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Event, Infallible>>();
+    let bg = s.clone();
+    tokio::spawn(async move {
+        let stage = |name: &str, detail: &str| {
+            let _ = tx.send(Ok(Event::default().event("stage").safe_data(
+                serde_json::json!({"stage": name, "detail": detail}).to_string(),
+            )));
+        };
+        let fail = |message: String| {
+            let _ = tx.send(Ok(Event::default().event("error").safe_data(message)));
+        };
+        if let Err(error) = guard_agent_running(&bg, false).await {
+            fail(error.message);
+            return;
+        }
+        let Some(model) = bg.models.read().await.get(&id).cloned() else {
+            fail(format!("unknown model '{id}'"));
+            return;
+        };
+        let binary = match SidecarBinary::detect(&bg.runtime_dir()) {
+            Ok(binary) => binary,
+            Err(error) => {
+                fail(error.to_string());
+                return;
+            }
+        };
+        let (Some(bench), Some(fit)) = (
+            crate::calibration::runtime_tool(&binary.0, "llama-bench"),
+            crate::calibration::runtime_tool(&binary.0, "llama-fit-params"),
+        ) else {
+            fail("The runtime has no llama-bench or llama-fit-params next to llama-server. Rebuild the runtime (scripts/build-runtime) to include its tools.".into());
+            return;
+        };
+        let gguf = model.gguf_path();
+        bg.fit_preparation.cancel().await;
+        let _update = bg.runtime_update.lock().await;
+
+        stage("unloading", "Unloading the current model so only one model is in memory.");
+        bg.llama.write().await.stop().await;
+        bg.models.write().await.unload_all();
+        bg.inference.write().await.unload();
+
+        let settings = bg.settings.read().await.clone();
+        let context = settings
+            .inference
+            .context_size
+            .min(model.context_length.max(1));
+        stage("placing", "Asking the runtime where this model's layers fit.");
+        let fitted = match binary.devices().await {
+            crate::runtime_selection::Devices::None => crate::calibration::FittedPlacement::cpu(),
+            _ => match crate::calibration::fitted_placement(&fit, &gguf, context, crate::runtime_fit::DEFAULT_MICRO_BATCH).await {
+                Ok(fitted) => fitted,
+                Err(error) => {
+                    fail(format!("The runtime could not place this model: {error}"));
+                    return;
+                }
+            },
+        };
+        let placement = fitted.placement;
+        let (physical, performance) = match crate::cpu_topology::detect() {
+            Some(topology) => (topology.physical_count(), topology.performance_cores()),
+            None => {
+                let cpu = hardware::detect().cpu;
+                (cpu.physical_cores, cpu.physical_cores)
+            }
+        };
+        let mut plan = crate::calibration::plan(physical, performance, placement, fitted.gpu_layers);
+        // The fit's expert rules, so a mixture-of-experts model is measured
+        // with the placement a load gets rather than every expert on the GPU,
+        // and the load mode such a load uses (read after unloading, so the
+        // free RAM is what a load would see).
+        plan.tensor_overrides = fitted.tensor_overrides.clone();
+        let ram_available = (hardware::detect().ram.available_gb * 1_073_741_824.0) as u64;
+        let model_bytes = crate::models::model_set_bytes(&gguf);
+        let loads_without_mmap = |fit: crate::runtime_fit::Fit| crate::runtime_fit::load_without_mmap(fit, ram_available, model_bytes);
+        plan.load_without_mmap = placement != crate::calibration::Placement::Cpu && loads_without_mmap(fitted.fit);
+        stage(
+            "measuring",
+            &format!(
+                "Measuring {} thread settings ({}). This loads the model once and takes a minute or two; with a GPU, micro-batch sizes are measured afterwards (several minutes more, with a 2-minute pause).",
+                plan.threads.len(),
+                match placement {
+                    crate::calibration::Placement::Gpu => "every layer on the GPU",
+                    crate::calibration::Placement::Hybrid if !fitted.tensor_overrides.is_empty() => "every layer on the GPU, some expert weights in RAM",
+                    crate::calibration::Placement::Hybrid => "layers split between GPU and CPU",
+                    crate::calibration::Placement::Cpu => "CPU only",
+                }
+            ),
+        );
+        let mut measurements = match crate::calibration::run_benchmark(&bench, &gguf, &plan, &plan.threads, 50).await {
+            Ok(measurements) => measurements,
+            Err(error) => {
+                fail(error);
+                return;
+            }
+        };
+        // Light also sleeps between operations when that measures nearly free.
+        if let Some(light) = crate::calibration::choose_profiles(&measurements, physical)
+            .and_then(|profiles| profiles.into_iter().find(|p| p.name == "light"))
+        {
+            stage("measuring", "Checking whether idle waiting costs speed at the lightest setting.");
+            if let Ok(quiet) = crate::calibration::run_benchmark(&bench, &gguf, &plan, &[light.threads], 0).await {
+                measurements.extend(quiet);
+            }
+        }
+        let Some(profiles) = crate::calibration::choose_profiles(&measurements, physical) else {
+            fail("The benchmark ran but produced no usable generation measurements.".into());
+            return;
+        };
+        // The micro-batch, when the model uses the GPU: each size with the
+        // placement the runtime fits at that size and the load mode that
+        // placement loads with, at the fastest generation thread count,
+        // chosen by the owner's speed rule on the mean of two passes run in
+        // alternating order (512, 1,024, 2,048, then reversed) with a
+        // 2-minute pause between them, since back-to-back runs can make the
+        // GPU throttle (owner instruction). Extra cost: up to 6 llama-bench
+        // runs, each loading the model once and reading a 4,096-token prompt
+        // and generating 64 tokens 4 times, plus 2 fit probes (512 reuses the
+        // placement above) and the pause: roughly 4-8 minutes. A size that
+        // fails to fit or run is left out rather than failing the calibration;
+        // nothing is chosen unless 512 was measured.
+        let mut micro_batches = Vec::new();
+        let candidates = if placement == crate::calibration::Placement::Cpu {
+            Vec::new()
+        } else {
+            crate::calibration::micro_batch_candidates(context)
+        };
+        if !candidates.is_empty() {
+            let threads = profiles
+                .iter()
+                .find(|p| p.name == "fastest")
+                .map(|p| p.threads)
+                .unwrap_or(physical.max(1) as u32);
+            // Each size's placement, fitted once for both passes.
+            let mut fitted_sizes: Vec<(u32, crate::calibration::FittedPlacement)> = Vec::new();
+            for size in &candidates {
+                let fitted_at_size = if *size == crate::runtime_fit::DEFAULT_MICRO_BATCH {
+                    fitted.clone()
+                } else {
+                    match crate::calibration::fitted_placement(&fit, &gguf, context, *size).await {
+                        Ok(fitted_at_size) => fitted_at_size,
+                        Err(error) => {
+                            tracing::warn!(model = %model.id, micro_batch = size, "micro-batch not measured: no fit ({error})");
+                            continue;
+                        }
+                    }
+                };
+                // A size whose fit leaves nothing on the GPU is not an option
+                // for a GPU load, and would be slow to measure.
+                if fitted_at_size.placement != crate::calibration::Placement::Cpu {
+                    fitted_sizes.push((*size, fitted_at_size));
+                }
+            }
+            let sizes: Vec<u32> = fitted_sizes.iter().map(|(size, _)| *size).collect();
+            let mut paused = false;
+            for (pass, size) in crate::calibration::micro_batch_run_order(&sizes) {
+                if pass == 1 && !paused {
+                    paused = true;
+                    stage("measuring", "Pausing 2 minutes so the GPU cools before the second pass.");
+                    tokio::time::sleep(crate::calibration::MICRO_BATCH_PASS_PAUSE).await;
+                }
+                let Some((_, fitted_at_size)) = fitted_sizes.iter().find(|(fitted_size, _)| *fitted_size == size) else {
+                    continue;
+                };
+                stage(
+                    "measuring",
+                    &format!(
+                        "Measuring a micro-batch of {} tokens with the placement that fits at that size (reads a {}-token prompt; pass {} of 2).",
+                        group_thousands(size),
+                        group_thousands(crate::calibration::MICRO_BATCH_PROMPT_TOKENS.min(context)),
+                        pass + 1
+                    ),
+                );
+                let without_mmap = loads_without_mmap(fitted_at_size.fit);
+                let size_plan = crate::calibration::micro_batch_plan(&plan, size, fitted_at_size, context, without_mmap);
+                match crate::calibration::run_benchmark(&bench, &gguf, &size_plan, &[threads], 50).await {
+                    Ok(measured) => {
+                        if let Some(measured) = measured.into_iter().next() {
+                            micro_batches.push(crate::calibration::MicroBatchMeasurement {
+                                micro_batch: size,
+                                gpu_layers: fitted_at_size.gpu_layers,
+                                expert_blocks_on_cpu: fitted_at_size.expert_blocks_on_cpu(),
+                                threads,
+                                prompt_tokens: size_plan.prompt_tokens,
+                                prompt: measured.prompt,
+                                generation: measured.generation,
+                                pass,
+                                load_without_mmap: without_mmap,
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(model = %model.id, micro_batch = size, "micro-batch not measured: {error}");
+                    }
+                }
+            }
+        }
+        let micro_batch = crate::calibration::choose_micro_batch(&micro_batches);
+        let environment = calibration_environment(&bg, &binary.0).await;
+        let key = crate::calibration::model_key(&gguf);
+        let previous = bg
+            .storage
+            .lock()
+            .await
+            .calibrations_for(&model.id, &key)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|earlier| earlier.environment.comparable(&environment));
+        let fastest = profiles
+            .iter()
+            .find(|p| p.name == "fastest")
+            .map(|p| p.generation_tps)
+            .unwrap_or(0.0);
+        let calibration = crate::calibration::Calibration {
+            id: uuid::Uuid::new_v4().to_string(),
+            model_id: model.id.clone(),
+            model_key: key,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            regression: previous
+                .as_ref()
+                .and_then(|earlier| crate::calibration::regression(earlier, fastest)),
+            environment,
+            plan,
+            measurements,
+            profiles,
+            micro_batches,
+            micro_batch,
+        };
+        if let Err(error) = bg.storage.lock().await.save_calibration(&calibration) {
+            fail(format!("Measured, but could not save the calibration: {error}"));
+            return;
+        }
+        tracing::info!(model = %model.id, fastest_tps = fastest, "calibration saved");
+        // A new calibrated micro-batch is part of what a fit depends on.
+        spawn_fit_preparation(&bg, std::time::Duration::from_secs(5));
+        let _ = tx.send(Ok(Event::default()
+            .event("done")
+            .safe_data(serde_json::to_string(&calibration).unwrap_or_default())));
+    });
+    Sse::new(UnboundedReceiverStream::new(rx).boxed()).keep_alive(KeepAlive::default())
+}
+
+/// This model file's latest calibration and whether it still describes this
+/// machine (same device, runtime build and power source). None when the file
+/// was never calibrated; the environment is read only when there is one.
+async fn latest_calibration(
+    s: &AppState,
+    model: &crate::models::ModelMetadata,
+    server: &std::path::Path,
+) -> Option<(crate::calibration::Calibration, bool)> {
+    let key = crate::calibration::model_key(&model.gguf_path());
+    let calibrations = s
+        .storage
+        .lock()
+        .await
+        .calibrations_for(&model.id, &key)
+        .unwrap_or_default();
+    let latest = calibrations.into_iter().next()?;
+    let now = calibration_environment(s, server).await;
+    let comparable = latest.environment.comparable(&now);
+    Some((latest, comparable))
+}
+
+/// Apply the chosen profile of this model's calibration (from
+/// `latest_calibration`) to a load, when the calibration still describes this
+/// machine. Returns a note for the runtime summary either way.
+fn apply_calibrated_profile(
+    profile_name: &str,
+    calibration: Option<&(crate::calibration::Calibration, bool)>,
+    cfg: &mut InferenceConfig,
+) -> String {
+    let Some((latest, comparable)) = calibration else {
+        return format!(
+            "{} profile selected, but this model has not been calibrated on this machine yet, so automatic settings were used. Calibrate it from its details on the Models page.",
+            title_case(profile_name)
+        );
+    };
+    if !*comparable {
+        return format!(
+            "{} profile selected, but this model's calibration was measured under different conditions (runtime build, device or power source changed), so automatic settings were used. Calibrate it again to refresh the profiles.",
+            title_case(profile_name)
+        );
+    }
+    let Some(profile) = latest.profiles.iter().find(|p| p.name == profile_name) else {
+        return "The saved calibration has no such profile; automatic settings were used.".into();
+    };
+    cfg.n_threads = profile.threads;
+    cfg.n_threads_batch = profile.threads_batch;
+    cfg.poll = Some(profile.poll);
+    cfg.priority = Some(profile.priority);
+    if let Some(policy) = cfg.runtime_policy.as_mut() {
+        policy.threads = profile.threads;
+    }
+    format!(
+        "{} profile from this model's calibration: {} generation thread{} and {} for prompts{}{}; measured {:.1} tok/s generating ({}% of the fastest) and {:.0} tok/s reading prompts, leaving {} cores free while generating.",
+        title_case(profile_name),
+        profile.threads,
+        if profile.threads == 1 { "" } else { "s" },
+        profile.threads_batch,
+        if profile.poll == 0 { ", sleeping between operations" } else { "" },
+        if profile.priority < 0 { ", yielding the CPU to other applications" } else { "" },
+        profile.generation_tps,
+        profile.generation_share,
+        profile.prompt_tps,
+        profile.free_cores_generating
+    )
+}
+
+fn title_case(word: &str) -> String {
+    let mut chars = word.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
 /// Stage 30 device profile (DAIO §4).
 async fn device_profile(State(s): State<AppState>) -> Json<crate::daio::DeviceProfile> {
     Json(current_device_profile(&s))
@@ -8202,6 +9947,7 @@ async fn calibrate(State(s): State<AppState>) -> Result<Json<serde_json::Value>,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::permissions::AutonomyLevel;
 
     /// A fake runtime that records every summarization prompt and answers
     /// with a numbered summary.
@@ -8328,6 +10074,7 @@ mod tests {
                 tool: tool.into(),
                 args: serde_json::json!({}),
                 reason: "Test approval".into(),
+                session_grantable: false,
             })),
             pending_tx: std::sync::Mutex::new(Some(approval_tx)),
             handle: std::sync::Mutex::new(None),
@@ -8477,9 +10224,10 @@ mod tests {
         assert!(put_settings(State(state.clone()), Json(invalid))
             .await
             .is_err());
+        // Still Ask (reads free, edits and commands ask), not Auto.
         assert_eq!(
             state.permissions.read().await.autonomy,
-            AutonomyLevel::Assisted
+            AutonomyLevel::WorkspaceAgent
         );
         assert!(matches!(
             receiver.try_recv(),
@@ -8503,6 +10251,36 @@ mod tests {
         .unwrap()
         .0;
         assert_eq!(result["resumed"], 0);
+    }
+
+    #[test]
+    fn a_reply_that_ends_by_asking_invites_an_answer() {
+        let message = |role: &str, content: &str| Message {
+            id: format!("{role}-{}", content.len()),
+            conversation_id: "c".into(),
+            role: role.into(),
+            content: content.into(),
+            created_at: String::new(),
+        };
+        assert!(latest_reply_asks(&[message("user", "fix it"), message("assistant", "Found the bug in subtract.
+
+Would you like me to fix it?")]));
+        assert!(latest_reply_asks(&[message("assistant", "Shall I add tests? **")]));
+        assert!(!latest_reply_asks(&[message("assistant", "Why? Because the sign was flipped. Fixed.")]));
+        assert!(!latest_reply_asks(&[message("assistant", "Done?"), message("user", "hm"), message("assistant", "All tests pass.")]));
+        assert!(!latest_reply_asks(&[message("user", "anything?")]));
+    }
+
+    #[tokio::test]
+    async fn a_session_grant_never_releases_a_waiting_web_search() {
+        let state = AppState::new_stub();
+        let (_, mut search) = pending_approval_fixture(&state, "web_search", AgentMode::Agent, true).await;
+        let (_, mut read) = pending_approval_fixture(&state, "read_file", AgentMode::Agent, false).await;
+        let _ = put_permission_mode(State(state.clone()), Json(PermissionModeRequest { mode: "accept_edits".into() }))
+            .await
+            .unwrap();
+        assert!(matches!(search.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)), "search consent is its own prompt");
+        assert!(matches!(read.try_recv(), Ok(crate::agent_runner::ApprovalDecision::Approved { session: false })));
     }
 
     #[test]
@@ -10012,7 +11790,8 @@ mod tests {
     async fn tool_gate_requires_approval_then_allows_once() {
         let a = app();
         let ws = tool_ws();
-        // SAFE read in Assisted mode still asks (default Level 1).
+        // The default Ask mode runs a read without asking (as Claude Code
+        // does) and asks before a file edit.
         let r = a
             .clone()
             .oneshot(json_req(
@@ -10027,6 +11806,23 @@ mod tests {
             ))
             .await
             .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let v = body_json(r).await;
+        assert!(v["output"].as_str().unwrap().contains("hello"));
+        let r = a
+            .clone()
+            .oneshot(json_req(
+                "POST",
+                "/api/tools/execute",
+                exec_body(
+                    &ws,
+                    "write_file",
+                    serde_json::json!({"path": "b.txt", "content": "edited"}),
+                    serde_json::json!({}),
+                ),
+            ))
+            .await
+            .unwrap();
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
         // Allow once executes.
         let r = a
@@ -10036,16 +11832,14 @@ mod tests {
                 "/api/tools/execute",
                 exec_body(
                     &ws,
-                    "read_file",
-                    serde_json::json!({"path": "a.txt"}),
+                    "write_file",
+                    serde_json::json!({"path": "b.txt", "content": "edited"}),
                     serde_json::json!({"approved_once": true}),
                 ),
             ))
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::OK);
-        let v = body_json(r).await;
-        assert!(v["output"].as_str().unwrap().contains("hello"));
         // Unknown tool is a 400, not a 403.
         let r = a
             .oneshot(json_req(
@@ -11066,17 +12860,164 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Verbatim from a 2B model asked "write a simple rust program" while the
+    /// chat prompt carried a document-tool example: an invented tool name,
+    /// ordinary code as its argument, and an args object that never closes.
+    const INVENTED_TOOL_REPLY: &str = "```tool\n{\"name\": \"rust_program\", \"args\": {\"code\": \"fn main() {\\n  println!(\\\"Hello world!\\\");\\n}}\"}\n``` \n\nI've started with a basic Rust program that prints \"Hello world!\".";
+
+    #[test]
+    fn a_context_beyond_the_models_limit_is_announced() {
+        let notice = context_limit_notice("Tiny", 32_768, 8_192).unwrap();
+        assert!(notice.contains("Tiny supports at most 8,192 tokens"));
+        assert!(notice.contains("32,768 was reduced to 8,192"));
+        assert!(context_limit_notice("Tiny", 8_192, 8_192).is_none());
+        assert!(context_limit_notice("Unknown", 32_768, 0).is_none());
+        assert_eq!(group_thousands(262_144), "262,144");
+        assert_eq!(group_thousands(512), "512");
+    }
+
+    fn message(id: &str, role: &str, content: &str, at: &str) -> Message {
+        Message { id: id.into(), conversation_id: "c".into(), role: role.into(), content: content.into(), created_at: at.into() }
+    }
+
+    fn attachment(name: &str, excerpt: &str, at: &str) -> crate::storage::Attachment {
+        crate::storage::Attachment {
+            id: name.into(),
+            conversation_id: "c".into(),
+            filename: name.into(),
+            mime: "text/plain".into(),
+            size_bytes: excerpt.len() as u64,
+            text_excerpt: excerpt.into(),
+            kind: "text".into(),
+            status: "ready".into(),
+            created_at: at.into(),
+        }
+    }
+
+    #[test]
+    fn an_attachment_stays_on_the_message_it_was_sent_with() {
+        let history = vec![
+            message("m1", "user", "summarise this", "2026-09-16T10:00:05+00:00"),
+            message("m2", "assistant", "It is about lists.", "2026-09-16T10:00:10+00:00"),
+            message("m3", "user", "and this one?", "2026-09-16T10:01:05+00:00"),
+            message("m4", "assistant", "About trees.", "2026-09-16T10:01:10+00:00"),
+            message("pending", "user", "compare them", ""),
+        ];
+        let files = vec![
+            attachment("lists.txt", "LISTS", "2026-09-16T10:00:00+00:00"),
+            attachment("trees.txt", "TREES", "2026-09-16T10:01:00+00:00"),
+        ];
+        let (turns, ids) = build_turns_with_owners(&history, &files, 100_000);
+        assert_eq!(ids, vec!["m1", "m2", "m3", "m4", "pending"]);
+        assert!(turns[0].content.contains("[Attached file: lists.txt]"));
+        assert!(turns[2].content.contains("[Attached file: trees.txt]"));
+        assert!(!turns[4].content.contains("Attached file"), "the newest turn no longer collects every excerpt");
+        // The same request next turn renders the earlier turns identically.
+        let mut next = history.clone();
+        next[4] = message("m5", "user", "compare them", "2026-09-16T10:02:00+00:00");
+        next.push(message("m6", "assistant", "Lists are linear.", "2026-09-16T10:02:10+00:00"));
+        next.push(message("pending", "user", "which is faster?", ""));
+        let (later, _) = build_turns_with_owners(&next, &files, 100_000);
+        assert_eq!(later[..4], turns[..4], "the prefix is byte-identical");
+    }
+
+    #[test]
+    fn the_changing_context_block_carries_the_listing_and_memory() {
+        let block = changing_context_block("src/\n  main.rs\n", "[Memory]\n- prefers tabs");
+        assert!(block.starts_with("\n\n[Linked project: current directory listing]\nsrc/"));
+        assert!(block.ends_with("[Memory]\n- prefers tabs"));
+        assert_eq!(changing_context_block("", "  "), "");
+        let prompt = build_system_prompt("code", LISTING_IN_LATEST_MESSAGE, "m");
+        assert!(prompt.contains(LISTING_IN_LATEST_MESSAGE));
+        assert!(!prompt.contains("no project linked"));
+    }
+
+    #[test]
+    fn a_plain_document_reply_is_saved_without_its_fence_under_a_name_from_the_request() {
+        assert_eq!(plain_document_body("```markdown\n# Title\n\nBody\n```"), "# Title\n\nBody");
+        assert_eq!(plain_document_body("# Title\nBody"), "# Title\nBody");
+        assert_eq!(plain_document_filename("Write a markdown file about linked lists", "md"), "linked-lists.md");
+        assert_eq!(plain_document_filename("make a csv", "csv"), "document.csv");
+        assert!(structured_document_notice("docx").contains(".txt, .md, .csv, .html or .json"));
+    }
+
+    #[test]
+    fn an_overflow_drops_the_oldest_history_but_never_the_system_prompt_or_the_question() {
+        let mut turns = vec![
+            ChatTurn::text("system", "rules"),
+            ChatTurn::text("user", &"a".repeat(3000)),
+            ChatTurn::text("assistant", &"b".repeat(3000)),
+            ChatTurn::text("user", &"c".repeat(3000)),
+            ChatTurn::text("assistant", &"d".repeat(3000)),
+            ChatTurn::text("user", "the question"),
+        ];
+        let removed = drop_oldest_history(&mut turns, 1200);
+        assert_eq!(removed, 2, "one message frees 1,000 tokens; its reply goes with it");
+        assert_eq!(turns[0].role, "system");
+        assert_eq!(turns[1].role, "user");
+        assert_eq!(turns.last().unwrap().content, "the question");
+        assert_eq!(drop_oldest_history(&mut turns, u32::MAX), 2);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(drop_oldest_history(&mut turns, u32::MAX), 0, "nothing left to drop");
+    }
+
+    #[test]
+    fn a_chat_prompt_teaches_no_tool_protocol_and_claims_no_project() {
+        let chat = build_system_prompt("chat", "", "Model");
+        assert!(!chat.contains("```tool"), "{chat}");
+        assert!(!chat.contains("create_document"));
+        assert!(!chat.contains("linked project"));
+        assert!(!chat.contains("run approved tools"));
+        // The document protocol travels only with a request for a document.
+        assert!(document_tool_note().contains("create_document"));
+        // A code session still describes its project and its read tools.
+        let code = build_system_prompt("code", "Project 'p' at C:/p", "Model");
+        assert!(code.contains("read_file"));
+        assert!(!code.contains("create_document"));
+    }
+
+    #[test]
+    fn only_an_offered_tool_is_an_action() {
+        let plain_chat = ChatToolOffer::for_request(false, false);
+        assert!(plain_chat.is_empty());
+        assert!(plain_chat.call_in(INVENTED_TOOL_REPLY).is_none());
+        // Nothing offered: an unreadable block earns no correction, so the
+        // model is never told its answer should have been a tool call.
+        assert!(crate::agent_runner::action_problem(INVENTED_TOOL_REPLY).is_some());
+        assert!(!plain_chat.attempted_in(INVENTED_TOOL_REPLY));
+
+        let document = ChatToolOffer::for_request(false, true);
+        assert!(document.offers("create_document"));
+        assert!(!document.offers("read_file"));
+        // Offered, but the model invented a different name: still no correction.
+        assert!(!document.attempted_in(INVENTED_TOOL_REPLY));
+        // A broken call to the offered tool is corrected.
+        let broken_document = "```tool\n{\"name\":\"create_document\",\"args\":{\"filename\":\"a.md\",\"text\":\"x\"\n```";
+        assert!(document.attempted_in(broken_document));
+
+        let code = ChatToolOffer::for_request(true, false);
+        assert!(code.offers("read_file") && code.offers("manage_context"));
+        assert!(!code.offers("create_document") && !code.offers("write_file"));
+    }
+
+    #[test]
+    fn a_tool_name_is_read_from_a_call_whose_json_is_broken() {
+        assert_eq!(tool_name_in(INVENTED_TOOL_REPLY).as_deref(), Some("rust_program"));
+        assert_eq!(tool_name_in("{\"name\" : \"read_file\", \"args\": {"), Some("read_file".into()));
+        assert_eq!(tool_name_in("no action here"), None);
+    }
+
     #[test]
     fn system_prompt_knows_projects() {
-        let snap = "Project 'RageV' at D:/Dev/RageV\nBuild: CMake\nTree (top levels):\n  src/\n"
+        let snap = "Project 'SampleEngine' at /projects/sample-engine\nBuild: CMake\nTree (top levels):\n  src/\n"
             .to_string();
-        let p = build_system_prompt("code", &snap, "Qwen 14B");
-        assert!(p.contains("RageV"), "{p}");
+        let p = build_system_prompt("code", &snap, "Example 14B");
+        assert!(p.contains("SampleEngine"), "{p}");
         assert!(p.contains("/init"), "{p}");
         assert!(p.contains("Never claim you cannot"), "{p}");
-        let p = build_system_prompt("code", "", "Qwen 14B");
+        let p = build_system_prompt("code", "", "Example 14B");
         assert!(p.contains("no project linked"), "{p}");
-        let p = build_system_prompt("chat", "", "Qwen 14B");
+        let p = build_system_prompt("chat", "", "Example 14B");
         assert!(!p.contains("/init"), "{p}");
     }
 
@@ -11266,6 +13207,7 @@ mod tests {
                 &state,
                 &None,
                 &workspace,
+                &ChatToolOffer::for_request(true, false),
                 &response,
                 &mut turns,
                 &mut memory,
@@ -11334,6 +13276,7 @@ mod tests {
                     &state,
                     &None,
                     &workspace,
+                    &ChatToolOffer::for_request(true, false),
                     &call,
                     &mut turns,
                     &mut memory,
@@ -11354,7 +13297,7 @@ mod tests {
         }
         assert!(CHAT_TOOL_ROUNDS >= 24);
         assert_eq!(turns.len(), 12);
-        assert!(run_chat_tool_round(&state, &None, &workspace,
+        assert!(run_chat_tool_round(&state, &None, &workspace, &ChatToolOffer::for_request(true, false),
             "```tool\n{\"name\":\"manage_context\",\"args\":{\"keep\":[\"chunk-5\"],\"release\":[\"chunk-1\"]}}\n```",
             &mut turns, &mut memory, &sender, "chunk-reply", 7).await);
         assert!(turns[1].content.contains("Body released"));
@@ -11435,6 +13378,7 @@ mod tests {
                 &state,
                 &None,
                 &workspace,
+                &ChatToolOffer::for_request(true, false),
                 "```tool\n{\"name\":\"read_file\",\"args\":{\"path\":\"readme.txt\"}}\n```",
                 &mut turns,
                 &mut memory,
@@ -11457,7 +13401,7 @@ mod tests {
             .as_ref()
             .unwrap()
             .contains("verified file content"));
-        assert!(run_chat_tool_round(&state, &None, &workspace,
+        assert!(run_chat_tool_round(&state, &None, &workspace, &ChatToolOffer::for_request(true, false),
             "```tool\n{\"name\":\"write_file\",\"args\":{\"path\":\"blocked.txt\",\"content\":\"never write\"}}\n```",
             &mut turns, &mut memory, &sender, "inspection-reply", 2).await);
         assert!(!root.join("blocked.txt").exists());

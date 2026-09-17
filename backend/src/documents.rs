@@ -527,7 +527,52 @@ pub fn requested_document_kind(text: &str) -> Option<&'static str> {
     if ["html file", "html page", "web page"].iter().any(|needle| has(needle)) {
         return Some("html");
     }
+    if ["json file", ".json file"].iter().any(|needle| has(needle)) {
+        return Some("json");
+    }
+    if ["text file", "txt file", ".txt file", "txt", "plain text file"].iter().any(|needle| has(needle)) {
+        return Some("txt");
+    }
     None
+}
+
+/// Save text a model wrote as a plain document (txt, md, csv, html, json) in
+/// the conversation's artifacts, the same place create_document saves to.
+/// Returns the stored file name.
+pub async fn save_plain_document(
+    storage: &tokio::sync::Mutex<crate::storage::Storage>,
+    artifacts_dir: &std::path::Path,
+    conversation_id: &str,
+    filename: &str,
+    kind: &str,
+    text: &str,
+) -> Result<String, String> {
+    let mime = match kind {
+        "md" => "text/markdown",
+        "csv" => "text/csv",
+        "html" => "text/html",
+        "json" => "application/json",
+        _ => "text/plain",
+    };
+    let path = store(artifacts_dir, conversation_id, filename, text.as_bytes())?;
+    let row = crate::storage::ArtifactRow {
+        id: uuid::Uuid::new_v4().to_string(),
+        conversation_id: conversation_id.into(),
+        filename: path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| filename.into()),
+        path: path.to_string_lossy().into_owned(),
+        mime: mime.into(),
+        size_bytes: text.len() as u64,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    storage
+        .lock()
+        .await
+        .record_artifact(&row)
+        .map_err(|error| error.to_string())?;
+    Ok(row.filename)
 }
 
 /// The fields a kind needs, when the spec carries none of them. A blank

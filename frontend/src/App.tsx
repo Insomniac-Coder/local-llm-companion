@@ -10,6 +10,7 @@ import ShareDialog, { type ShareOptions } from './components/ShareDialog';
 import RecoveryBanner from './components/RecoveryBanner';
 import ProjectActions, { useWorkspaceBranch } from './components/CodeHeader';
 import AttachChips from './components/AttachChips';
+import StartScripts from './components/StartScripts';
 import SessionMenu from './components/SessionMenu';
 import PermissionsModal from './components/PermissionsModal';
 import RightPanel from './components/RightPanel';
@@ -23,15 +24,15 @@ import Welcome from './components/Welcome';
 import ModelsPage from './components/ModelsPage';
 import RuntimePage from './components/RuntimePage';
 import ToolsPage from './components/ToolsPage';
-import { AUTO_POLICY_DESCRIPTION, PROJECT_BOUNDARY_DESCRIPTION, SEARCH_PERMISSION_DESCRIPTION } from './components/permissionCopy';
+import { PERMISSION_MODE_DESCRIPTIONS, PERMISSION_MODE_LABELS, PROJECT_BOUNDARY_DESCRIPTION, SEARCH_PERMISSION_DESCRIPTION } from './components/permissionCopy';
 import { VisibleOutputMeter, type GenerationPhase, type OutputTiming } from './services/outputTiming';
 import { applyAgentContext } from './services/contextUsage';
 import { currentActivitySnapshot, parseActivityStart, visibleWorkActivity } from './services/workElapsed';
-import { type CodeIntent, matchesShortcut, selectAvailableModel, shouldStartAgent, updateMessage, WORKBENCH_DESTINATIONS } from './services/workbench';
+import { APPROVE_PLAN_MESSAGE, autoTitle, matchesShortcut, nextPermissionMode, PERMISSION_MODE_SETTLE_MS, PERMISSION_MODES, PermissionModeSaver, selectAvailableModel, shouldStartAgent, updateMessage, WORKBENCH_DESTINATIONS } from './services/workbench';
 import { Button, Dialog, IconButton, Kbd, Lamp, Notice, PopDivider, PopItem, PopLabel, Popover, Toggle } from './ui/primitives';
 import { Icon, type IconName } from './ui/Icon';
 import {
-  agentRuns, classifyRequest, compactConversation, createConversation, deleteConversation, deleteModel, discardStale, editMessage, exportConversation, forkConversation,
+  agentRuns, compactConversation, createConversation, deleteConversation, deleteModel, discardStale, editMessage, exportConversation, forkConversation,
   getContext, getConversationMetrics, getMessages, getRecovery, getPermissionMode, getSettings, inferenceStart,
   inferenceStatus, listCommands, listConversations, listDownloads,
   listModels, listSessions, listTools, listWorkspaces, patchSession, stopAgent,
@@ -39,7 +40,7 @@ import {
   setPermissionMode as updatePermissionMode, startAgent, stopChat, streamChat, unloadModels,
   systemInfo, uploadAttachment, modelDetail,
   type AgentEvent, type CommandItem, type ContextInfo, type Conversation, type DownloadInfo,
-  type InferenceStatus, type ModelMeta, type RecoveryInfo, type SessionInfo,
+  type InferenceStatus, type ModelMeta, type PermissionMode, type RecoveryInfo, type SessionInfo,
   type StreamUsage, type PersistedMetric, type ToolDescriptor, type Workspace,
 } from './services/api';
 
@@ -91,6 +92,8 @@ export default function App() {
   const modelDefaultsRead = useRef(false);
   const [reasoningCapable, setReasoningCapable] = useState(false);
   const [convs, setConvs] = useState<Conversation[]>([]);
+  const convsRef = useRef(convs);
+  convsRef.current = convs;
   const [convId, setConvId] = useState<string | null>(null);
   const [msgs, setMsgs] = useState<Msg[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -141,8 +144,22 @@ export default function App() {
   const refreshAgentActivity = useRef<() => void>(() => {});
   const [agentPhase, setAgentPhase] = useState('PLANNING');
   // The persisted backend policy is authoritative; browser storage is not a grant.
-  const [permissionMode, setPermissionModeState] = useState<'ask' | 'auto'>('ask');
+  const [permissionMode, setPermissionModeState] = useState<PermissionMode>('ask');
+  // True until the saved mode is read; saves themselves never lock the picker.
   const [permissionModeBusy, setPermissionModeBusy] = useState(true);
+  const modeSaver = useRef<PermissionModeSaver<PermissionMode, { mode: PermissionMode; resumed: number }>>(null as never);
+  if (!modeSaver.current) {
+    modeSaver.current = new PermissionModeSaver<PermissionMode, { mode: PermissionMode; resumed: number }>('ask', updatePermissionMode, ({ mode: saved, result, error }) => {
+      setPermissionModeState(saved);
+      if (error !== undefined) {
+        notify('error', (error as any)?.message ?? 'Could not change permission mode.');
+        return;
+      }
+      localStorage.setItem('companion.permissionMode', saved);
+      const resumed = result?.resumed ? ` — resumed ${result.resumed} waiting task${result.resumed === 1 ? '' : 's'}` : '';
+      notify('success', `${PERMISSION_MODE_LABELS[saved]} mode${resumed}. ${PERMISSION_MODE_DESCRIPTIONS[saved]}`);
+    });
+  }
   const [compacting, setCompacting] = useState(false);
   const [diffWs, setDiffWs] = useState<string | null>(null);
   const [recovery, setRecovery] = useState<RecoveryInfo | null>(null);
@@ -192,7 +209,9 @@ export default function App() {
     window.addEventListener('companion:appearance', onAppearance);
     const onSettings = (event: Event) => {
       const value = (event as CustomEvent).detail;
-      setPermissionModeState(value.agent?.autonomous_enabled ? 'auto' : 'ask');
+      const saved: PermissionMode = (PERMISSION_MODES as readonly string[]).includes(value.agent?.permission_mode) ? value.agent.permission_mode : value.agent?.autonomous_enabled ? 'auto' : 'ask';
+      modeSaver.current.reset(saved);
+      setPermissionModeState(saved);
       if (value.keyboard?.command_palette) setPaletteShortcut(value.keyboard.command_palette);
       preferredDefaultModel.current = value.general?.default_model ?? '';
       setShowGenerationSpeed(value.diagnostics?.show_generation_speed ?? true);
@@ -303,6 +322,7 @@ export default function App() {
     systemInfo().then((v) => { setSys(v); setBackendUp(true); }).catch(() => { setSys(null); setBackendUp(false); });
     inferenceStatus().then(setInf).catch(() => setInf(null));
     getPermissionMode().then((result) => {
+      modeSaver.current.reset(result.mode);
       setPermissionModeState(result.mode);
       localStorage.setItem('companion.permissionMode', result.mode);
     }).catch(() => notify('warning', 'Could not read the saved approval policy. Reconnect to the local runtime before changing it.'))
@@ -311,24 +331,32 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  async function changePermissionMode(next: 'ask' | 'auto') {
-    if (permissionModeBusy || next === permissionMode) return;
-    const previous = permissionMode;
+  /** Returns whether the mode is now `next`. The picker shows it at once. */
+  function changePermissionMode(next: PermissionMode): Promise<boolean> {
     setPermissionModeState(next);
-    setPermissionModeBusy(true);
-    try {
-      const result = await updatePermissionMode(next);
-      setPermissionModeState(result.mode);
-      localStorage.setItem('companion.permissionMode', result.mode);
-      notify('success', result.mode === 'auto'
-        ? `Auto mode on${result.resumed ? ` — resumed ${result.resumed} waiting task${result.resumed === 1 ? '' : 's'}` : ''}.`
-        : 'Ask mode on — agent actions will request approval.');
-    } catch (error: any) {
-      setPermissionModeState(previous);
-      notify('error', error?.message ?? 'Could not change permission mode.');
-    } finally {
-      setPermissionModeBusy(false);
+    return modeSaver.current.request(next);
+  }
+
+  /** Approving a plan switches the mode first, then carries the plan out.
+   *  True once the work started; otherwise the reason was shown. */
+  async function approvePlan(next: 'accept_edits' | 'ask'): Promise<boolean> {
+    if (busy || agentBusy) {
+      notify('warning', 'Wait for the current work to finish, then approve the plan.');
+      return false;
     }
+    if (!inf?.running || models.find((model) => model.loaded)?.id !== modelId) {
+      notify('warning', 'No model is loaded. Load one from the panel at the bottom left, then approve the plan.');
+      return false;
+    }
+    if (!(await changePermissionMode(next))) return false;
+    return send(APPROVE_PLAN_MESSAGE, next);
+  }
+
+  /** "No, keep planning": the next message plans too. */
+  async function keepPlanning(): Promise<boolean> {
+    const kept = await changePermissionMode('plan');
+    composerRef.current?.focus();
+    return kept;
   }
 
   // Workspace IDs are security boundaries. A missing one requires an explicit
@@ -537,13 +565,17 @@ export default function App() {
     }
   }
 
-  async function send(override?: string) {
+  /** `modeOverride`: the permission mode this message runs in when it was
+   *  changed in the same step (approving a plan), before state has updated. */
+  async function send(override?: string, modeOverride?: PermissionMode): Promise<boolean> {
     const raw = override ?? input;
-    if (!raw.trim() || busy || agentBusy || (convId && pendingAgentStarts.current.has(convId))) return;
+    if (!raw.trim() || busy || agentBusy || (convId && pendingAgentStarts.current.has(convId))) return false;
     if (!raw.trim().startsWith('/') && (!inf?.running || models.find((model) => model.loaded)?.id !== modelId)) {
       notify('warning', 'No model is loaded. Load one from the panel at the bottom left — your draft is kept.');
-      return;
+      return false;
     }
+    // A mode chosen with Shift+Tab a moment ago is in effect before work starts.
+    if (mode === 'code' && !(await modeSaver.current.settle())) return false;
     let cid = convId;
     if (!cid) {
       try {
@@ -551,7 +583,7 @@ export default function App() {
         if (mode === 'code' && !workspaces.some((workspace) => workspace.id === wsId)) {
           notify('warning', 'Choose a project first.');
           setProjectLauncherOpen(true);
-          return;
+          return false;
         }
         const c = await createConversation(raw.slice(0, 60) || 'New chat', modelId, extra);
         setConvs((prev) => [c, ...prev]);
@@ -561,36 +593,10 @@ export default function App() {
         localStorage.setItem(`companion.last.${mode}`, cid);
       } catch (e: any) {
         setMsgs((m) => [...m, { id: `tmp-${Date.now()}`, role: 'tool', text: `Error: ${e?.message ?? e}`, time: '' }]);
-        return;
+        return false;
       }
     }
     const text = raw;
-    let inferredIntent: CodeIntent = 'ask';
-    let classified = false;
-    if (mode === 'code' && !text.trim().startsWith('/')) {
-      const routingController = new AbortController();
-      abort.current = routingController;
-      setBusy(true);
-      setChatActivity({conversationId: cid, startedAt: Date.now()});
-      setStatusLine('Understanding your request…');
-      try {
-        const decision = await classifyRequest(text, cid, routingController.signal);
-        if (routingController.signal.aborted || conversationRef.current !== cid) return;
-        inferredIntent = decision.intent;
-        classified = decision.source === 'model';
-        // A heuristic route is a normal outcome (the backend logs why the
-        // model's decision was unusable); only an unusable response is
-        // worth telling the user about, and even then the message goes on.
-        if (decision.source === 'fallback') notify('info', 'The routing check returned nothing usable; answering this as a question.');
-      } catch (error: any) {
-        if (error?.name !== 'AbortError') notify('error', error?.message ?? 'Could not classify the message. Your draft is kept.');
-        return;
-      } finally {
-        setBusy(false);
-        setChatActivity(null);
-        setStatusLine('');
-      }
-    }
     if (override === undefined) {
       setInput('');
       if (composerRef.current) composerRef.current.style.height = 'auto';
@@ -600,31 +606,32 @@ export default function App() {
     setMsgs((m) => [...m, { id: tmpId, role: 'user', text, time: '' }]);
 
     followOutput.current = true;
-    if (shouldStartAgent(mode, inferredIntent, text)) {
+    if (shouldStartAgent(mode, text)) {
       const linkedWorkspace = convs.find((conversation) => conversation.id === cid)?.workspace ?? wsId;
       const workspace = workspaces.find((candidate) => candidate.id === linkedWorkspace);
       if (!workspace) {
         setMsgs((messages) => messages.filter((message) => message.id !== tmpId));
         notify('warning', 'Choose a project so the agent has a safe working boundary.');
         setProjectLauncherOpen(true);
-        return;
+        return false;
       }
       setAgentBusy(true);
       pendingAgentStarts.current.add(cid);
       setAgentActivity({ conversationId: cid, runId: '', startedAt: null });
       setAgentPhase('ROUTING');
+      let started = false;
       try {
-        const agentMode = inferredIntent === 'plan' ? 'plan' : 'agent';
-        const run = await startAgent(workspace.path, text.trim(), agentMode, cid, {search, classified, reasoning});
+        const agentMode = (modeOverride ?? modeSaver.current.mode) === 'plan' ? 'plan' : 'agent';
+        const run = await startAgent(workspace.path, text.trim(), agentMode, cid, {search, reasoning});
         if ('run_id' in run) {
+          started = true;
+          // Progress and approvals show in the conversation, as in Claude
+          // Code; the inspector stays as the user left it.
           if (conversationRef.current === cid) {
             setFocusRun(run.run_id);
             setAgentPhase('PLANNING');
-            setRightOpen(true);
-            setRightTab('activity');
           }
           void getContext(cid).then((context) => { if (conversationRef.current === cid) setCtx(context); }).catch(() => {});
-          notify('success', 'Work started. Progress and approvals appear in the inspector.');
           void maybeAutoTitle(cid, text);
         } else {
           if (conversationRef.current === cid) {
@@ -647,8 +654,11 @@ export default function App() {
         if (conversationRef.current === cid) refreshAgentActivity.current();
         void reloadMsgs(cid);
         refreshSessions();
+        // The run records the model now working on this session: the "Last used
+        // with" notice must see it.
+        void refreshConvs();
       }
-      return;
+      return started;
     }
     setBusy(true);
     setChatActivity({ conversationId: cid, startedAt: Date.now() });
@@ -677,6 +687,16 @@ export default function App() {
             lastTpsPush.current = now;
             setLiveTps(rate);
           }
+          setMsgs((messages) => updateMessage(messages, `${tmpId}-a`, (message) => ({ ...message, text: acc })));
+        },
+        onAction: ({ state, name }) => {
+          if (conversationRef.current !== cid) return;
+          const label = name ? name.replace(/_/g, ' ') : 'an action';
+          setStatusLine(state === 'started' ? `Preparing ${label}…` : state === 'incomplete' ? `The ${label} request was cut off.` : '');
+        },
+        onReplace: (text) => {
+          acc = text;
+          if (conversationRef.current !== cid) return;
           setMsgs((messages) => updateMessage(messages, `${tmpId}-a`, (message) => ({ ...message, text: acc })));
         },
         onReasoning: (t) => {
@@ -725,14 +745,11 @@ export default function App() {
             void send(cmd.text);
           } else if (cmd?.type === 'agent' && cmd.run_id) {
             setFocusRun(cmd.run_id);
-            setRightOpen(true);
-            setRightTab('activity');
-            notify('success', `Agent run started (${cmd.run_id.slice(0, 8)}).`);
           }
           if (cid) void maybeAutoTitle(cid, text);
         },
         onError: (msg) => { if (conversationRef.current === cid) setMsgs((m) => [...m, { id: `tmp-${Date.now()}`, role: 'tool', text: `Error: ${msg}`, time: '' }]); },
-      }, ctl.signal, { reasoning, search, classified });
+      }, ctl.signal, { reasoning, search });
     } catch (e: any) {
       if (e?.name !== 'AbortError' && conversationRef.current === cid) {
         setMsgs((m) => [...m, { id: `tmp-${Date.now()}`, role: 'tool', text: `Error: ${e?.message ?? e}`, time: '' }]);
@@ -743,7 +760,11 @@ export default function App() {
       setStatusLine('');
       void reloadMsgs(cid);
       refreshSessions();
+      // A reply records the model that answered; without reloading the list the
+      // "Last used with another model" notice stayed after replying.
+      void refreshConvs();
     }
+    return true;
   }
 
   function regenerate() {
@@ -811,6 +832,16 @@ export default function App() {
       }
       if (e.key === 'Escape') { setCmdMenu([]); return; }
     }
+    // Shift+Tab cycles the permission mode, as in Claude Code.
+    if (mode === 'code' && e.key === 'Tab' && e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
+      e.preventDefault();
+      if (!busy && !agentBusy && !permissionModeBusy) {
+        const next = nextPermissionMode(permissionMode);
+        setPermissionModeState(next);
+        modeSaver.current.schedule(next, PERMISSION_MODE_SETTLE_MS);
+      }
+      return;
+    }
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void send(); }
   }
 
@@ -868,7 +899,10 @@ export default function App() {
       a.download = `session-${target.slice(0, 8)}.json`;
       a.click();
       URL.revokeObjectURL(a.href);
-      notify('success', 'Session exported.');
+      const requests = Array.isArray(data?.model_requests) ? data.model_requests.length : 0;
+      notify('success', requests > 0
+        ? `Session exported, including ${requests} model request record${requests === 1 ? '' : 's'}. These can contain file contents the assistant read; check before sharing.`
+        : 'Session exported.');
     } catch (e: any) {
       notify('error', e?.message ?? 'Export failed.');
     }
@@ -903,9 +937,9 @@ export default function App() {
   }
 
   async function maybeAutoTitle(cid: string, userText: string) {
-    const cur = convs.find((c) => c.id === cid);
-    if (!cur || (cur.title !== 'New chat' && cur.title !== 'New Chat')) return;
-    const t = userText.replace(/^\/\w+\s*/, '').trim().slice(0, 48);
+    // The latest list, not the one this send started with: a session created
+    // moments ago is only in the newer one.
+    const t = autoTitle(convsRef.current.find((c) => c.id === cid)?.title, userText);
     if (!t) return;
     try {
       await patchConversation(cid, { title: t });
@@ -976,17 +1010,19 @@ export default function App() {
   async function guardedSwitch(kind: 'load' | 'start', id: string, force: boolean) {
     setLoadingModel(true);
     try {
-      if (kind === 'load') {
-        await loadModel(id, force);
-      } else {
-        await inferenceStart(id, force);
-      }
+      // The load reports what the person should know about it (a CPU
+      // fallback, a context larger than the model supports).
+      const started: { notices?: string[] } | undefined = kind === 'load'
+        ? await loadModel(id, force)
+        : await inferenceStart(id, force);
       await refreshModels();
       const status = await inferenceStatus();
       setInf(status);
       const name = models.find((model) => model.id === id)?.name ?? id;
       if (!force) notify('success', kind === 'load' ? `${name} is loaded and ready.` : 'Inference started.');
-      if (status.runtime_notice) notify('info', status.runtime_notice);
+      const notices = started?.notices ?? [];
+      for (const notice of notices) notify('warning', notice);
+      if (status.runtime_notice && !notices.includes(status.runtime_notice)) notify('info', status.runtime_notice);
     } catch (e: any) {
       if (e?.status === 409 && !force) {
         setGuard({ kind, id, detail: e.message });
@@ -1485,7 +1521,7 @@ export default function App() {
 
         {backendUp === false && (
           <Notice tone="error" className="global-notice" title="The local runtime isn’t responding">
-            Close this window and start Companion again with <code>.\run.ps1</code>. Your conversations are safe on disk.
+            Close this window and start Companion again with its start script: <StartScripts />. Your conversations are safe on disk.
           </Notice>
         )}
 
@@ -1554,6 +1590,7 @@ export default function App() {
                       ) : (
                         <div key={m.id} className={`message-row ${m.role}`}>
                           <MessageView
+                            sessionMode={mode}
                             activities={m.activities}
                             role={m.role}
                             text={m.text}
@@ -1602,6 +1639,8 @@ export default function App() {
                           if (convId) void reloadMsgs(convId);
                           void refreshConvs();
                         }}
+                        onApprovePlan={approvePlan}
+                        onKeepPlanning={keepPlanning}
                       />
                     )}
                   </div>
@@ -1666,7 +1705,7 @@ export default function App() {
                       el.style.height = `${Math.min(el.scrollHeight, 240)}px`;
                     }}
                     onKeyDown={composerKey}
-                    placeholder={dragOver ? 'Drop to attach' : mode === 'code' ? 'Ask, plan, or describe a change…' : 'Ask anything, or drop a file…'}
+                    placeholder={dragOver ? 'Drop to attach' : mode === 'code' ? 'Ask, plan, or describe a change… (Shift+Tab: mode)' : 'Ask anything, or drop a file…'}
                     aria-label="Message composer"
                     disabled={loadingModel || agentBusy}
                   />
@@ -1680,9 +1719,10 @@ export default function App() {
                       />
                       <IconButton icon="paperclip" label={convId ? 'Attach a file' : 'Send a first message to attach files'} tipSide="top" disabled={!convId || busy || agentBusy} onClick={() => fileRef.current?.click()} />
                       {mode === 'code' && (
-                        <span className={`permission-mode ${permissionMode}`} role="group" aria-label="Agent approval policy" title={`${AUTO_POLICY_DESCRIPTION} ${PROJECT_BOUNDARY_DESCRIPTION} ${SEARCH_PERMISSION_DESCRIPTION}`}>
-                          <button type="button" disabled={permissionModeBusy || busy || agentBusy} className={permissionMode === 'ask' ? 'active' : ''} aria-pressed={permissionMode === 'ask'} onClick={() => void changePermissionMode('ask')}>Ask</button>
-                          <button type="button" disabled={permissionModeBusy || busy || agentBusy} className={permissionMode === 'auto' ? 'active' : ''} aria-pressed={permissionMode === 'auto'} onClick={() => void changePermissionMode('auto')}>Auto</button>
+                        <span className={`permission-mode ${permissionMode}`} role="group" aria-label="Permission mode (Shift+Tab to cycle)" title={`${PROJECT_BOUNDARY_DESCRIPTION} ${SEARCH_PERMISSION_DESCRIPTION}`}>
+                          {PERMISSION_MODES.map((option) => (
+                            <button key={option} type="button" disabled={permissionModeBusy || busy || agentBusy} className={permissionMode === option ? 'active' : ''} aria-pressed={permissionMode === option} title={PERMISSION_MODE_DESCRIPTIONS[option]} onClick={() => void changePermissionMode(option)}>{PERMISSION_MODE_LABELS[option]}</button>
+                          ))}
                         </span>
                       )}
                       <Toggle

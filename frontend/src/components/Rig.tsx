@@ -1,8 +1,10 @@
+import { loadErrorSummary } from '../services/loadError';
 import { useEffect, useState } from 'react';
 import { cancelLoad, getLoadProgress, getMetrics, type InferenceStatus, type LoadProgress, type ModelMeta } from '../services/api';
 import { Button, IconButton, Lamp, Meter, PopDivider, PopItem, PopLabel, Popover } from '../ui/primitives';
 import { Icon } from '../ui/Icon';
 import { isReading, type ResourceSample } from './resourceTelemetry';
+import StartScripts from './StartScripts';
 
 export type MachineActivity = 'idle' | 'generating' | 'agent' | 'waiting';
 
@@ -168,15 +170,17 @@ export default function Rig(props: Props) {
         </button>
         {shown && <div className="rig-spec readout">{spec(shown, context)}</div>}
 
-        {backendUp === false && <p className="rig-detail error">Start Companion again with run.ps1 to reconnect.</p>}
+        {backendUp === false && <p className="rig-detail error">Start Companion again with <StartScripts /> to reconnect.</p>}
 
         {stage && (
           <>
-            <p className={`rig-detail${stage.stage === 'error' ? ' error' : ''}`}>{stage.detail || `${stage.stage}…`}</p>
+            {stage.stage === 'error'
+              ? <p className="rig-detail error" title={stage.detail}>{loadErrorSummary(stage.detail)}</p>
+              : <p className="rig-detail">{stage.detail || `${stage.stage}…`}</p>}
             {stage.stage !== 'error' && <div className="rig-progress" aria-hidden="true"><i /></div>}
           </>
         )}
-        {!stage && !loadingModel && inf?.last_error && !loaded && backendUp !== false && <p className="rig-detail error">{inf.last_error}</p>}
+        {!stage && !loadingModel && inf?.last_error && !loaded && backendUp !== false && <p className="rig-detail error" title={inf.last_error}>{loadErrorSummary(inf.last_error)}</p>}
 
         {sample && backendUp !== false && (
           <div className="rig-meters">

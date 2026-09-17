@@ -1,9 +1,12 @@
+import { MODES, performanceMode, getCalibration, profileSummary, staleReason, type CalibrationStatus } from '../services/calibration';
+import { contextSupportWarning } from '../services/contextSupport';
+import { cacheConflict, flashAttentionRequired, FLASH_ATTENTION_CONFLICT_NOTE, FLASH_ATTENTION_REQUIRED_NOTE, quantizedCacheUnavailable, QUANTIZED_CACHE_UNAVAILABLE_NOTE } from '../services/cacheCompatibility';
 import { Children, cloneElement, isValidElement, useEffect, useId, useRef, useState, type ReactElement, type ReactNode } from 'react';
 import { getSettings, putSettings, listModels, scanModels, getRuntimePolicy, type ModelMeta } from '../services/api';
 import { pushToast, type Toast } from './Toasts';
 import { defaultModelOptions, type ModelListState } from './settingsModels';
 import { expertSectionOpen, settingsSearchMatches, updateSetting } from './settingsForm';
-import { AUTO_POLICY_DESCRIPTION, PROJECT_BOUNDARY_DESCRIPTION, SEARCH_PERMISSION_DESCRIPTION } from './permissionCopy';
+import { PERMISSION_MODE_DESCRIPTIONS, PERMISSION_MODE_LABELS, PROJECT_BOUNDARY_DESCRIPTION, SEARCH_PERMISSION_DESCRIPTION } from './permissionCopy';
 import { Button, Lamp } from '../ui/primitives';
 import { Icon, type IconName } from '../ui/Icon';
 
@@ -41,17 +44,34 @@ export function SettingField({ label, children, description }: { label: string; 
 }
 
 export function HardwareOverrides({ settings, set }: { settings: any; set: SetPreference }) {
-  if (settings.runtime_auto !== false) return null;
+  if (performanceMode(settings) !== 'manual') return null;
   return <div className="settings-hardware-overrides">
     <p className="settings-capability-note">Manual values apply after Save and the next model load. Your previous values are kept when automatic management is on.</p>
     <div className="settings-fields">
       <SettingField label="CPU threads"><Num obj={settings.hardware} k="cpu_threads" set={(value) => set(['hardware', 'cpu_threads'], value)} /></SettingField>
       <SettingField label="GPU layers" description="Use −1 to let the runtime choose how many layers to place on the GPU."><Num obj={settings.hardware} k="gpu_layers" set={(value) => set(['hardware', 'gpu_layers'], value)} /></SettingField>
-      <SettingField label="Flash attention"><input type="checkbox" className="switch" checked={!!settings.hardware?.flash_attention} onChange={(event) => set(['hardware', 'flash_attention'], event.target.checked)} /></SettingField>
+      <SettingField label="Flash attention" description={flashAttentionRequired(settings, performanceMode(settings)) ? FLASH_ATTENTION_REQUIRED_NOTE : cacheConflict(settings, performanceMode(settings)) ? <span className="settings-context-warning">{FLASH_ATTENTION_CONFLICT_NOTE}</span> : undefined}><input type="checkbox" className="switch" checked={!!settings.hardware?.flash_attention} disabled={flashAttentionRequired(settings, performanceMode(settings))} onChange={(event) => set(['hardware', 'flash_attention'], event.target.checked)} /></SettingField>
       <SettingField label="KV cache on GPU"><input type="checkbox" className="switch" checked={!!settings.hardware?.kv_cache_gpu} onChange={(event) => set(['hardware', 'kv_cache_gpu'], event.target.checked)} /></SettingField>
       <SettingField label="Prompt batch size"><Num obj={settings.inference} k="batch_size" set={(value) => set(['inference', 'batch_size'], value)} /></SettingField>
+      <SettingField label="Prompt threads" description="Threads for reading prompts; 0 uses the CPU threads value. Prompts come in short bursts, so this can be higher than the generation threads without keeping the machine busy."><Num obj={settings.hardware} k="threads_batch" set={(value) => set(['hardware', 'threads_batch'], value)} /></SettingField>
+      <SettingField label="Wait between operations" description="Spin keeps worker threads busy-waiting for the next step (slightly faster, uses CPU while idle). Sleep lets them rest."><select value={settings.hardware?.poll === 0 ? 'sleep' : 'spin'} onChange={(event) => set(['hardware', 'poll'], event.target.value === 'sleep' ? 0 : 50)}><option value="spin">Spin (runtime default)</option><option value="sleep">Sleep</option></select></SettingField>
+      <SettingField label="Priority" description="Low lets other applications take the CPU first when they need it."><select value={String(settings.hardware?.priority ?? 0)} onChange={(event) => set(['hardware', 'priority'], Number(event.target.value))}><option value="0">Normal</option><option value="-1">Low</option></select></SettingField>
     </div>
   </div>;
+}
+
+/** What the selected mode means for the default model, in measured terms. */
+export function PerformanceModeNote({ settings, status }: { settings: any; status: CalibrationStatus | null }) {
+  const mode = performanceMode(settings);
+  const base = 'Applies at the next model load. Profiles are measured per model: calibrate a model from its details on the Models page.';
+  if (mode === 'auto' || mode === 'manual') return <span>{base}</span>;
+  if (!settings?.general?.default_model) return <span>{base} Choose a default model to see what this profile does for it.</span>;
+  const calibration = status?.calibration;
+  if (!calibration) return <span>{base} The default model is not calibrated yet, so it will load with automatic settings until it is.</span>;
+  const stale = staleReason(status);
+  if (stale) return <span>{base} {stale}</span>;
+  const profile = calibration.profiles.find((candidate) => candidate.name === mode);
+  return <span>{base}{profile ? <span className="settings-mode-measured"> For the default model: {profileSummary(profile)}.</span> : null}</span>;
 }
 
 export function RuntimeSummary({ policy, dirty }: { policy: RuntimePolicy; dirty: boolean }) {
@@ -93,6 +113,14 @@ export default function SettingsPanel({ setToasts }: { setToasts: React.Dispatch
   const [sections, setSections] = useState<{ id: string; name: string }[]>([]);
   const [current, setCurrent] = useState('');
   const [models, setModels] = useState<ModelMeta[]>([]);
+  const [calibrationStatus, setCalibrationStatus] = useState<CalibrationStatus | null>(null);
+  const defaultModelId: string = s?.general?.default_model ?? '';
+  useEffect(() => {
+    if (!defaultModelId) { setCalibrationStatus(null); return; }
+    let current = true;
+    getCalibration(defaultModelId).then((next) => { if (current) setCalibrationStatus(next); }).catch(() => { if (current) setCalibrationStatus(null); });
+    return () => { current = false; };
+  }, [defaultModelId]);
   const [modelListState, setModelListState] = useState<ModelListState>('loading');
   const [modelListNotice, setModelListNotice] = useState('');
   const [policy, setPolicy] = useState<RuntimePolicy | null>(null);
@@ -191,8 +219,9 @@ export default function SettingsPanel({ setToasts }: { setToasts: React.Dispatch
 
   const set: SetPreference = (path, value) => { editRevision.current++; setDirty(true); setS((previous: any) => updateSetting(previous, path, value)); };
   const discard = () => { editRevision.current++; setS(savedSettings); setDirty(false); };
+  const conflict = cacheConflict(s, performanceMode(s));
   const save = async () => {
-    if (saving) return;
+    if (saving || conflict) return;
     setSaving(true);
     const revision = editRevision.current;
     try {
@@ -245,7 +274,7 @@ export default function SettingsPanel({ setToasts }: { setToasts: React.Dispatch
           <section className="settings-section" data-settings-title="Assistant">
             <h2><Icon name="sparkle" size={16} />Assistant</h2><p className="settings-section-intro">Set your preferred reasoning and file-editing behavior.</p>
             <div className="settings-fields">
-              <SettingField label="Auto mode · no approval prompts" description={`${AUTO_POLICY_DESCRIPTION} ${PROJECT_BOUNDARY_DESCRIPTION}`}><input type="checkbox" className="switch" checked={!!s.agent?.autonomous_enabled} onChange={(event) => set(['agent', 'autonomous_enabled'], event.target.checked)} /></SettingField>
+              <SettingField label="Permission mode" description={`${PERMISSION_MODE_DESCRIPTIONS[(s.agent?.permission_mode ?? (s.agent?.autonomous_enabled ? 'auto' : 'ask')) as keyof typeof PERMISSION_MODE_DESCRIPTIONS] ?? PERMISSION_MODE_DESCRIPTIONS.ask} ${PROJECT_BOUNDARY_DESCRIPTION} Shift+Tab in a code session cycles it.`}><select value={s.agent?.permission_mode ?? (s.agent?.autonomous_enabled ? 'auto' : 'ask')} onChange={(event) => { set(['agent', 'permission_mode'], event.target.value); set(['agent', 'autonomous_enabled'], event.target.value === 'auto'); }}>{(Object.keys(PERMISSION_MODE_LABELS) as (keyof typeof PERMISSION_MODE_LABELS)[]).map((option) => <option key={option} value={option}>{PERMISSION_MODE_LABELS[option]}</option>)}</select></SettingField>
               <SettingField label="Reasoning on by default" description="Allows longer responses; native thinking behavior depends on the model."><input type="checkbox" className="switch" checked={!!s.reasoning?.default_on} onChange={(event) => set(['reasoning', 'default_on'], event.target.checked)} /></SettingField>
               <SettingField label="Reasoning budget"><select value={s.reasoning?.budget ?? 'automatic'} onChange={(event) => set(['reasoning', 'budget'], event.target.value)}><option value="automatic">Automatic</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></SettingField>
               <SettingField label="Automatic compaction" description="When the context fills up, older messages and agent steps are summarized so nothing is silently dropped. An agent run pauses between steps while this happens and then resumes; a chat reply starts once it is done. Original messages stay saved."><select value={s.memory?.auto_compact === 'off' ? 'off' : 'automatic'} onChange={(event) => set(['memory', 'auto_compact'], event.target.value)}><option value="automatic">Automatic</option><option value="off">Off</option></select></SettingField>
@@ -265,9 +294,19 @@ export default function SettingsPanel({ setToasts }: { setToasts: React.Dispatch
           <section className="settings-section settings-performance" data-settings-title="Performance">
             <h2><Icon name="gauge" size={16} />Performance</h2><p className="settings-section-intro">Let Companion choose compatible runtime settings when you load a model.</p>
             <div className="settings-fields">
-              <SettingField label="Manage hardware automatically" description="Chooses processor usage, GPU placement, prompt batching and cache defaults. Changes apply after Save and the next model load."><input type="checkbox" className="switch" checked={s.runtime_auto !== false} onChange={(event) => set(['runtime_auto'], event.target.checked)} /></SettingField>
-              <SettingField label="Speculative decoding" description="Auto drafts tokens that already appear in the context and verifies them in one step. Output is identical; replies that repeat context (code edits, file rewrites, tool calls) finish several times faster. Applies on the next model load."><select value={s.runtime?.speculative ?? 'auto'} onChange={(event) => set(['runtime', 'speculative'], event.target.value)}><option value="auto">Auto (draft from context)</option><option value="off">Off</option></select></SettingField>
-              <SettingField label="KV cache precision" description="f16 is the compatibility default. q8_0 halves cache memory, which allows a larger context on the same GPU, at a small speed cost on this runtime. Applies on the next model load."><select value={s.runtime?.kv_cache ?? 'f16'} onChange={(event) => set(['runtime', 'kv_cache'], event.target.value)}><option value="f16">f16 (default)</option><option value="q8_0">q8_0 (half the cache memory)</option></select></SettingField>
+              <SettingField label="Performance mode" description={<PerformanceModeNote settings={s} status={calibrationStatus} />}>
+                <div className="settings-mode-options" role="radiogroup" aria-label="Performance mode">
+                  {MODES.map((option) => (
+                    <label key={option.value} className={`settings-mode-option${performanceMode(s) === option.value ? ' selected' : ''}`}>
+                      <input type="radio" name="performance-mode" value={option.value} checked={performanceMode(s) === option.value} onChange={() => { set(['runtime', 'mode'], option.value); set(['runtime_auto'], option.value !== 'manual'); }} />
+                      <strong>{option.label}</strong>
+                      <span>{option.description}</span>
+                    </label>
+                  ))}
+                </div>
+              </SettingField>
+              <SettingField label="Speculative decoding" description="Auto drafts tokens that already appear in the context and verifies them in one step. The model still chooses every word; checking several words at once can very rarely pick a different one of two almost equally likely words. Replies that repeat the context (code edits, file rewrites, tool calls) finish faster, and when nothing repeats it costs no measurable speed. Applies on the next model load."><select value={s.runtime?.speculative ?? 'auto'} onChange={(event) => set(['runtime', 'speculative'], event.target.value)}><option value="auto">Auto (draft from context)</option><option value="off">Off</option></select></SettingField>
+              <SettingField label="KV cache precision" description={<><span>f16 is the compatibility default. q8_0 halves cache memory, which allows a larger context on the same GPU; it measured no slower with Flash Attention on. Applies on the next model load.</span>{quantizedCacheUnavailable(s, performanceMode(s)) && <span className="settings-context-warning" role={cacheConflict(s, performanceMode(s)) ? 'alert' : 'status'}>{cacheConflict(s, performanceMode(s)) ?? QUANTIZED_CACHE_UNAVAILABLE_NOTE}</span>}</>}><select value={s.runtime?.kv_cache ?? 'f16'} onChange={(event) => set(['runtime', 'kv_cache'], event.target.value)}><option value="f16">f16 (default)</option><option value="q8_0" disabled={quantizedCacheUnavailable(s, performanceMode(s))}>q8_0 (half the cache memory{quantizedCacheUnavailable(s, performanceMode(s)) ? '; needs Flash Attention' : ''})</option></select></SettingField>
             </div>
             <HardwareOverrides settings={s} set={set} />
             <div className="settings-runtime-summary"><strong>A fresh cache for each model load</strong><p>The runtime handles cache layout for the model architecture. Loading a model starts a fresh runtime cache; your saved conversations remain on disk.</p></div>
@@ -278,15 +317,18 @@ export default function SettingsPanel({ setToasts }: { setToasts: React.Dispatch
 
           <section className="settings-section" data-settings-title="Privacy & boundaries">
             <h2><Icon name="shield" size={16} />Privacy &amp; boundaries</h2>
-            <ul className="settings-boundaries"><li>{PROJECT_BOUNDARY_DESCRIPTION}</li><li>Ask mode requests approval for agent actions. {AUTO_POLICY_DESCRIPTION}</li><li>{SEARCH_PERMISSION_DESCRIPTION}</li></ul>
+            <ul className="settings-boundaries"><li>{PROJECT_BOUNDARY_DESCRIPTION}</li>{(Object.keys(PERMISSION_MODE_LABELS) as (keyof typeof PERMISSION_MODE_LABELS)[]).map((option) => <li key={option}>{PERMISSION_MODE_LABELS[option]}: {PERMISSION_MODE_DESCRIPTIONS[option]}</li>)}<li>{SEARCH_PERMISSION_DESCRIPTION}</li></ul>
             <p className="settings-capability-note" style={{ marginBottom: 12 }}>These are app-level controls, not an operating-system or browser sandbox. Use Auto only for tasks and projects you trust.</p>
+            <div className="settings-fields">
+              <SettingField label="Keep a record of model requests" description="Stores what was sent to the model and what it returned for each reply and agent step, so a wrong or broken answer can be diagnosed. Kept on this computer only, limited to the most recent 300 requests, and included when you export a conversation. Records can contain file contents the assistant read."><input type="checkbox" className="switch" checked={s.privacy?.record_model_requests !== false} onChange={(event) => set(['privacy', 'record_model_requests'], event.target.checked)} /></SettingField>
+            </div>
           </section>
 
           <details className="settings-section settings-expert" data-settings-title="Expert tuning" ref={expert} open={expertOpen || expertMatches} onToggle={(event) => { if (!query.trim()) setExpertOpen(event.currentTarget.open); }}>
             <summary><Icon name="chevronRight" size={15} className="chev" /><span>Expert tuning</span><span className="settings-expert-caption">Context, sampling and task limits</span></summary>
             <p className="settings-section-intro">Optional overrides for specific models and workflows. Hardware stays automatic unless you change it above.</p>
             <div className="settings-fields">
-              <SettingField label="Context size" description="The window to ask for. Applies on the next model load; the setting below decides what happens when it does not fit."><Num obj={s.inference} k="context_size" set={(value) => set(['inference', 'context_size'], value)} /></SettingField>
+              <SettingField label="Context size" description={<><span>The window to ask for. Applies on the next model load; the setting below decides what happens when it does not fit memory.</span>{contextSupportWarning(Number(s.inference?.context_size), models, s.general?.default_model) && <span className="settings-context-warning" role="status">{contextSupportWarning(Number(s.inference?.context_size), models, s.general?.default_model)}</span>}</>}><Num obj={s.inference} k="context_size" set={(value) => set(['inference', 'context_size'], value)} /></SettingField>
               <SettingField label="When the context size does not fit" description="A model plus a context cache that big may not fit the GPU. Fit it automatically keeps the whole model on the GPU by loading a smaller window, which is faster. Use my size as written keeps the window and lets part of the model run on the CPU, which is slower. Either way the loaded window and the reason are shown in the context meter."><select value={s.runtime?.context_fit === 'requested' ? 'requested' : 'fit'} onChange={(event) => set(['runtime', 'context_fit'], event.target.value)}><option value="fit">Fit it to memory (faster)</option><option value="requested">Use my size as written (slower)</option></select></SettingField>
               <SettingField label="Temperature"><Num obj={s.inference} k="temperature" set={(value) => set(['inference', 'temperature'], value)} /></SettingField>
               <SettingField label="Top-p"><Num obj={s.inference} k="top_p" set={(value) => set(['inference', 'top_p'], value)} /></SettingField>
@@ -303,9 +345,9 @@ export default function SettingsPanel({ setToasts }: { setToasts: React.Dispatch
           {(dirty || saving) && (
             <div className="save-bar" role="status">
               <Lamp state="caution" />
-              <span>Unsaved changes</span>
+              <span>{conflict ? 'Cannot save: an 8-bit KV cache needs Flash Attention' : 'Unsaved changes'}</span>
               <Button variant="ghost" size="sm" disabled={saving} onClick={discard}>Discard</Button>
-              <Button size="sm" loading={saving} onClick={() => void save()}>Save changes</Button>
+              <Button size="sm" loading={saving} disabled={!!conflict} title={conflict ?? undefined} onClick={() => void save()}>Save changes</Button>
             </div>
           )}
         </div>

@@ -57,6 +57,28 @@ pub fn cpu_configuration(mut cfg: InferenceConfig, reason: &str) -> InferenceCon
     // f16 is the better CPU default regardless of the GPU-oriented preference.
     cfg.kv_cache_type_k = "f16".into();
     cfg.kv_cache_type_v = "f16".into();
+    // The micro-batch and the load mode were chosen for the GPU placement. On
+    // CPU the runtime's micro-batch (512) measured best, and CPU-only loads
+    // keep the default load mode.
+    cfg.micro_batch = None;
+    cfg.load_without_mmap = false;
+    // The draft head was measured on the GPU only; the CPU keeps n-gram
+    // drafting, which costs nothing when it finds no match.
+    if cfg.speculative == crate::inference::DRAFT_HEAD_SPECULATIVE {
+        cfg.speculative = crate::inference::default_speculative();
+    }
+    cfg.spec_draft_n_max = None;
+    // The n-gram length was chosen for a GPU placement; CPU-only keeps the
+    // runtime's default until measured.
+    cfg.spec_ngram_length = None;
+    // On CPU the whole model lives in RAM: the prompt cache gets only what is
+    // left after it.
+    let weights = std::fs::metadata(&cfg.model_path).map(|m| m.len()).unwrap_or(0);
+    let ram_available = (crate::hardware::detect().ram.available_gb * 1_073_741_824.0) as u64;
+    cfg.cache_ram_mib = Some(crate::inference::prompt_cache_ram_mib(
+        ram_available,
+        weights.saturating_add(1_073_741_824),
+    ));
     // Measured on the bundled CPU backend (docs/PERFORMANCE.md): the runtime's
     // default batch prefilled slightly faster than the old 128 cap, so an
     // automatic (0) preference stays automatic. An explicit manual value is
@@ -74,7 +96,31 @@ pub fn cpu_configuration(mut cfg: InferenceConfig, reason: &str) -> InferenceCon
         policy.cache_type_k = "f16".into();
         policy.cache_type_v = "f16".into();
         policy.placement = "cpu".into();
+        policy.speculative = cfg.speculative.clone();
+        policy.spec_draft_n_max = None;
+        policy.notes.retain(|note| {
+            !note.starts_with("This model carries a built-in draft head") && !note.starts_with(crate::runtime_fit::NGRAM_LENGTH_NOTE_PREFIX)
+        });
+        policy.notes.retain(|note| {
+            !note.starts_with(crate::runtime_fit::MICRO_BATCH_NOTE_PREFIX)
+                && !note.starts_with(crate::runtime_fit::LOAD_MODE_NOTE_PREFIX)
+        });
         policy.notes.push(format!("CPU mode selected automatically: {reason}. GPU, cache and projector offloading are disabled. Context is capped at 8192 for CPU operation; saved preferences are unchanged. Responses are slower on CPU: prefer a 4B-8B model at Q4_K_M or a small-active-parameter MoE model, keep Reasoning off unless needed, and rely on the prompt cache (only new text is processed each turn)."));
+    }
+    cfg
+}
+
+/// The configuration without the micro-batch and load mode chosen for the GPU
+/// placement (`runtime_fit`): the runtime's defaults for both, and none of
+/// their notes.
+pub fn without_load_tuning(mut cfg: InferenceConfig) -> InferenceConfig {
+    cfg.micro_batch = None;
+    cfg.load_without_mmap = false;
+    if let Some(policy) = cfg.runtime_policy.as_mut() {
+        policy.notes.retain(|note| {
+            !note.starts_with(crate::runtime_fit::MICRO_BATCH_NOTE_PREFIX)
+                && !note.starts_with(crate::runtime_fit::LOAD_MODE_NOTE_PREFIX)
+        });
     }
     cfg
 }
@@ -109,6 +155,10 @@ pub fn gpu_startup_failure(error: &InferenceError) -> bool {
             "failed to initialize cuda",
             "cudamalloc failed",
             "failed to allocate cuda",
+            // A pinned copy of the weights that cannot be allocated (loading
+            // without mmap): "unable to allocate CUDA_Host buffer".
+            "unable to allocate cuda",
+            "unable to allocate vulkan",
             "no gpu devices",
             "no usable gpu",
             "vk_error",
@@ -159,16 +209,34 @@ where
             .await
             .map(|result| (result, Some(format!("Running on CPU: {reason}."))));
     }
-    match launch(cfg.clone()).await {
-        Ok(result) => Ok((result, None)),
-        Err(first) if gpu_startup_failure(&first) => {
-            tracing::warn!("GPU runtime startup failed; retrying this model once on CPU: {first}");
-            match launch(cpu_configuration(cfg, "GPU initialization or allocation failed")).await {
-                Ok(result) => Ok((result, Some("GPU startup failed; the model is now running on CPU. Responses may be slower.".into()))),
-                Err(cpu) => Err(InferenceError::Generation(format!("Automatic GPU startup and CPU fallback both failed. CPU attempt: {cpu}. Original GPU attempt: {first}. Saved conversations were not changed."))),
+    let tuned = cfg.load_without_mmap || cfg.micro_batch.is_some_and(|size| size > crate::runtime_fit::DEFAULT_MICRO_BATCH);
+    let first = match launch(cfg.clone()).await {
+        Ok(result) => return Ok((result, None)),
+        Err(error) if gpu_startup_failure(&error) => error,
+        Err(error) => return Err(error),
+    };
+    // A larger micro-batch (compute buffer) or loading without mmap (a pinned
+    // copy of the weights in RAM) asks for more memory than a plain start:
+    // the GPU gets one more try without them before it is given up.
+    let first = if tuned {
+        tracing::warn!("GPU runtime startup failed with the chosen micro-batch or load mode; retrying once on the GPU without them: {first}");
+        match launch(without_load_tuning(cfg.clone())).await {
+            Ok(result) => {
+                return Ok((
+                    result,
+                    Some("The GPU could not start with the chosen micro-batch or load mode, so the model runs on the GPU with the runtime's defaults for both. Prompts may be read more slowly.".into()),
+                ))
             }
+            Err(error) if gpu_startup_failure(&error) => error,
+            Err(error) => return Err(error),
         }
-        Err(error) => Err(error),
+    } else {
+        first
+    };
+    tracing::warn!("GPU runtime startup failed; retrying this model once on CPU: {first}");
+    match launch(cpu_configuration(cfg, "GPU initialization or allocation failed")).await {
+        Ok(result) => Ok((result, Some("GPU startup failed; the model is now running on CPU. Responses may be slower.".into()))),
+        Err(cpu) => Err(InferenceError::Generation(format!("Automatic GPU startup and CPU fallback both failed. CPU attempt: {cpu}. Original GPU attempt: {first}. Saved conversations were not changed."))),
     }
 }
 
@@ -230,6 +298,39 @@ mod tests {
         assert!(notice.unwrap().contains("CPU"));
         assert_eq!(active.runtime_policy.unwrap().effective_context, 8192);
     }
+    #[test]
+    fn the_cpu_fallback_drops_the_gpu_micro_batch_and_load_mode() {
+        let mut cfg = configured();
+        cfg.micro_batch = Some(1024);
+        cfg.load_without_mmap = true;
+        if let Some(policy) = cfg.runtime_policy.as_mut() {
+            policy.notes.push(format!("{}1024 tokens: test.", crate::runtime_fit::MICRO_BATCH_NOTE_PREFIX));
+            policy.notes.push(format!("{}: test.", crate::runtime_fit::LOAD_MODE_NOTE_PREFIX));
+        }
+        let cpu = cpu_configuration(cfg, "test");
+        assert_eq!(cpu.micro_batch, None);
+        assert!(!cpu.load_without_mmap);
+        let notes = cpu.runtime_policy.unwrap().notes;
+        assert!(!notes.iter().any(|note| note.starts_with("Micro-batch") || note.starts_with("Loading without mmap")), "{notes:?}");
+        assert!(notes.iter().any(|note| note.starts_with("CPU mode selected automatically")));
+    }
+
+    #[test]
+    fn the_cpu_fallback_keeps_ngram_drafting_but_not_the_draft_head() {
+        let mut cfg = configured();
+        cfg.speculative = crate::inference::DRAFT_HEAD_SPECULATIVE.into();
+        cfg.spec_draft_n_max = Some(3);
+        let cpu = cpu_configuration(cfg, "test");
+        assert_eq!(cpu.speculative, "ngram-simple");
+        assert_eq!(cpu.spec_draft_n_max, None);
+        let mut split = configured();
+        split.spec_ngram_length = Some(24);
+        assert_eq!(cpu_configuration(split, "test").spec_ngram_length, None, "CPU-only keeps the default length");
+        let mut off = configured();
+        off.speculative = "none".into();
+        assert_eq!(cpu_configuration(off, "test").speculative, "none", "drafting the owner turned off stays off");
+    }
+
     #[tokio::test]
     async fn working_gpu_and_manual_overrides_are_preserved() {
         for (automatic, devices) in [
@@ -298,5 +399,48 @@ mod tests {
             .await;
         assert_eq!(attempts, 2);
         assert!(result.unwrap_err().to_string().contains("both failed"));
+    }
+
+    #[tokio::test]
+    async fn a_gpu_start_that_fails_with_the_load_tuning_retries_on_the_gpu_without_it() {
+        let mut cfg = configured();
+        cfg.micro_batch = Some(1024);
+        cfg.load_without_mmap = true;
+        if let Some(policy) = cfg.runtime_policy.as_mut() {
+            policy.notes.push(format!("{}1024 tokens: test.", crate::runtime_fit::MICRO_BATCH_NOTE_PREFIX));
+        }
+        let mut attempts = vec![];
+        let (active, notice) = load_with_fallback(cfg, true, Devices::Available, |cfg| {
+            attempts.push((cfg.n_gpu_layers, cfg.micro_batch, cfg.load_without_mmap));
+            async move {
+                if cfg.load_without_mmap {
+                    Err(InferenceError::Generation("llama_model_load: error loading model: unable to allocate CUDA_Host buffer".into()))
+                } else {
+                    Ok(cfg)
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(attempts, [(-1, Some(1024), true), (-1, None, false)], "the GPU again, without the tuning, before the CPU");
+        assert_eq!(active.n_gpu_layers, -1);
+        assert!(notice.unwrap().contains("runtime's defaults"));
+        assert!(!active.runtime_policy.unwrap().notes.iter().any(|note| note.starts_with("Micro-batch")));
+
+        // Without tuning to drop, a GPU failure goes straight to the CPU as before.
+        let mut attempts = 0;
+        let result: Result<((), Option<String>), _> = load_with_fallback(configured(), true, Devices::Available, |cfg| {
+            attempts += 1;
+            async move {
+                if cfg.n_gpu_layers == 0 {
+                    Ok(())
+                } else {
+                    Err(InferenceError::Generation("CUDA error: out of memory".into()))
+                }
+            }
+        })
+        .await;
+        assert_eq!(attempts, 2);
+        assert!(result.unwrap().1.unwrap().contains("CPU"));
     }
 }

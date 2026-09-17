@@ -1,0 +1,6 @@
+{
+  "repository": "https://github.com/ggml-org/llama.cpp",
+  "tag": "b10809",
+  "commit": "5266f24da75dc449bd56cbed7addb9c8e4a6a73e",
+  "note": "The inference runtime is built from this exact upstream commit by scripts/build-runtime.ps1. Change tag and commit together, rebuild, and re-run the benchmark suite before committing the bump."
+}

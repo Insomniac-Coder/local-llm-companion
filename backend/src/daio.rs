@@ -333,13 +333,13 @@ mod tests {
             DeviceProfile {
                 fingerprint: String::new(),
                 os: "windows".into(),
-                cpu_model: "Intel Core i9".into(),
+                cpu_model: "Example CPU".into(),
                 physical_cores: 8,
                 logical_cores: 16,
                 simd: vec!["AVX2".into()],
                 ram_total_gb: 64.0,
                 ram_avail_gb: 40.0,
-                gpu_model: "RTX 5070 Ti".into(),
+                gpu_model: "Example GPU 12GB".into(),
                 gpu_backend: "cuda".into(),
                 vram_total_gb: 12.0,
                 vram_avail_gb: 11.0,
@@ -416,7 +416,7 @@ mod tests {
         let (mut d, _) = rig();
         d.fingerprint = d.fingerprint_parts();
         assert!(!d.fingerprint.is_empty());
-        assert!(!d.fingerprint.contains("5070 Ti"));
+        assert!(!d.fingerprint.contains("Example GPU"));
     }
 
     #[test]

@@ -119,10 +119,29 @@ pub fn run(cmd: &str, cwd: &Path, timeout_secs: u64) -> Result<CommandResult, St
         .unwrap_or_default();
     Ok(CommandResult {
         exit_code: status.and_then(|s| s.code()),
-        stdout: stdout.chars().take(MAX_OUTPUT_CHARS).collect(),
-        stderr: stderr.chars().take(MAX_OUTPUT_CHARS).collect(),
+        stdout: head_tail(&stdout, MAX_OUTPUT_CHARS),
+        stderr: head_tail(&stderr, MAX_OUTPUT_CHARS),
         timed_out,
     })
+}
+
+/// At most `limit` characters of `text`: a third from the start and two
+/// thirds from the end, joined by a line saying how much was left out. Build
+/// and test output puts its errors last, which a cut from the start dropped.
+pub fn head_tail(text: &str, limit: usize) -> String {
+    let total = text.chars().count();
+    if total <= limit {
+        return text.to_string();
+    }
+    let keep = limit.saturating_sub(80.min(limit / 4));
+    let head_chars = keep / 3;
+    let tail_chars = keep - head_chars;
+    let head: String = text.chars().take(head_chars).collect();
+    let tail: String = text.chars().skip(total - tail_chars).collect();
+    format!(
+        "{head}\n[... {} characters omitted ...]\n{tail}",
+        total - head_chars - tail_chars
+    )
 }
 
 pub fn format_result(cmd: &str, r: &CommandResult) -> String {
@@ -135,24 +154,47 @@ pub fn format_result(cmd: &str, r: &CommandResult) -> String {
     if r.timed_out {
         out.push_str("\n(timed out and was killed)\n");
     }
-    out.push_str("\n--- stdout ---\n");
-    out.push_str(if r.stdout.is_empty() {
-        "(empty)"
+    let section = |name: &str, text: &str| {
+        format!("\n--- {name} ---\n{}", if text.is_empty() { "(empty)" } else { text })
+    };
+    // A failed command's explanation is usually on stderr: it comes first, so
+    // a later cut to the model's room can never remove it in favour of stdout.
+    if r.timed_out || r.exit_code != Some(0) {
+        out.push_str(&section("stderr", &r.stderr));
+        out.push('\n');
+        out.push_str(&section("stdout", &r.stdout));
     } else {
-        &r.stdout
-    });
-    out.push_str("\n\n--- stderr ---\n");
-    out.push_str(if r.stderr.is_empty() {
-        "(empty)"
-    } else {
-        &r.stderr
-    });
+        out.push_str(&section("stdout", &r.stdout));
+        out.push('\n');
+        out.push_str(&section("stderr", &r.stderr));
+    }
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_output_keeps_its_end_where_the_errors_are() {
+        let output = format!("{}error[E0308]: mismatched types at src/main.rs:12", "compiling crate\n".repeat(4_000));
+        let kept = head_tail(&output, 16_000);
+        assert!(kept.chars().count() <= 16_000);
+        assert!(kept.starts_with("compiling crate"));
+        assert!(kept.ends_with("error[E0308]: mismatched types at src/main.rs:12"));
+        assert!(kept.contains("characters omitted"));
+        assert_eq!(head_tail("short", 16_000), "short");
+    }
+
+    #[test]
+    fn a_failed_command_shows_stderr_first() {
+        let failed = CommandResult { exit_code: Some(1), stdout: "x".repeat(60_000), stderr: "error: boom".into(), timed_out: false };
+        let text = format_result("cargo build", &failed);
+        assert!(text.find("--- stderr ---").unwrap() < text.find("--- stdout ---").unwrap());
+        let ok = CommandResult { exit_code: Some(0), stdout: "done".into(), stderr: String::new(), timed_out: false };
+        let text = format_result("cargo build", &ok);
+        assert!(text.find("--- stdout ---").unwrap() < text.find("--- stderr ---").unwrap());
+    }
 
     #[test]
     fn echo_captures_stdout_and_zero_exit() {

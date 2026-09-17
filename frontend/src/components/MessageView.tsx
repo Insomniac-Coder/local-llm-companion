@@ -160,6 +160,7 @@ export default function MessageView({
   onOpenAgentActivity,
   onEdit,
   onRegenerate,
+  sessionMode,
 }: {
   role: 'user' | 'assistant' | 'tool';
   text: string;
@@ -178,6 +179,8 @@ export default function MessageView({
   byline?: string;
   /** Native reasoning streamed for this reply during the session (not persisted). */
   thinking?: string;
+  /** Chat sessions never ran agents, so their replies are never agent transcripts. */
+  sessionMode?: 'chat' | 'code';
   onOpenAgentActivity?: (runId: string) => void;
   onEdit?: () => void;
   onRegenerate?: () => void;
@@ -185,9 +188,13 @@ export default function MessageView({
   const { body, sources } = role === 'assistant' ? splitSources(text) : { body: text, sources: [] as { title: string; url: string }[] };
   const isAgentRun = !!activities?.some((event) => event.kind === 'task');
   const isChatActivity = role === 'assistant' && !!activities?.length && !isAgentRun;
+  // Legacy agent transcripts were written into code sessions only. Reading a
+  // chat reply as one turned a small model's tool-shaped answer into an agent
+  // timeline announcing "an unreadable action" that no agent had attempted.
+  // In chat the reply is shown as the text the model wrote.
   const agentEvents = role === 'assistant' ? (activities?.length
     ? isAgentRun ? activities : null
-    : parseAgentTranscript(body, !!streaming)) : null;
+    : sessionMode === 'chat' ? null : parseAgentTranscript(body, !!streaming)) : null;
   const chatDetails = isChatActivity ? activities!.filter((event) => event.kind !== 'response') : [];
   const chatResponses = isChatActivity ? activities!.filter((event) => event.kind === 'response').map((event) => event.message).join('\n\n') : '';
   const answerBody = isChatActivity

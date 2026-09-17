@@ -54,7 +54,7 @@ export default function RuntimePage({
         {inf?.last_error && <Notice tone="error" title="The runtime reported an error">{inf.last_error}</Notice>}
         {inf && !inf.binary_found && (
           <Notice tone="caution" title="llama-server was not found">
-            Download a llama.cpp release and place llama-server(.exe) with its DLLs in models/bin, put it on PATH, or set COMPANION_LLAMA_SERVER_BIN.
+            The llama.cpp runtime has not been built on this machine. Run scripts/build-runtime.ps1 (Windows) or scripts/build-runtime.sh (Linux, macOS) from the project folder; it builds llama-server with the CPU, Vulkan and CUDA backends this machine supports into runtime/bin. COMPANION_LLAMA_SERVER_BIN can point at another llama-server instead.
           </Notice>
         )}
 

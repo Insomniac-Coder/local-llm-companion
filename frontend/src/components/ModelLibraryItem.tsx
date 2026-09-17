@@ -1,7 +1,9 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import { modelDetail, type ModelDetail, type ModelMeta } from '../services/api';
 import { Badge, Button, IconButton, Lamp } from '../ui/primitives';
+import { toolSupportLabel, documentKindsNote } from '../services/toolSupport';
 import RecommendCard from './RecommendCard';
+import CalibrationCard from './CalibrationCard';
 import OptimizeCard from './OptimizeCard';
 
 type Notify = (kind: 'info' | 'success' | 'warning' | 'error', text: string) => void;
@@ -19,15 +21,17 @@ export function ModelDetails({ detail, notify }: { detail: ModelDetail; notify: 
       <div><dt>Estimated total memory</dt><dd>{estimates.total_need_gb != null ? `~${estimates.total_need_gb} GB` : 'Unavailable'}</dd></div>
     </dl>
     <div className="model-library-capabilities">
-      <Badge tone={metadata.tool_calling ? 'info' : 'neutral'}>{metadata.tool_calling ? 'Tools declared' : 'Tools unverified'}</Badge>
+      <Badge tone={metadata.tool_calling ? 'info' : 'neutral'}>{toolSupportLabel(metadata)}</Badge>
       <Badge tone={metadata.vision ? 'info' : 'neutral'}>{metadata.vision ? 'Vision declared' : 'Text model'}</Badge>
       <Badge tone={metadata.supports_reasoning ? 'info' : 'neutral'}>{metadata.supports_reasoning ? 'Reasoning declared' : 'Reasoning unverified'}</Badge>
     </div>
+    {documentKindsNote(metadata) && <p className="model-library-note">{documentKindsNote(metadata)}</p>}
     <p className="model-library-note">Memory estimates are heuristic and architecture-dependent, not measured usage or the current runtime cache allocation. Model capabilities are metadata declarations, not a compatibility test.</p>
     {estimates.compat_warnings.length > 0 && <ul className="model-library-warnings">{estimates.compat_warnings.map((warning, index) => <li key={index}>{warning}</li>)}</ul>}
     {detail.recommended && <p className="model-library-note">Estimate only · not applied: {detail.recommended.note}</p>}
     <div className="model-library-tools">
       <p className="model-library-note">Recommendations are not applied automatically. Choosing a context candidate saves it for the next model load.</p>
+      <CalibrationCard modelId={metadata.id} notify={notify} />
       <RecommendCard modelId={metadata.id} notify={notify} />
       <OptimizeCard modelId={metadata.id} notify={notify} />
     </div>
@@ -90,6 +94,13 @@ function ModelLibraryCard({ model, loadingModel, onLoad, onDelete, notify }: Pro
         <IconButton icon="trash" label={`Delete ${model.name}`} size="md" tone="danger" tipSide="left" onClick={onDelete} />
       </div>
     </div>
+    {/* Shown without expanding: a file the runtime will refuse should say so
+        before Load is pressed, not in a log excerpt afterwards. */}
+    {(model.load_issues?.length ?? 0) > 0 && (
+      <ul className="model-library-warnings" aria-label={`Loading problems for ${model.name}`}>
+        {model.load_issues!.map((issue, index) => <li key={index}>{issue}</li>)}
+      </ul>
+    )}
     <div className="model-library-detail" id={detailsId} hidden={!expanded} role="region" aria-label={`Details for ${model.name}`} aria-busy={expanded && loading}>
       {expanded && <>
         {loading && <p className="model-library-note" role="status">Loading details for {model.name}…</p>}

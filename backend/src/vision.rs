@@ -33,7 +33,22 @@ pub fn prepare_image(bytes: &[u8]) -> Result<PreparedImage, String> {
             bytes.len()
         ));
     }
-    let img = image::load_from_memory(bytes).map_err(|e| format!("cannot decode image: {e}"))?;
+    // Phone cameras store portrait photos as landscape pixels plus an EXIF
+    // orientation tag. Re-encoding drops the tag, so the rotation must be
+    // applied to the pixels first or the model sees the photo on its side.
+    use image::ImageDecoder;
+    let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| format!("cannot read image: {e}"))?
+        .into_decoder()
+        .map_err(|e| format!("cannot decode image: {e}"))?;
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut img =
+        image::DynamicImage::from_decoder(decoder).map_err(|e| format!("cannot decode image: {e}"))?;
+    img.apply_orientation(orientation);
+    // Dimensions as the picture is meant to be seen, after orientation.
     let (w, h) = (img.width(), img.height());
     let scaled = {
         let longest = w.max(h);
@@ -101,6 +116,39 @@ mod tests {
             .write_image(img.as_raw(), w, h, image::ExtendedColorType::Rgb8)
             .unwrap();
         buf
+    }
+
+    /// A JPEG of `w`×`h` pixels carrying an EXIF orientation tag.
+    fn jpeg_with_orientation(w: u32, h: u32, orientation: u16) -> Vec<u8> {
+        let img = image::RgbImage::from_fn(w, h, |x, _| image::Rgb([if x < w / 2 { 255 } else { 0 }, 0, 0]));
+        let mut plain = vec![];
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut plain, 95)
+            .encode(img.as_raw(), w, h, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        // APP1 "Exif": big-endian TIFF header, one IFD0 entry (0x0112, SHORT).
+        let mut exif = b"Exif\0\0MM\0\x2a\0\0\0\x08\0\x01\x01\x12\0\x03\0\0\0\x01".to_vec();
+        exif.extend_from_slice(&orientation.to_be_bytes());
+        exif.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        let mut out = plain[..2].to_vec(); // SOI
+        out.extend_from_slice(&[0xFF, 0xE1]);
+        out.extend_from_slice(&((exif.len() + 2) as u16).to_be_bytes());
+        out.extend_from_slice(&exif);
+        out.extend_from_slice(&plain[2..]);
+        out
+    }
+
+    #[test]
+    fn a_portrait_photo_stored_sideways_reaches_the_model_upright() {
+        // 6 = rotate 90° clockwise to display: 40×20 stored pixels are a 20×40 picture.
+        let prepared = prepare_image(&jpeg_with_orientation(40, 20, 6)).unwrap();
+        assert_eq!((prepared.width, prepared.height), (20, 40));
+        let encoded = prepared.data_url.split_once(",").unwrap().1;
+        let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded).unwrap();
+        let sent = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((sent.width(), sent.height()), (20, 40), "the pixels sent are upright too");
+        // 1 = as stored.
+        let plain = prepare_image(&jpeg_with_orientation(40, 20, 1)).unwrap();
+        assert_eq!((plain.width, plain.height), (40, 20));
     }
 
     #[test]

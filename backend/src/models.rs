@@ -47,14 +47,38 @@ pub struct ModelMetadata {
     /// lacks the keys; sliding-window layers make this an overestimate.
     #[serde(default)]
     pub kv_bytes_per_token: Option<u64>,
-    /// Weight file size in bytes at scan time.
+    /// Weight file size in bytes at scan time (every shard of a split set).
     #[serde(default)]
     pub weights_bytes: Option<u64>,
+    /// Transformer blocks (`<arch>.block_count`), from the GGUF header. The
+    /// load path scales how many expert blocks a larger micro-batch may move
+    /// to RAM by it. None when the header lacks the key.
+    #[serde(default)]
+    pub block_count: Option<u32>,
+    /// Built-in next-token prediction layers (`<arch>.nextn_predict_layers`),
+    /// the draft head llama-server uses with `--spec-type draft-mtp`. None or
+    /// 0 when the file has none.
+    #[serde(default)]
+    pub draft_head_layers: Option<u32>,
     /// Restrictions this model's own chat template places on the message
     /// list. Always taken from the GGUF, never from metadata.json: it
     /// describes the template, and the template travels with the weights.
     #[serde(default, skip_deserializing)]
     pub chat_template: crate::inference::ChatTemplateShape,
+    /// Why this file may not load or chat correctly, read from its structure.
+    /// Empty when nothing is wrong. Never read from metadata.json.
+    #[serde(default, skip_deserializing)]
+    pub load_issues: Vec<String>,
+    /// llama.cpp's built-in chat format for this architecture, set only when
+    /// the file carries no chat template (see `builtin_chat_format`). Read
+    /// from the GGUF, never from metadata.json.
+    #[serde(default, skip_deserializing)]
+    pub builtin_chat_format: Option<String>,
+    /// Where `tool_calling` came from: "runtime" when llama.cpp reported the
+    /// template's capabilities for this file, "template" when only the chat
+    /// template's source suggests it. Filled in by the model list.
+    #[serde(default, skip_deserializing)]
+    pub tool_support_source: Option<String>,
     #[serde(default)]
     pub projector_file: Option<String>,
     /// GGUF filename inside `dir`. Older metadata omits this and continues to
@@ -258,6 +282,41 @@ impl ModelManager {
     }
 
     /// Stage 4: unregister a model (e.g. after its directory was deleted).
+    /// Make the registry match the models folder: register every model the
+    /// scan found, and drop entries whose model file no longer exists.
+    ///
+    /// Scans used to register only, so a model folder deleted by hand stayed
+    /// in the list for the life of the process, with a Load button for a file
+    /// that was gone. The loaded model is kept even if its file vanished: the
+    /// runtime still holds it open, and unloading is the user's action.
+    /// Returns the ids removed, and a warning for each model that could not be
+    /// registered.
+    pub fn reconcile(&mut self, found: Vec<ModelMetadata>) -> (Vec<String>, Vec<String>) {
+        let mut warnings = Vec::new();
+        let found_ids: std::collections::HashSet<String> =
+            found.iter().map(|model| model.id.clone()).collect();
+        for model in found {
+            if let Err(error) = self.register(model) {
+                warnings.push(format!("skipping discovered model: {error}"));
+            }
+        }
+        let current = self.current_id.clone();
+        let removed: Vec<String> = self
+            .models
+            .values()
+            .filter(|model| {
+                !found_ids.contains(&model.id)
+                    && current.as_deref() != Some(model.id.as_str())
+                    && !model.gguf_path().is_file()
+            })
+            .map(|model| model.id.clone())
+            .collect();
+        for id in &removed {
+            self.models.remove(id);
+        }
+        (removed, warnings)
+    }
+
     pub fn remove(&mut self, id: &str) -> bool {
         if self.current_id.as_deref() == Some(id) {
             self.current_id = None;
@@ -281,6 +340,97 @@ struct GgufHeader {
     template: TemplateHints,
     /// f16 KV bytes per token derived from the attention shape, when present.
     kv_bytes_per_token: Option<u64>,
+    /// `<arch>.block_count`, when present.
+    block_count: Option<u32>,
+    /// `<arch>.nextn_predict_layers`, when present.
+    draft_head_layers: Option<u32>,
+    /// Facts that decide whether stock llama.cpp can load the file; see
+    /// `load_issues`.
+    layout: GgufLayout,
+}
+
+/// Structural facts read from the header, no weights involved.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct GgufLayout {
+    /// Vision/audio tower and projector tensors (`v.`, `a.`, `mm.`) inside a
+    /// model file. llama.cpp keeps these in a separate projector (mmproj)
+    /// file, and its text loader refuses tensors it does not claim.
+    tower_tensors: u64,
+    /// Entries in tokenizer.ggml.tokens.
+    vocab_tokens: Option<u64>,
+    /// Rows of token_embd.weight, which must equal the vocabulary.
+    embedding_rows: Option<u64>,
+    has_chat_template: bool,
+}
+
+/// Plain reasons a model file is unlikely to load or chat correctly in
+/// upstream llama.cpp, from its structure alone. Advisory: the runtime's own
+/// loader stays the authority, and a file is never refused on these grounds.
+///
+/// Every pattern here was observed in files taken from Ollama's registry,
+/// which Ollama's patched runtime repairs in memory at load time: gemma3 and
+/// gemma4 blobs with their towers packed in, a gemma3 tokenizer one entry
+/// longer than its embedding, and no Jinja chat template (Ollama renders
+/// prompts in Go). None of it is tied to a model name.
+fn load_issues(layout: GgufLayout, architecture: Option<&str>) -> Vec<String> {
+    let mut issues = Vec::new();
+    if layout.tower_tensors > 0 {
+        issues.push(format!(
+            "{} vision/audio tensors are packed into this model file; llama.cpp expects them in a separate projector (mmproj) file and refuses the model. Files taken from Ollama's registry are packaged this way; use the upstream GGUF.",
+            layout.tower_tensors
+        ));
+    }
+    if let (Some(tokens), Some(rows)) = (layout.vocab_tokens, layout.embedding_rows) {
+        if tokens != rows {
+            issues.push(format!(
+                "The tokenizer lists {tokens} tokens but the embedding has {rows} rows; llama.cpp refuses the mismatch."
+            ));
+        }
+    }
+    // Without a template the load uses the architecture's built-in format
+    // when llama.cpp has one; only files without either are at risk.
+    if !layout.has_chat_template && architecture.and_then(builtin_chat_format).is_none() {
+        issues.push(
+            "The file carries no chat template, so the runtime falls back to a generic format this model was not trained on; replies may be garbled or echo the prompt.".into(),
+        );
+    }
+    issues
+}
+
+/// llama.cpp's built-in chat format for a GGUF architecture, for files that
+/// carry no chat template. Without a template llama-server renders every
+/// conversation as ChatML; a model trained on another format then never
+/// produces its own end-of-turn token (measured: a Gemma 3 4B file without a
+/// template ran to the 8,192-token output limit and invented conversations).
+///
+/// Only architectures whose instruction-tuned releases all use one format are
+/// listed. `llama`, `phi3`, `deepseek2`, `chatglm`, `glm4`, `granite`, `minicpm`,
+/// `cohere2` and `grok` each cover releases with different formats, so a
+/// file of those architectures keeps the load issue instead of a guess.
+/// "chatml" is the runtime's own fallback, so it needs no launch argument.
+/// The names are llama.cpp's (`llm_chat_template` in llama-chat.cpp); the
+/// load path checks that the installed runtime lists one before using it.
+pub fn builtin_chat_format(architecture: &str) -> Option<&'static str> {
+    match architecture {
+        "gemma" | "gemma2" | "gemma3" | "gemma3n" => Some("gemma"),
+        "qwen2" | "qwen2moe" | "qwen3" | "qwen3moe" => Some("chatml"),
+        "llama4" => Some("llama4"),
+        "command-r" => Some("command-r"),
+        "gpt-oss" => Some("gpt-oss"),
+        "hunyuan-moe" => Some("hunyuan-moe"),
+        "hunyuan-dense" => Some("hunyuan-dense"),
+        "seed_oss" => Some("seed_oss"),
+        _ => None,
+    }
+}
+
+/// The built-in format a file without a template is loaded with; None when it
+/// has its own template or its architecture has no single built-in format.
+fn fallback_chat_format(header: &GgufHeader) -> Option<String> {
+    if header.layout.has_chat_template {
+        return None;
+    }
+    header.architecture.as_deref().and_then(builtin_chat_format).map(str::to_string)
 }
 
 /// Attention shape keys needed to size the KV cache exactly.
@@ -356,9 +506,38 @@ fn template_hints(template: &str) -> TemplateHints {
             || lower.contains("<think>")
             || lower.contains("reasoning_effort")
             || lower.contains("thinking_mode"),
-        tools: lower.contains("tool_call") || lower.contains("tools"),
+        tools: template_handles_tools(&lower),
         shape: template_shape(&lower),
     }
+}
+
+/// The template renders tools or tool calls: a `tool_call(s)` field, or the
+/// identifier `tools` used inside a Jinja tag. The word "tools" in prose a
+/// template carries is not evidence (the previous test counted it).
+fn template_handles_tools(lower: &str) -> bool {
+    if lower.contains("tool_call") {
+        return true;
+    }
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    for (open, close) in [("{%", "%}"), ("{{", "}}")] {
+        let mut rest = lower;
+        while let Some(start) = rest.find(open) {
+            let after = &rest[start + open.len()..];
+            let Some(end) = after.find(close) else { break };
+            let tag = &after[..end];
+            let mut search = tag;
+            while let Some(at) = search.find("tools") {
+                let before = search[..at].chars().next_back();
+                let next = search[at + "tools".len()..].chars().next();
+                if !before.is_some_and(is_ident) && !next.is_some_and(is_ident) {
+                    return true;
+                }
+                search = &search[at + "tools".len()..];
+            }
+            rest = &after[end + close.len()..];
+        }
+    }
+    false
 }
 
 /// A multimodal projector next to the weights. Only an unambiguous single
@@ -521,7 +700,8 @@ fn parse_gguf_header(path: &Path) -> std::io::Result<GgufHeader> {
     let mut contexts = Vec::new();
     let mut shape: Vec<(String, u64)> = Vec::new();
     let mut alignment = 32u64;
-    const SHAPE_SUFFIXES: [&str; 6] = [
+    const SHAPE_SUFFIXES: [&str; 7] = [
+        ".nextn_predict_layers",
         ".block_count",
         ".attention.head_count",
         ".attention.head_count_kv",
@@ -539,6 +719,17 @@ fn parse_gguf_header(path: &Path) -> std::io::Result<GgufHeader> {
             header.architecture = Some(string(&mut reader)?);
         } else if key == "tokenizer.chat_template" && kind == 8 {
             header.template = template_hints(&string(&mut reader)?);
+            header.layout.has_chat_template = true;
+        } else if key == "tokenizer.ggml.tokens" && kind == 9 {
+            let element = u32_value(&mut reader)?;
+            let count = u64_value(&mut reader)?;
+            if count > 2_000_000 {
+                return Err(invalid("metadata array too large"));
+            }
+            for _ in 0..count {
+                skip_value(&mut reader, element, length, true)?;
+            }
+            header.layout.vocab_tokens = Some(count);
         } else if key == "general.alignment" && kind == 4 {
             alignment = u32_value(&mut reader)? as u64;
             if alignment == 0 || alignment > 4096 || !alignment.is_power_of_two() {
@@ -598,6 +789,8 @@ fn parse_gguf_header(path: &Path) -> std::io::Result<GgufHeader> {
                 .find(|(key, _)| key == &format!("{architecture}{suffix}"))
                 .map(|(_, value)| *value)
         };
+        header.block_count = lookup(".block_count").and_then(|value| u32::try_from(value).ok());
+        header.draft_head_layers = lookup(".nextn_predict_layers").and_then(|value| u32::try_from(value).ok());
         header.kv_bytes_per_token = AttentionShape {
             block_count: lookup(".block_count"),
             head_count: lookup(".attention.head_count"),
@@ -612,14 +805,22 @@ fn parse_gguf_header(path: &Path) -> std::io::Result<GgufHeader> {
     // finished downloading but whose tensor data is missing is not ready yet.
     let mut last_offset = 0;
     for _ in 0..tensor_count {
-        let _name = string(&mut reader)?;
+        let name = string(&mut reader)?;
         let dimensions = u32_value(&mut reader)?;
         if !(1..=4).contains(&dimensions) {
             return Err(invalid("invalid tensor dimensions"));
         }
-        for _ in 0..dimensions {
-            if u64_value(&mut reader)? == 0 {
+        if name.starts_with("v.") || name.starts_with("a.") || name.starts_with("mm.") {
+            header.layout.tower_tensors += 1;
+        }
+        for axis in 0..dimensions {
+            let size = u64_value(&mut reader)?;
+            if size == 0 {
                 return Err(invalid("empty tensor dimension"));
+            }
+            // GGUF stores token_embd as [embedding width, vocabulary rows].
+            if axis == 1 && name == "token_embd.weight" {
+                header.layout.embedding_rows = Some(size);
             }
         }
         let _element_type = u32_value(&mut reader)?;
@@ -661,12 +862,31 @@ fn is_model_gguf(path: &Path) -> bool {
             .is_some_and(|v| v.to_ascii_lowercase().contains("mmproj"))
 }
 
+fn split_pattern() -> &'static regex::Regex {
+    static SPLIT: OnceLock<regex::Regex> = OnceLock::new();
+    SPLIT.get_or_init(|| regex::Regex::new(r"(?i)^(.*)-(\d{5})-of-(\d{5})\.gguf$").unwrap())
+}
+
+/// Bytes of a model's weights on disk: every shard of a split set (llama.cpp
+/// loads a set through its first shard, `name-00001-of-000NN.gguf`), or the
+/// single file. 0 when nothing can be read.
+pub fn model_set_bytes(path: &Path) -> u64 {
+    let name = path.file_name().and_then(|v| v.to_str()).unwrap_or("");
+    let Some(parts) = split_pattern().captures(name) else {
+        return std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    };
+    let count = parts[3].parse::<u32>().unwrap_or(0).min(1024);
+    (1..=count)
+        .map(|number| path.with_file_name(format!("{}-{number:05}-of-{count:05}.gguf", &parts[1])))
+        .filter_map(|shard| std::fs::metadata(shard).ok())
+        .map(|meta| meta.len())
+        .sum()
+}
+
 /// llama.cpp loads a split set through its first shard. Registering every shard
 /// as a separate model produces broken choices, so only expose complete sets.
 fn complete_model_file(path: &Path) -> Result<bool, String> {
-    static SPLIT: OnceLock<regex::Regex> = OnceLock::new();
-    let pattern =
-        SPLIT.get_or_init(|| regex::Regex::new(r"(?i)^(.*)-(\d{5})-of-(\d{5})\.gguf$").unwrap());
+    let pattern = split_pattern();
     let name = path.file_name().and_then(|v| v.to_str()).unwrap_or("");
     if let Some(parts) = pattern.captures(name) {
         let index = parts[2].parse::<u32>().unwrap_or(0);
@@ -817,12 +1037,17 @@ fn inferred_metadata(
         context_length: header.context_length.unwrap_or(4096),
         vision: projector_file.is_some(),
         // The chat template embedded in the file is the evidence, never the
-        // filename: a Qwen 3 or Gemma 4 template declares its thinking switch.
+        // filename: a template with a thinking switch declares it.
         tool_calling: header.template.tools,
         supports_reasoning: header.template.thinking,
         chat_template: header.template.shape,
+        load_issues: load_issues(header.layout, header.architecture.as_deref()),
+        builtin_chat_format: fallback_chat_format(header),
+        tool_support_source: None,
         kv_bytes_per_token: header.kv_bytes_per_token,
-        weights_bytes: std::fs::metadata(gguf).ok().map(|m| m.len()),
+        weights_bytes: Some(model_set_bytes(gguf)).filter(|bytes| *bytes > 0),
+        block_count: header.block_count,
+        draft_head_layers: header.draft_head_layers,
         projector_file: projector_file.clone(),
         model_file: gguf
             .file_name()
@@ -937,6 +1162,8 @@ pub fn scan_models_dir(dir: &std::path::Path) -> (Vec<ModelMetadata>, Vec<String
                     let Some(header) = checked_header(dir, &m.gguf_path(), &mut warnings) else {
                         continue;
                     };
+                    m.builtin_chat_format = fallback_chat_format(&header);
+                    m.load_issues = load_issues(header.layout, header.architecture.as_deref());
                     if let Some(architecture) = header.architecture {
                         m.architecture = architecture;
                     }
@@ -949,7 +1176,9 @@ pub fn scan_models_dir(dir: &std::path::Path) -> (Vec<ModelMetadata>, Vec<String
                     m.tool_calling |= header.template.tools;
                     m.chat_template = header.template.shape;
                     m.kv_bytes_per_token = header.kv_bytes_per_token;
-                    m.weights_bytes = std::fs::metadata(m.gguf_path()).ok().map(|f| f.len());
+                    m.block_count = header.block_count;
+                    m.draft_head_layers = header.draft_head_layers;
+                    m.weights_bytes = Some(model_set_bytes(&m.gguf_path())).filter(|bytes| *bytes > 0);
                     if m.projector_file.is_none() {
                         if let Some(projector) = projector_in(&entry_path) {
                             m.projector_file = Some(projector);
@@ -1044,6 +1273,9 @@ mod tests {
             architecture: "llama".into(),
             quantization: "Q4_K_M".into(),
             chat_template: Default::default(),
+            load_issues: Vec::new(),
+            builtin_chat_format: None,
+            tool_support_source: None,
             parameters: "8B".into(),
             context_length: 32768,
             vision: false,
@@ -1051,6 +1283,8 @@ mod tests {
             supports_reasoning: false,
             kv_bytes_per_token: None,
             weights_bytes: None,
+            block_count: None,
+            draft_head_layers: None,
             projector_file: None,
             model_file: None,
             dir: PathBuf::from(format!("models/{id}")),
@@ -1120,14 +1354,14 @@ mod tests {
     fn scan_discovers_bare_named_gguf() {
         let root = std::env::temp_dir().join(format!("companion-bare-scan-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let folder = root.join("gemma-4-12b");
+        let folder = root.join("example-12b");
         std::fs::create_dir_all(&folder).unwrap();
-        std::fs::write(folder.join("gemma-4-12b-it-Q4_K_M.gguf"), test_gguf_bytes()).unwrap();
+        std::fs::write(folder.join("example-12b-it-Q4_K_M.gguf"), test_gguf_bytes()).unwrap();
 
         let (found, warnings) = scan_models_dir(&root);
         assert!(warnings.is_empty());
         assert_eq!(found.len(), 1);
-        assert_eq!(found[0].id, "gemma-4-12b");
+        assert_eq!(found[0].id, "example-12b");
         assert_eq!(found[0].parameters, "12B");
         assert_eq!(found[0].quantization, "Q4_K_M");
         // The header, not the marketing filename, supplies runtime facts.
@@ -1135,7 +1369,7 @@ mod tests {
         assert_eq!(found[0].context_length, 8192);
         assert_eq!(
             found[0].gguf_path(),
-            folder.join("gemma-4-12b-it-Q4_K_M.gguf")
+            folder.join("example-12b-it-Q4_K_M.gguf")
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1276,16 +1510,16 @@ mod tests {
 
     #[test]
     fn model_names_are_not_quantization_evidence() {
-        assert_eq!(infer_quantization("Qwen3-8B"), "unknown");
-        assert_eq!(infer_quantization("Qwen3-8B-Q4_K_M"), "Q4_K_M");
-        assert_eq!(infer_quantization("Gemma-BF16"), "BF16");
+        assert_eq!(infer_quantization("Example-8B"), "unknown");
+        assert_eq!(infer_quantization("Example-8B-Q4_K_M"), "Q4_K_M");
+        assert_eq!(infer_quantization("Example-BF16"), "BF16");
     }
 
     #[test]
     fn chat_template_is_the_evidence_for_thinking_and_tool_support() {
-        let qwen3 = "{%- if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>{%- endif %}{%- for tool in tools %}{{ tool | tojson }}{%- endfor %}";
+        let thinking_template = "{%- if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>{%- endif %}{%- for tool in tools %}{{ tool | tojson }}{%- endfor %}";
         assert_eq!(
-            template_hints(qwen3),
+            template_hints(thinking_template),
             TemplateHints {
                 thinking: true,
                 tools: true,
@@ -1299,7 +1533,7 @@ mod tests {
         let root = scan_fixture();
         let folder = root.join("thinker");
         std::fs::create_dir_all(&folder).unwrap();
-        std::fs::write(folder.join("thinker-8b-q4_k_m.gguf"), gguf_with_template(qwen3)).unwrap();
+        std::fs::write(folder.join("thinker-8b-q4_k_m.gguf"), gguf_with_template(thinking_template)).unwrap();
         let plain = root.join("plain");
         std::fs::create_dir_all(&plain).unwrap();
         std::fs::write(plain.join("plain-8b-q4_k_m.gguf"), test_gguf_bytes()).unwrap();
@@ -1310,6 +1544,97 @@ mod tests {
         let plain = found.iter().find(|m| m.id == "plain").unwrap();
         assert!(!plain.supports_reasoning && !plain.tool_calling);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn only_a_template_that_renders_tools_declares_tool_support() {
+        assert!(template_handles_tools("{%- if tools %}{{ tools | tojson }}{% endif %}"));
+        assert!(template_handles_tools("{% for tool in tools %}"));
+        assert!(template_handles_tools("{{ message.tool_calls }}"));
+        assert!(!template_handles_tools("you are a helpful assistant with many tools. {{ messages }}"));
+        assert!(!template_handles_tools("{% if tools_disabled %}{% endif %}"));
+    }
+
+    #[test]
+    fn a_model_whose_files_were_deleted_leaves_the_list() {
+        let root = std::env::temp_dir().join(format!("companion-reconcile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let entry = |id: &str| {
+            let mut model = sample(id);
+            model.dir = root.join(id);
+            model.model_file = Some("model.gguf".into());
+            model
+        };
+        for id in ["kept", "deleted", "loaded"] {
+            std::fs::create_dir_all(root.join(id)).unwrap();
+            std::fs::write(root.join(id).join("model.gguf"), b"x").unwrap();
+        }
+        let mut manager = ModelManager::new();
+        let (removed, _) = manager.reconcile(vec![entry("kept"), entry("deleted"), entry("loaded")]);
+        assert!(removed.is_empty());
+        manager.switch_to("loaded").unwrap();
+        // The user deletes two folders by hand; the next scan finds only one model.
+        std::fs::remove_dir_all(root.join("deleted")).unwrap();
+        std::fs::remove_dir_all(root.join("loaded")).unwrap();
+        let (removed, _) = manager.reconcile(vec![entry("kept")]);
+        assert_eq!(removed, vec!["deleted".to_string()]);
+        let ids: Vec<String> = manager.list().into_iter().map(|model| model.id).collect();
+        // The loaded model stays until it is unloaded; the deleted one is gone.
+        assert_eq!(ids, vec!["kept".to_string(), "loaded".to_string()]);
+        // An emptied folder is reconciled too, not skipped.
+        std::fs::remove_dir_all(root.join("kept")).unwrap();
+        manager.remove("loaded");
+        let (removed, _) = manager.reconcile(Vec::new());
+        assert_eq!(removed, vec!["kept".to_string()]);
+        assert!(manager.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn structural_load_issues_are_reported_without_naming_models() {
+        let clean = GgufLayout {
+            tower_tensors: 0,
+            vocab_tokens: Some(256_000),
+            embedding_rows: Some(256_000),
+            has_chat_template: true,
+        };
+        assert!(load_issues(clean, None).is_empty());
+        // The layout of a registry blob: towers packed in, tokenizer one entry
+        // longer than the embedding, no template.
+        let packed = GgufLayout {
+            tower_tensors: 439,
+            vocab_tokens: Some(262_145),
+            embedding_rows: Some(262_144),
+            has_chat_template: false,
+        };
+        let issues = load_issues(packed, None);
+        assert_eq!(issues.len(), 3);
+        assert!(issues[0].contains("439 vision/audio tensors"));
+        assert!(issues[1].contains("262145") && issues[1].contains("262144"));
+        assert!(issues[2].contains("no chat template"));
+    }
+
+    #[test]
+    fn a_file_without_a_template_uses_its_architectures_built_in_format() {
+        let no_template = GgufLayout { has_chat_template: false, ..GgufLayout::default() };
+        // An architecture with one format: no load issue, the format is used.
+        assert!(load_issues(no_template, Some("gemma3")).is_empty());
+        let header = GgufHeader {
+            architecture: Some("gemma3".into()),
+            layout: no_template,
+            ..GgufHeader::default()
+        };
+        assert_eq!(fallback_chat_format(&header).as_deref(), Some("gemma"));
+        // Its own template always wins.
+        let templated = GgufHeader { layout: GgufLayout { has_chat_template: true, ..no_template }, ..header };
+        assert_eq!(fallback_chat_format(&templated), None);
+        // An architecture shared by releases with different formats keeps the
+        // issue and gets no guess.
+        assert_eq!(builtin_chat_format("llama"), None);
+        assert_eq!(load_issues(no_template, Some("llama")).len(), 1);
+        assert_eq!(load_issues(no_template, None).len(), 1);
+        // The runtime's own fallback is ChatML, which some architectures use.
+        assert_eq!(builtin_chat_format("qwen3moe"), Some("chatml"));
     }
 
     #[test]
@@ -1345,9 +1670,24 @@ mod tests {
     }
 
     #[test]
+    fn a_split_model_counts_every_shard() {
+        let dir = std::env::temp_dir().join(format!("companion-split-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("model-00001-of-00002.gguf");
+        std::fs::write(&first, vec![0u8; 100]).unwrap();
+        std::fs::write(dir.join("model-00002-of-00002.gguf"), vec![0u8; 250]).unwrap();
+        let single = dir.join("single.gguf");
+        std::fs::write(&single, vec![0u8; 40]).unwrap();
+        assert_eq!(model_set_bytes(&first), 350);
+        assert_eq!(model_set_bytes(&single), 40);
+        assert_eq!(model_set_bytes(&dir.join("missing.gguf")), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn kv_bytes_per_token_follow_the_attention_shape() {
-        // Qwen3-8B: 36 layers, 8 KV heads, head dim 128 -> 147,456 bytes/token at f16.
-        let qwen3 = AttentionShape {
+        // An 8B model: 36 layers, 8 KV heads, head dim 128 -> 147,456 bytes/token at f16.
+        let eight_b = AttentionShape {
             block_count: Some(36),
             head_count: Some(32),
             head_count_kv: Some(8),
@@ -1355,7 +1695,7 @@ mod tests {
             key_length: Some(128),
             value_length: Some(128),
         };
-        assert_eq!(qwen3.kv_bytes_per_token(), Some(147_456));
+        assert_eq!(eight_b.kv_bytes_per_token(), Some(147_456));
         // Without explicit key/value lengths the head dimension is derived.
         let derived = AttentionShape {
             block_count: Some(48),

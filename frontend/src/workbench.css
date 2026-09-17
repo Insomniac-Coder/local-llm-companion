@@ -1415,6 +1415,9 @@ a.chip:hover { border-color: var(--line-3); color: var(--text); background: var(
 .agent-run.live .agent-run-steps li:last-child::before { background: var(--tally); box-shadow: 0 0 8px color-mix(in srgb, var(--tally) 60%, transparent); }
 .agent-run-open { width: 100%; height: 38px; display: flex; align-items: center; justify-content: space-between; padding: 0 14px; border-top: 1px solid var(--line); color: var(--text-2); font-size: 12.5px; text-align: left; transition: background-color 0.12s, color 0.12s; }
 .agent-run-open:hover { background: var(--hover); color: var(--text); }
+.plan-approval { overflow: hidden; border: 1px solid var(--tally-line); border-radius: 14px; background: var(--raised); animation: rise-in 0.22s var(--ease) both; }
+.plan-approval .agent-run-head > svg { flex: none; color: var(--tally); }
+.plan-approval-actions { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 14px 12px; }
 
 .session-activity { display: flex; flex-direction: column; gap: 16px; min-height: 100%; }
 .run-summary { display: flex; align-items: flex-start; gap: 12px; }
@@ -1431,6 +1434,7 @@ a.chip:hover { border-color: var(--line-3); color: var(--text); background: var(
 .approval-card p { margin: 0; color: var(--text); font-size: 13px; line-height: 1.5; }
 .approval-card code { align-self: flex-start; padding: 3px 8px; border: 1px solid var(--line-2); border-radius: 6px; background: var(--bg); color: var(--text); font-size: 12px; }
 .approval-card .approval-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.approval-card .approval-target { margin: 0; max-height: 160px; overflow: auto; padding: 8px 10px; border: 1px solid var(--line-2); border-radius: 6px; background: var(--bg); color: var(--text); font-family: var(--font-mono, ui-monospace, monospace); font-size: 12px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
 .run-history summary { display: flex; align-items: center; gap: 6px; color: var(--text-3); font-size: 12.5px; cursor: pointer; list-style: none; }
 .run-history summary::-webkit-details-marker { display: none; }
 .run-history summary:hover { color: var(--text); }

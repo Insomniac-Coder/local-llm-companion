@@ -4,7 +4,11 @@ import { readFileSync, writeFileSync, copyFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 
 const API = process.env.COMPANION_API || 'http://127.0.0.1:5173';
-const MODEL = process.argv[2] || 'qwen3-8b';
+const MODEL = process.argv[2];
+if (!MODEL) {
+  console.error('Usage: node scripts/e2e/e2e.mjs <model-id>');
+  process.exit(2);
+}
 const FIXTURE = new URL('./fixture/', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1');
 const report = [];
 const log = (line) => { console.log(line); report.push(line); };
@@ -56,7 +60,7 @@ function sse(body, onEvent) {
 async function chat(convId, message, opts = {}) {
   const t0 = performance.now();
   let text = '', reasoning = '', done = null, errors = [], activities = [], firstToken = null, phases = [];
-  await sse({ conversation_id: convId, message, classified: opts.classified ?? false, ...(opts.reasoning !== undefined ? { reasoning: opts.reasoning } : {}) }, (event, data) => {
+  await sse({ conversation_id: convId, message, ...(opts.reasoning !== undefined ? { reasoning: opts.reasoning } : {}) }, (event, data) => {
     if (event === 'token') { if (firstToken === null) firstToken = performance.now() - t0; text += data; }
     else if (event === 'reasoning') reasoning += data;
     else if (event === 'done') done = JSON.parse(data);
@@ -74,7 +78,7 @@ function fmtTiming(done) {
 
 async function agentRun(workspacePath, convId, task, reasoning) {
   const t0 = performance.now();
-  const start = await j('/api/agent/run', { method: 'POST', body: JSON.stringify({ workspace: workspacePath, task, mode: 'agent', conversation_id: convId, search: false, classified: true, reasoning }) });
+  const start = await j('/api/agent/run', { method: 'POST', body: JSON.stringify({ workspace: workspacePath, task, mode: 'agent', conversation_id: convId, search: false, reasoning }) });
   if (!start.run_id) return { start, events: [], wall_ms: 0 };
   const r = await fetch(API + '/api/agent/runs/' + start.run_id + '/events');
   const reader = r.body.getReader();
@@ -147,21 +151,16 @@ log(`  ${fmtTiming(r.done)}`);
 copyFileSync(FIXTURE + 'calculator.js', FIXTURE + 'calculator.js.orig');
 const ws = await j('/api/workspaces', { method: 'POST', body: JSON.stringify({ name: 'fixture', path: FIXTURE }) });
 const codeConv = await j('/api/conversations', { method: 'POST', body: JSON.stringify({ title: 'e2e code', model_id: MODEL, mode: 'code', workspace: ws.id }) });
-let tc = performance.now();
-let cls = await j('/api/chat/classify', { method: 'POST', body: JSON.stringify({ conversation_id: codeConv.id, message: 'What does calculator.js export, and what does the test file check? Also, what is the support ticket number in the README?' }) });
-log(`\n[ask-classify] ${JSON.stringify(cls)} in ${Math.round(performance.now() - tc)} ms`);
-r = await chat(codeConv.id, 'What does calculator.js export, and what does the test file check? Also, what is the support ticket number in the README?', { classified: cls.source === 'model' });
-const tools = r.activities.filter((a) => a.kind === 'tool_result' || a.kind === 'tool_error').map((a) => `${a.kind}:${a.tool}(${a.args?.path ?? a.args?.query ?? ''})`);
-log(`[ask-answer] ${r.wall_ms} ms, tool rounds ${r.done?.tool_rounds}, tools: ${tools.join(', ')}${r.errors.length ? `, ERRORS: ${r.errors.join(' | ')}` : ''}`);
-log(`  answer: ${r.text.replace(/\s+/g, ' ').slice(0, 400)}`);
-log(`  correct: exports ${/add/.test(r.text) && /subtract/.test(r.text) && /multiply/.test(r.text)}, ticket ${/LANTERN-583/.test(r.text)}`);
-log(`  ${fmtTiming(r.done)}`);
+// Code sessions route like Claude Code: a question goes to the agent too, which answers after reading.
+const question = await agentRun(FIXTURE, codeConv.id, 'What does calculator.js export, and what does the test file check? Also, what is the support ticket number in the README?', false);
+const answer = question.events.find((e) => e.kind === 'final')?.message ?? '';
+const tools = question.events.filter((e) => e.kind === 'tool_result' || e.kind === 'tool_error').map((e) => `${e.kind}:${e.tool}(${e.args?.path ?? e.args?.query ?? ''})`);
+log(`\n[ask-answer] ${question.wall_ms} ms, tools: ${tools.join(', ')}`);
+log(`  answer: ${answer.replace(/\s+/g, ' ').slice(0, 400)}`);
+log(`  correct: exports ${/add/.test(answer) && /subtract/.test(answer) && /multiply/.test(answer)}, ticket ${/LANTERN-583/.test(answer)}`);
 
 // ---- Agent ----
-tc = performance.now();
 const task = 'The subtract function in calculator.js is wrong: it adds instead of subtracting. Fix it with a minimal edit, then run `node calculator.test.js` and report the real result.';
-cls = await j('/api/chat/classify', { method: 'POST', body: JSON.stringify({ conversation_id: codeConv.id, message: task }) });
-log(`\n[agent-classify] ${JSON.stringify(cls)} in ${Math.round(performance.now() - tc)} ms`);
 const run = await agentRun(FIXTURE, codeConv.id, task, false);
 const last = run.events[run.events.length - 1];
 const toolEvents = run.events.filter((e) => e.kind === 'tool_result' || e.kind === 'tool_error').map((e) => `${e.kind}:${e.tool}(${(e.args?.path ?? e.args?.command ?? e.args?.query ?? '').toString().slice(0, 40)})`);

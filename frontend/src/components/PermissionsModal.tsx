@@ -2,18 +2,19 @@ import { useEffect, useState } from 'react';
 import { Button, Dialog } from '../ui/primitives';
 import { Icon } from '../ui/Icon';
 import { getSettings } from '../services/api';
-import { AUTO_POLICY_DESCRIPTION, PROJECT_BOUNDARY_DESCRIPTION, SEARCH_PERMISSION_DESCRIPTION } from './permissionCopy';
+import { PERMISSION_MODE_DESCRIPTIONS, PERMISSION_MODE_LABELS, PROJECT_BOUNDARY_DESCRIPTION, SEARCH_PERMISSION_DESCRIPTION } from './permissionCopy';
 
 export function PermissionSummary({ settings }: { settings: any }) {
-  const auto = !!settings.agent?.autonomous_enabled;
+  const mode = (settings.agent?.permission_mode in PERMISSION_MODE_LABELS ? settings.agent.permission_mode : settings.agent?.autonomous_enabled ? 'auto' : 'ask') as keyof typeof PERMISSION_MODE_LABELS;
+  const auto = mode === 'auto';
   const searchPolicy = settings.search?.autonomous === 'deny' ? 'Not allowed' : settings.search?.autonomous === 'allow' ? 'Allowed when Search is enabled' : 'Ask unless Auto mode is on';
   return <>
     <dl className="policy-status">
-      <dt>Approval policy</dt><dd className={auto ? 'auto' : ''}>{auto ? 'Auto — no approval prompts' : 'Ask — approve actions'}</dd>
+      <dt>Permission mode</dt><dd className={auto ? 'auto' : ''}>{PERMISSION_MODE_LABELS[mode]} — {PERMISSION_MODE_DESCRIPTIONS[mode]}</dd>
       <dt>Agent search</dt><dd>{searchPolicy}</dd>
     </dl>
     <ul className="policy-list">
-      <li><Icon name="shield" size={16} /><span>Ask mode requests approval for agent actions. {AUTO_POLICY_DESCRIPTION}</span></li>
+      <li><Icon name="shield" size={16} /><span>{(Object.keys(PERMISSION_MODE_LABELS) as (keyof typeof PERMISSION_MODE_LABELS)[]).map((option) => `${PERMISSION_MODE_LABELS[option]}: ${PERMISSION_MODE_DESCRIPTIONS[option]}`).join(' ')}</span></li>
       <li><Icon name="folder" size={16} /><span>{PROJECT_BOUNDARY_DESCRIPTION} Use Auto only for tasks and projects you trust.</span></li>
       <li><Icon name="globe" size={16} /><span>{SEARCH_PERMISSION_DESCRIPTION}</span></li>
     </ul>

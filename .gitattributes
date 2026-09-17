@@ -1,0 +1,7 @@
+# Shell scripts keep LF line endings in every checkout: bash on Linux and macOS
+# (and in WSL) cannot run a script with CRLF endings.
+*.sh text eol=lf
+# Batch files keep CRLF: cmd.exe misreads some constructs in LF batch files.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+models/gemma-4-e4b-it-qat/*.gguf filter=lfs diff=lfs merge=lfs -text

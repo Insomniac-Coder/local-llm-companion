@@ -171,9 +171,16 @@ Source of truth: `Local_LLM_PC_Companion_Design.md` (§§1–107).
   `timings` (prompt/decode tok/s, `cache_n`, draft acceptance) and an early
   `should_stop` predicate that closes the connection so the slot is released.
 - Every request of a conversation shares one KV prefix
-  (`api::assemble_request_context`): chat, routing (`/api/chat/classify`
-  appends one instruction turn after the identical prefix) and the agent's
-  completion review (appended to the run transcript). Reasoning off sends
+  (`api::assemble_request_context`): chat and the agent's completion review
+  (appended to the run transcript). Code sessions have no routing request:
+  every message goes to the agent, which answers or acts within the session's
+  permission mode (ask, accept edits, plan, auto). A question answered before
+  anything was read is sent once to read the files it concerns
+  (`asks_for_information`, `READ_BEFORE_ANSWERING`); a change request gets the
+  "start the work" push instead. A plan run ends with the plan-only
+  `present_plan` tool (as Claude Code's ExitPlanMode); only then does the run
+  summary carry `plan_ready` and the conversation show the approval card, whose
+  "Yes" switches the mode and continues the planned task. Reasoning off sends
   `chat_template_kwargs.enable_thinking=false`; `supports_reasoning` and
   `tool_calling` are read from the GGUF chat template, and a lone `mmproj`
   next to the weights enables vision.
@@ -342,8 +349,8 @@ Source of truth: `Local_LLM_PC_Companion_Design.md` (§§1–107).
 - `POST /api/inference/start {model_id?, model_path?, port?, n_ctx?, n_gpu_layers?, n_threads?}` builds argv from settings + overrides, waits for `/health` (90 s), marks model loaded.
 - `POST /api/inference/stop` kills the child; `POST /api/models/unload` also stops it (§15).
 - Chat prefers the sidecar when running, stub fallback otherwise (collect-then-stream; token-passthrough is Stage 5).
-- Binary search: `COMPANION_LLAMA_SERVER_BIN` → PATH → `models/bin/` (§52 errors tell the user where to put it).
-- Setup: download a llama.cpp release, place `llama-server(.exe)`, add a GGUF at `models/<id>/model.gguf` + `metadata.json`, Scan → Load → Start inference.
+- Binary search: `COMPANION_LLAMA_SERVER_BIN` → `runtime/bin/` (built from the pinned commit in `runtime/llama.cpp.lock.json` by `scripts/build-runtime.ps1` / `build-runtime.sh`) → PATH (§52 errors tell the user what to do).
+- Setup: build the runtime with the build script (see README), add a GGUF under `models/<id>/`, Scan → Load → Start inference.
 
 ## Stage 2 API contract
 - Errors: `{error, hint}` with 400/404/413/500 (§52). Frontend surfaces both.
@@ -360,7 +367,15 @@ Source of truth: `Local_LLM_PC_Companion_Design.md` (§§1–107).
 - `LLM → ToolRequest → PermissionManager → Tool → OS`. No direct OS access.
 - `WorkspaceManager::resolve` is the only path joiner; lexical + canonical checks.
 - MODERATE/DANGEROUS tools require `approved=true` (permission UX sets it, §26).
-- Default autonomy = Level 1 Assisted.
+- Permission modes map to autonomy levels (`permissions::autonomy_for_mode`): ask →
+  WorkspaceAgent (reads free, everything else asks; the default), accept edits → AcceptEdits
+  (reads and file edits in the project free), plan → read-only runs, auto → Autonomous.
+- `PermissionManager::decide_call` sees the call's arguments: an edit inside any `.git` folder
+  (config, hooks) asks even in Accept edits, because git runs commands named there. The app's own
+  git reads pass `-c core.fsmonitor=false --no-ext-diff --no-textconv`.
+- Changing the mode releases waiting actions the new mode allows; a waiting web search is released
+  only by Auto. Shift+Tab cycles ask → accept edits → plan (never Auto) and saves where it stops;
+  saves go one at a time (`PermissionModeSaver`).
 
 ## Limitations (honest, per §79)
 - Sidecar only: no in-process GGML (needs a C++ toolchain); needs a downloaded binary + GGUF.

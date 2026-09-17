@@ -11,12 +11,20 @@ const result = await build({ entryPoints: [fileURLToPath(new URL('../src/compone
 const loaded = { exports: {} };
 new Function('require', 'module', 'exports', result.outputFiles[0].text)(createRequire(import.meta.url), loaded, loaded.exports);
 
-test('permission summary clearly describes full Auto while preserving the actual saved policy', () => {
-  for (const enabled of [true, false]) {
-    const html = renderToStaticMarkup(createElement(loaded.exports.PermissionSummary, { settings: { agent: { autonomous_enabled: enabled }, search: { autonomous: 'deny' } } }));
-    assert.ok(html.includes(enabled ? 'Auto — no approval prompts' : 'Ask — approve actions'));
-    for (const text of ['file edits, commands and deletions', 'not operating-system sandboxed', 'request’s Search switch', 'overrides Auto', 'Not allowed']) assert.ok(html.includes(text), text);
-    assert.match(html, /Ask mode requests approval for agent actions/);
+test('permission summary names the saved mode and describes all four, including full Auto', () => {
+  const cases = [
+    [{ permission_mode: 'ask' }, 'Ask — Reads and searches run freely'],
+    [{ permission_mode: 'accept_edits' }, 'Accept edits — Reads and file edits in the project run without asking'],
+    [{ permission_mode: 'plan' }, 'Plan — Read-only'],
+    [{ permission_mode: 'auto', autonomous_enabled: true }, 'Auto — Auto carries out your requested task'],
+    // A settings file from before the modes keeps meaning what its switch said.
+    [{ autonomous_enabled: true }, 'Auto — Auto carries out your requested task'],
+    [{ autonomous_enabled: false }, 'Ask — Reads and searches run freely'],
+  ];
+  for (const [agent, current] of cases) {
+    const html = renderToStaticMarkup(createElement(loaded.exports.PermissionSummary, { settings: { agent, search: { autonomous: 'deny' } } }));
+    assert.ok(html.includes(current), `${JSON.stringify(agent)}: ${current}`);
+    for (const text of ['file edits, commands and deletions', 'not operating-system sandboxed', 'request’s Search switch', 'overrides Auto', 'Not allowed', 'Accept edits: ', 'Plan: ']) assert.ok(html.includes(text), text);
     assert.doesNotMatch(html, /commands and deletion still require|Network policy:|Safe project inspection does not need approval/);
   }
 });
@@ -28,11 +36,11 @@ test('active permission surfaces no longer advertise file-only Auto or automatic
   }
 });
 
-test('Ask and Auto expose and visibly style their selected state', () => {
+test('the permission modes expose and visibly style their selected state', () => {
   const app = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
   const css = readFileSync(new URL('../src/workbench.css', import.meta.url), 'utf8');
-  assert.match(app, /aria-pressed=\{permissionMode === 'ask'\}/);
-  assert.match(app, /aria-pressed=\{permissionMode === 'auto'\}/);
+  assert.match(app, /PERMISSION_MODES\.map\(\(option\) =>/);
+  assert.match(app, /aria-pressed=\{permissionMode === option\}/);
   assert.match(css, /\.permission-mode button\[aria-pressed='true'\]/);
   assert.match(css, /\.permission-mode\.auto button\[aria-pressed='true'\]/);
 });

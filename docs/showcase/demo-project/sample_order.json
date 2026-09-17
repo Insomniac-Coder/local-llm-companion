@@ -1,0 +1,8 @@
+{
+  "customer": "Sample customer",
+  "items": [
+    {"name": "pen", "price": 1.5, "quantity": 4},
+    {"name": "notebook", "price": 3.0, "quantity": 2},
+    {"name": "stapler", "price": 7.25, "quantity": 1}
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "text": "The answer is 42.",
+  "finish_reason": "stop",
+  "reasoning_present": true,
+  "prompt_tokens": 18
+}

@@ -2,6 +2,7 @@
   "name": "companion-frontend",
   "private": true,
   "version": "0.1.0",
+  "license": "Unlicense",
   "type": "module",
   "scripts": {
     "test": "node --test src/services/*.test.mjs tests/*.test.mjs",

@@ -10,6 +10,8 @@ mod agent;
 mod agent_progress;
 mod agent_runner;
 mod api;
+mod calibration;
+mod cpu_topology;
 mod commands;
 mod config;
 mod daio;
@@ -27,11 +29,13 @@ mod models;
 mod permissions;
 mod recommend;
 mod repo_index;
-mod request_router;
+mod runtime_fit;
 mod runtime_selection;
 mod search;
 mod settings;
+mod speed_rule;
 mod storage;
+mod stream_split;
 mod terminal;
 mod tools;
 mod vision;
@@ -82,7 +86,8 @@ async fn main() {
         storage,
         cfg.models_dir.clone(),
         cfg.data_dir.join("attachments"),
-    );
+    )
+    .with_install_root(cfg.root.clone());
 
     // Register models found on disk (§9 layout), then seed demo only if empty
     // so the UI Model selector is never blank on first launch (§88).
@@ -97,35 +102,11 @@ async fn main() {
                 tracing::warn!("skipping model: {e}");
             }
         }
+        // No placeholder entry when the folder is empty: a listed model must be
+        // a file that can be loaded. The setup screen explains how to add one.
         if mm.is_empty() {
-            let _ = mm.register(models::ModelMetadata {
-                id: "demo-8b".into(),
-                name: "Demo 8B Q4_K_M (stub)".into(),
-                architecture: "llama".into(),
-                quantization: "Q4_K_M".into(),
-                parameters: "8B".into(),
-                context_length: 32768,
-                vision: false,
-                tool_calling: true,
-                supports_reasoning: false,
-                chat_template: Default::default(),
-                kv_bytes_per_token: None,
-                weights_bytes: None,
-                projector_file: None,
-                model_file: None,
-                dir: cfg.models_dir.join("demo-8b"),
-                capabilities: models::ModelCapabilities {
-                    chat: true,
-                    coding: true,
-                    tool_calling: true,
-                    json_output: true,
-                    vision: false,
-                    audio: false,
-                },
-                loaded: false,
-            });
             tracing::info!(
-                "no models in {}; seeded demo entry (add GGUF + metadata.json, then POST /api/models/scan)",
+                "no models in {}; add a GGUF (models/modeldownloader.py) and the list updates on its next read",
                 cfg.models_dir.display()
             );
         } else {
@@ -136,6 +117,10 @@ async fn main() {
             );
         }
     }
+
+    // Each model's fit is searched ahead of its first load (owner decision
+    // 2026-09-17), once the interface has had time to come up.
+    api::spawn_fit_preparation(&state, std::time::Duration::from_secs(20));
 
     // Refuse non-loopback binds unless explicitly overridden (§54).
     if !(cfg.addr.starts_with("127.0.0.1:") || cfg.addr.starts_with("localhost:")) {
@@ -162,8 +147,9 @@ async fn main() {
     }
 
     if !cfg.frontend_dir.join("index.html").is_file() {
+        let start_script = if cfg!(windows) { ".\\run.ps1 (or run.bat)" } else { "./run.sh" };
         tracing::warn!(
-            "frontend build not found at {}; run .\\run.ps1 or `npm run build` in frontend/",
+            "frontend build not found at {}; start Companion with {start_script} or run `npm run build` in frontend/",
             cfg.frontend_dir.display()
         );
     }

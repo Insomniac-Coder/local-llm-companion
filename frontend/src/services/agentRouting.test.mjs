@@ -1,32 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { classifyRequest, startAgent, streamChat } from './api.ts';
+import { startAgent, streamChat } from './api.ts';
 import { shouldStartAgent } from './workbench.ts';
 
-test('routing uses only the validated model label and sends the exact message with its session', async () => {
-  const originalFetch = globalThis.fetch;
-  const calls = [];
-  const controller = new AbortController();
-  let reply;
-  globalThis.fetch = async (url, init) => {
-    calls.push({url, init});
-    return new Response(JSON.stringify(reply), {status: 200});
-  };
-  try {
-    const message = 'tell me more about rageV project';
-    for (const label of ['ask', 'plan', 'agent']) {
-      reply = {intent: label, source: 'model'};
-      const result = await classifyRequest(message, 'session', controller.signal);
-      assert.equal(result.intent, label);
-      assert.equal(shouldStartAgent('code', result.intent, message), label !== 'ask');
-    }
-    for (const invalid of [null, {intent:'inspect'}, {intent:'agent',source:'untrusted'}]) {
-      reply = invalid;
-      assert.deepEqual(await classifyRequest(message, 'session', controller.signal), {intent:'ask',source:'fallback'});
-    }
-    assert.ok(calls.every(({url, init}) => url === '/api/chat/classify' && init.signal === controller.signal));
-    assert.deepEqual(JSON.parse(calls[0].init.body), {message, conversation_id:'session'});
-  } finally { globalThis.fetch = originalFetch; }
+test('code sessions route like Claude Code: every message goes to the agent, commands keep their path', () => {
+  for (const message of ['tell me more about this project', 'Create a calculator app', 'hello', 'Implement the plan']) {
+    assert.equal(shouldStartAgent('code', message), true, message);
+  }
+  assert.equal(shouldStartAgent('code', '/test'), false);
+  assert.equal(shouldStartAgent('chat', 'Create a calculator app'), false);
 });
 
 test('agent start preserves conversational dispositions and forwards explicit search consent', async () => {

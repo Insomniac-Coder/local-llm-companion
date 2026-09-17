@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Companion demo rehearsal</title>
+<style>
+  @page { size: A4; margin: 16mm 15mm 16mm 15mm; }
+  :root { --ink: #1b1d21; --muted: #5b6270; --line: #d9dde3; --wash: #f4f6f8; --accent: #b3261e; --ok: #1f7a3a; }
+  * { box-sizing: border-box; }
+  body { margin: 0; color: var(--ink); background: #fff; font: 10.5pt/1.5 "Segoe UI", system-ui, sans-serif; }
+  h1 { font-size: 22pt; margin: 0 0 2mm; letter-spacing: -0.01em; }
+  h2 { font-size: 13.5pt; margin: 7mm 0 2mm; padding-top: 2mm; border-top: 2px solid var(--ink); break-after: avoid; }
+  h3 { font-size: 11pt; margin: 4mm 0 1.5mm; break-after: avoid; }
+  p { margin: 0 0 2mm; }
+  .lede { color: var(--muted); margin-bottom: 4mm; }
+  .meta { display: grid; grid-template-columns: auto 1fr; gap: 1mm 5mm; font-size: 9.5pt; margin: 3mm 0 5mm; padding: 3mm 4mm; background: var(--wash); border-radius: 2mm; }
+  .meta b { color: var(--muted); font-weight: 600; }
+  ol, ul { margin: 0 0 2mm; padding-left: 6mm; }
+  li { margin: 0.6mm 0; }
+  .prompt { margin: 2mm 0 3mm; padding: 2.5mm 3.5mm; border-left: 3px solid var(--accent); background: var(--wash); font: 10pt/1.45 "Cascadia Code", Consolas, monospace; white-space: pre-wrap; break-inside: avoid; }
+  .prompt::before { content: "Type exactly"; display: block; font: 600 7.5pt "Segoe UI", sans-serif; letter-spacing: 0.06em; text-transform: uppercase; color: var(--accent); margin-bottom: 0.8mm; }
+  .expect { border: 1px solid var(--line); border-radius: 2mm; padding: 2.5mm 3.5mm; margin: 2mm 0 3mm; break-inside: avoid; }
+  .expect h4 { margin: 0 0 1mm; font-size: 8pt; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ok); }
+  .saw { font-size: 9.5pt; color: var(--muted); }
+  code { font: 9.5pt "Cascadia Code", Consolas, monospace; background: var(--wash); padding: 0 1mm; border-radius: 1mm; }
+  table { width: 100%; border-collapse: collapse; font-size: 9.5pt; margin: 2mm 0 3mm; break-inside: avoid; }
+  th, td { text-align: left; padding: 1.5mm 2mm; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-weight: 600; color: var(--muted); }
+  .flow { break-inside: avoid-page; }
+  .shots { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4mm; margin: 3mm 0; break-inside: avoid; }
+  figure { margin: 0; }
+  figure img { width: 100%; height: 42mm; object-fit: cover; border: 1px solid var(--line); border-radius: 1.5mm; display: block; }
+  figcaption { font-size: 8.5pt; color: var(--muted); margin-top: 1mm; }
+  .note { font-size: 9.5pt; padding: 2mm 3.5mm; border-radius: 2mm; background: #fff4e5; border: 1px solid #f0d3a8; margin: 2mm 0 3mm; break-inside: avoid; }
+  .keys { font: 600 9pt "Segoe UI", sans-serif; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 1mm; padding: 0 1.2mm; }
+</style>
+</head>
+<body>
+
+<h1>Companion demo rehearsal</h1>
+<p class="lede">Everything I tried in the app on 17 September 2026 with the 4B model, written so you can repeat it step by step before the showcase: what to type, what should happen, and what I saw.</p>
+
+<div class="meta">
+  <b>Model</b><span>Gemma 4 E4B, 4-bit (listed in the app as <code>Gemma 4 e4b IT qat ud (Q4_K_XL)</code>)</span>
+  <b>Where it runs</b><span>Entirely on the GPU, 32K context, about 4.6 GB of video memory</span>
+  <b>Model files</b><span>Split into four parts so GitHub can store them; the app reads them as one model. Checked: loads in 5.7 s, chat at 111 tokens per second, a code question answered correctly.</span>
+  <b>App build</b><span>The build of 17 September prepared for the showcase (night decisions 48–54)</span>
+  <b>Demo project</b><span><code>docs/showcase/demo-project</code> in the repository (a small Python order-totals tool with tests)</span>
+</div>
+
+<h2>1. Before the demo: checklist</h2>
+<p>Do these on the demo machine ahead of time, not in front of the audience. Every step here is one-off or quick.</p>
+<table>
+  <tr><th style="width:7mm"></th><th>Step</th><th>Why</th></tr>
+  <tr><td>☐</td><td><b>Get the code and the model.</b> Once the showcase commit is pushed: install Git LFS once (<code>git lfs install</code>), then clone the repository, or run <code>git pull</code> and <code>git lfs pull</code> in an existing clone. Check that <code>models/gemma-4-e4b-it-qat/</code> holds four files ending <code>-00001-of-00004.gguf</code> … <code>-00004-of-00004.gguf</code>, about 4 GB together (30 MB, 1.5 GB, 1.4 GB, 1.0 GB), not small text placeholders.</td><td>The model is stored with Git LFS. Without it, Git fetches placeholder files instead of the model.</td></tr>
+  <tr><td>☐</td><td><b>Build and start once, well before.</b> Run <code>.\run.ps1</code> in PowerShell or <code>run.bat</code> in Command Prompt (Windows), or <code>./run.sh</code> (macOS, Linux), from the project folder and wait for it to finish starting. Leave that window open during the demo.</td><td>The first run builds the inference runtime (about 10 minutes with CUDA) and the UI. Later starts take seconds.</td></tr>
+  <tr><td>☐</td><td><b>Plug in the power</b> and close games, video editors and other GPU-heavy apps.</td><td>On battery the laptop slows down. The model needs about 4.6 GB of video memory, and other apps can hold 1–2 GB.</td></tr>
+  <tr><td>☐</td><td><b>Open the app</b> at <code>http://localhost:5173</code> in a wide browser window, so the sidebar stays visible.</td><td>A narrow window folds the sidebar behind a menu button.</td></tr>
+  <tr><td>☐</td><td><b>Load the model</b> from the card at the bottom of the sidebar: choose Gemma 4 E4B and press <b>Load</b>. Wait for <b>READY</b> and <code>32K context</code>.</td><td>The first load reads 4 GB from disk. After that, a load took 5.6 s.</td></tr>
+  <tr><td>☐</td><td><b>Warm up:</b> send one short chat message and ask one question in a code task (flows 2 and 3 below). Then delete those sessions from the sidebar.</td><td>You see it working end to end, and the demo starts without first-use delays.</td></tr>
+  <tr><td>☐</td><td><b>Prepare a fresh demo project:</b> copy <code>docs/showcase/demo-project</code> into a new folder of its own (for example <code>demo-run\project</code>). In the <b>Code</b> tab, open the project picker at the top of the sidebar, choose <b>Open or create a project…</b> and select <code>demo-run</code>.</td><td>Demo tasks write files and new folders there. A fresh copy means nothing is left over from rehearsal.</td></tr>
+  <tr><td>☐</td><td><b>Tidy the sidebar:</b> delete old sessions you don't want on screen.</td><td>Old chats from other models show a "Last used with another model" banner.</td></tr>
+  <tr><td>☐</td><td><b>Set the starting mode</b> under the message box for your first code demo (Ask for questions, Plan for a planned change, Auto for building an app), and start each demo with <b>New task</b>.</td><td>A fresh task keeps earlier requests out of the model's history.</td></tr>
+  <tr><td>☐</td><td><b>Keep the prompts below at hand</b> (copy and paste works). Leave <b>Web search</b> (the globe icon) off.</td><td>Everything runs locally, and the prompts below are the ones rehearsed.</td></tr>
+</table>
+<div class="expect"><h4>Ready when</h4>
+  The sidebar card shows <b>READY</b> with <code>32K context</code>, the Code tab shows your demo project, and a warm-up chat answered at 100+ tokens per second.
+</div>
+<div class="note">I added the demo project through the app's API during the rehearsal, so "Open or create a project…" is the one screen I did not click through myself. After it, the new-task screen should show the project name, its path, and three quick actions (Understand this project, Plan a change, Find a bug).</div>
+
+<div class="flow">
+<h2>2. A plain chat</h2>
+<p>In the <b>Chat</b> tab, start a new chat and send:</p>
+<div class="prompt">Give me three short tips for writing clear commit messages.</div>
+<div class="expect"><h4>What should happen</h4>
+  The answer streams in straight away as a numbered list. Under it: the model name, <i>First text</i>, <i>Output</i> speed and <i>Total</i>.
+  <p class="saw">I saw: first text 0.5 s, 100 tokens per second, done in 1.6 s. In the test suite, nine different chat questions took 0.3–2.3 s each at 113–129 tokens per second (higher is faster).</p>
+</div>
+</div>
+
+<div class="flow">
+<h2>3. Ask about the code (Ask mode)</h2>
+<p>In the <b>Code</b> tab, press <b>New task</b>, pick <b>Ask</b> below the message box, and send:</p>
+<div class="prompt">What does this project do, and how is the tax applied to an order?</div>
+<div class="expect"><h4>What should happen</h4>
+  The agent lists the folders, reads <code>project/README.md</code> and <code>project/orders.py</code>, then answers. Nothing is changed and nothing asks for approval (Ask mode reads freely).
+  <p class="saw">I saw: five steps, no retries, correct answer: a command-line tool that reads an order from JSON and prints the total; <code>TAX_RATE = 0.08</code>; <code>order_total</code> multiplies the subtotal by <code>1 + tax_rate</code> and rounds to two decimals.</p>
+</div>
+</div>
+
+<div class="flow">
+<h2>4. Plan a change, keep planning, then approve</h2>
+<p>Start a new task, pick <b>Plan</b>, and send:</p>
+<div class="prompt">Add a function total_quantity(items) to project/orders.py that returns the sum of all item quantities, with a unit test in project/test_orders.py.</div>
+<div class="expect"><h4>What should happen</h4>
+  The agent reads both files and presents a plan. A card appears: <b>The plan is ready</b> — Yes, accept edits · Yes, ask before edits · No, keep planning. Nothing has been changed yet.
+</div>
+<ol>
+  <li>Press <b>No, keep planning</b>. The card closes, the mode stays on <b>Plan</b>, and the cursor is back in the message box.</li>
+  <li>Send the refinement:
+    <div class="prompt">Also run the tests with python -m unittest inside the project folder after the change.</div>
+    A new plan arrives that includes running the tests, with the card again.</li>
+  <li>Press <b>Yes, accept edits</b>. The mode switches to <b>Accept edits</b> and the agent starts working without asking for file edits.</li>
+  <li>When it wants to run the tests it stops with <b>Waiting for approval</b>. Press <b>Review the request</b>: the card names the command, <code>python -m unittest</code> (in project). Press <b>Allow once</b>.</li>
+</ol>
+<div class="expect"><h4>What should happen</h4>
+  <code>orders.py</code> gains <code>total_quantity</code>, <code>test_orders.py</code> gains a test, and the tests pass. Each file change has <b>View changes</b>, showing only the changed lines.
+  <p class="saw">I saw: the model first forgot to import the new function, so the test run failed with a NameError. It read the error, fixed the import and asked to run the tests again (a second <b>Allow once</b>). All three tests then passed.</p>
+</div>
+<div class="note">Commands ask every time in Ask and Accept edits, so there is no "Allow for session" for them. To let a whole task run without prompts, use <b>Auto</b> (next flow).</div>
+</div>
+
+<div class="flow">
+<h2>5. Build an app from scratch (Auto mode)</h2>
+<p>Start a new task, pick <b>Auto</b>, and send:</p>
+<div class="prompt">Create a to-do list web app in a new folder named todo: a single index.html with its CSS and JavaScript inside. I can add a task, tick it as done, and delete it.</div>
+<div class="expect"><h4>What should happen</h4>
+  No approval prompts. The agent creates <code>todo/index.html</code>, checks it, and reports. Open that file in your browser: type a task and press <b>Add Task</b>; click a task to mark it done; <b>Delete</b> removes it; the list survives a reload.
+  <p class="saw">I saw: about 50 s. Everything worked; empty tasks are ignored. On an earlier try, before a fix made that morning, the model wrote the page into the wrong folder. The app now catches that and sends it back.</p>
+</div>
+</div>
+
+<div class="flow">
+<h2>6. The two test-suite apps</h2>
+<p>The same way (new task, <b>Auto</b>), these are the exact prompts the automated test runs used:</p>
+<div class="prompt">Create a basic calculator web app in a new folder named calculator: a single index.html with its CSS and JavaScript inside. It needs buttons for the digits 0-9, +, -, ×, ÷, a decimal point, clear and equals, and a display that shows what is typed and the result.</div>
+<div class="prompt">Create a web app in a new folder named clock: a single index.html with its CSS and JavaScript inside, with three tabs: a live digital clock, a stopwatch with start, stop and reset, and a countdown timer where the user enters minutes and seconds and presses start.</div>
+<div class="expect"><h4>What I saw</h4>
+  Calculator in 47.8 s: I clicked 7+5=12, 6×7=42, 9÷4=2.25, 3−8=−5, 1.5+2.25=3.75 and 2+3×4=14 (correct order of operations); C resets. The model's own slips: a second "=" button, and "/" on the divide key.<br>
+  Clock in 54.3 s: styled page, ticking clock, Stopwatch and Countdown tabs.
+</div>
+<div class="shots">
+  <figure><img src="img/calculator.png" style="object-view-box: inset(190px 300px 180px 300px)"><figcaption>Calculator (test run)</figcaption></figure>
+  <figure><img src="img/clock.png" style="object-view-box: inset(20px 300px 520px 300px)"><figcaption>Clock (test run)</figcaption></figure>
+  <figure><img src="img/todo.png" style="object-view-box: inset(40px 250px 600px 250px)"><figcaption>To-do app (rehearsal)</figcaption></figure>
+</div>
+</div>
+
+<div class="flow">
+<h2>7. Switching modes</h2>
+<ul>
+  <li>Click <b>Ask</b>, <b>Accept edits</b>, <b>Plan</b> or <b>Auto</b> under the message box, or press <span class="keys">Shift</span>+<span class="keys">Tab</span> in the message box to cycle Ask → Accept edits → Plan. Auto is left out of the cycle on purpose; pick it with a click.</li>
+  <li>Ask: reads freely; edits, commands and deletions ask. Accept edits: reads and file edits run; commands, deletions, Git and web search ask. Plan: read-only, ends with a plan to approve. Auto: carries out the task without prompts.</li>
+</ul>
+</div>
+
+<div class="flow">
+<h2>8. Timings at a glance</h2>
+<table>
+  <tr><th>What</th><th>Time I measured</th></tr>
+  <tr><td>Load the model</td><td>5.6 s</td></tr>
+  <tr><td>Chat reply</td><td>first text 0.1–0.5 s; 100–129 tokens/s; 0.3–2.3 s in total</td></tr>
+  <tr><td>Question about the project (Ask)</td><td>a few seconds of model time, 5 steps</td></tr>
+  <tr><td>Plan (Plan mode)</td><td>about 20 s</td></tr>
+  <tr><td>Change with tests (test suite, Auto)</td><td>16.3 s, 5 tests passing</td></tr>
+  <tr><td>Calculator / clock / to-do app (Auto)</td><td>47.8 s / 54.3 s / about 50 s</td></tr>
+</table>
+</div>
+
+<div class="flow">
+<h2>9. Rough edges to know about</h2>
+<ul>
+  <li><b>A 4B model still makes small mistakes.</b> Examples from today: "/" instead of "÷", a forgotten import (it fixed that itself after the test failed), and a docstring edit that removed the <code>def</code> line it was documenting. Asking it to run the tests after a change, and looking at <b>View changes</b>, shows these quickly.</li>
+  <li><b>Technical wording in the activity list.</b> When a reply cannot be read, progress rows mention things like "the constrained JSON format". The run carries on; the wording is not yet plain.</li>
+  <li><b>New code sessions stay titled "New task"</b> in the sidebar.</li>
+  <li><b>The "Last used with another model" banner</b> in an old chat stays after the next reply.</li>
+  <li><b>Start each demo in a fresh task.</b> A long session carries earlier tasks in its history, which a small model can confuse with the new request.</li>
+</ul>
+</div>
+
+<div class="flow">
+<h2>10. Afterwards</h2>
+<p>Delete the <code>demo-run</code> folder (or send it to the Recycle Bin). The app keeps the sessions in its history until you delete them from the sidebar.</p>
+</div>
+
+</body>
+</html>

@@ -64,7 +64,8 @@ test('every settings section contains explicit field rows, including conditional
     ts.forEachChild(node, visit);
   }
   visit(source);
-  assert.equal(sectionCount, 6);
+  // Six sections plus Privacy's "Keep a record of model requests" switch.
+  assert.equal(sectionCount, 7);
 });
 
 test('hardware overrides are hidden by default and return with preserved values only in manual mode', () => {

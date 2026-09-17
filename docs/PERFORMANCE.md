@@ -180,7 +180,8 @@ is size and provenance, and that is a build recipe, not a fork:
 package (server only; one CUDA architecture instead of all; optionally a CPU
 backend compiled for the host). Expected effect on this machine: `ggml-cuda.dll`
 from 145 MB to roughly 30 MB and forty unused tools removed; no change in
-tokens per second. The recipe is documented and reviewed but not executed here,
-because this machine has no CMake or CUDA toolkit installed. Two leftover
-archives in `models/bin` (`cuda.zip`, `cudart.zip`, 540 MB together) are
-downloads that were already extracted and can be deleted by hand.
+tokens per second. Executed on 2026-09-16 (see
+`docs/validation/2026-09-16-audit-benchmarks.md`): the runtime in `runtime/bin` is built the way the
+official Windows release is (clang for the CPU modules and tools, MSVC for the CUDA and Vulkan
+modules) and measured equal to the official release on GPU and CPU; an all-MSVC build read prompts
+7% slower on the CPU. The downloaded release that used to live in `models/bin` was removed.

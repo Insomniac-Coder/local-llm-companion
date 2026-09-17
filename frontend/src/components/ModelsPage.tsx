@@ -71,7 +71,7 @@ export default function ModelsPage({
               <IconButton icon="x" label="Close download form" tipSide="bottom-end" onClick={() => setDownloadOpen(false)} />
             </div>
             <div className="download-grid">
-              <label className="field"><span>Name</span><input value={dlId} onChange={(e) => setDlId(e.target.value)} placeholder="qwen-14b" autoFocus /></label>
+              <label className="field"><span>Name</span><input value={dlId} onChange={(e) => setDlId(e.target.value)} placeholder="my-model" autoFocus /></label>
               <label className="field wide"><span>File link</span><input value={dlUrl} onChange={(e) => setDlUrl(e.target.value)} placeholder="https://huggingface.co/…/model.gguf" /></label>
               <label className="field wide"><span>SHA-256 <em className="muted" style={{ fontStyle: 'normal' }}>(optional)</em></span><input value={dlSha} onChange={(e) => setDlSha(e.target.value)} placeholder="Verifies the file after download" /></label>
             </div>

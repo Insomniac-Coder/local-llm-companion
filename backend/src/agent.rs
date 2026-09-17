@@ -108,6 +108,55 @@ pub struct AgentContextUsage {
     pub compact_at_pct: u32,
 }
 
+/// Characters per token of the loaded model's tokenizer on this user's text,
+/// times 100, measured from the prompt sizes the runtime reports; 0 until the
+/// first report after a load. The fixed 4 it replaces ran low on code and
+/// non-Latin text, so compaction started late and the context gauge passed
+/// 100%.
+static CHARS_PER_TOKEN_X100: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn chars_per_token() -> f64 {
+    match CHARS_PER_TOKEN_X100.load(Ordering::SeqCst) {
+        0 => 4.0,
+        value => f64::from(value) / 100.0,
+    }
+}
+
+/// A new model has a different tokenizer: forget the measurement.
+pub fn reset_chars_per_token() {
+    CHARS_PER_TOKEN_X100.store(0, Ordering::SeqCst);
+}
+
+/// Learn from one request the runtime measured. Unit tests share the process,
+/// so they never change the global ratio; the arithmetic is tested directly.
+pub fn observe_prompt(chars: usize, tokens: u32) {
+    #[cfg(not(test))]
+    {
+        let current = CHARS_PER_TOKEN_X100.load(Ordering::SeqCst);
+        if let Some(next) = next_chars_per_token_x100(current, chars, tokens) {
+            CHARS_PER_TOKEN_X100.store(next, Ordering::SeqCst);
+        }
+    }
+    #[cfg(test)]
+    let _ = (chars, tokens);
+}
+
+/// The smoothed ratio after one observation, or None when the request is too
+/// small to trust. Bounded to 1–8 characters per token. Template tokens count
+/// against the characters, which errs toward estimating more tokens.
+fn next_chars_per_token_x100(current: u32, chars: usize, tokens: u32) -> Option<u32> {
+    if tokens < 256 || chars < 512 {
+        return None;
+    }
+    let measured = (chars as f64 / f64::from(tokens) * 100.0).clamp(100.0, 800.0);
+    let next = if current == 0 {
+        measured
+    } else {
+        f64::from(current) * 0.7 + measured * 0.3
+    };
+    Some(next.round() as u32)
+}
+
 impl AgentContextUsage {
     pub fn for_turns(
         turns: &[crate::llamaserver::ChatTurn],
@@ -119,9 +168,9 @@ impl AgentContextUsage {
         // runtime's tokenizer can report actual tokens, especially for images.
         let text_chars: usize = turns.iter().map(|turn| turn.content.chars().count()).sum();
         Self {
-            estimated_tokens: ((text_chars.saturating_add(3) / 4)
-                .saturating_add(turns.len().saturating_mul(8)))
-            .min(u32::MAX as usize) as u32,
+            estimated_tokens: ((text_chars as f64 / chars_per_token()).ceil() as usize)
+                .saturating_add(turns.len().saturating_mul(8))
+                .min(u32::MAX as usize) as u32,
             prompt_tokens: None,
             generated_tokens: None,
             context_limit,
@@ -167,6 +216,11 @@ pub struct PendingTool {
     pub tool: String,
     pub args: serde_json::Value,
     pub reason: String,
+    /// "Allow for session" applies: only moderate-risk actions keep a grant.
+    /// Commands and deletion ask every time, so the UI offers the button only
+    /// when it will be honoured (it used to be shown and silently ignored).
+    #[serde(default)]
+    pub session_grantable: bool,
 }
 
 impl AgentEvent {
@@ -309,6 +363,15 @@ pub fn run_stub_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_token_ratio_is_learned_from_reported_prompts_and_bounded() {
+        assert_eq!(next_chars_per_token_x100(0, 100, 20), None, "too small to trust");
+        assert_eq!(next_chars_per_token_x100(0, 9_000, 3_000), Some(300), "code: 3 characters per token");
+        assert_eq!(next_chars_per_token_x100(300, 20_000, 4_000), Some(360), "smoothed toward 5");
+        assert_eq!(next_chars_per_token_x100(0, 1_000, 900), Some(111));
+        assert_eq!(next_chars_per_token_x100(0, 900_000, 1_000), Some(800), "capped at 8");
+    }
 
     #[test]
     fn request_context_counts_only_the_submitted_transcript() {

@@ -18,6 +18,33 @@ use tokio::task::JoinHandle;
 /// bound. Prefix caching makes a long unchanged transcript nearly free.
 const TRANSCRIPT_TURNS: usize = 60;
 const TOOL_OUTPUT_CHARS: usize = 16_000;
+/// In-place retries of one model request after a transient server failure
+/// (1 s, 2 s, 4 s).
+const TRANSIENT_MODEL_RETRIES: u32 = 3;
+/// Context overflows a run recovers from by releasing context before it stops.
+const MAX_OVERFLOW_RECOVERIES: u32 = 2;
+
+/// Sleep in short slices so Stop takes effect during a retry wait. False when
+/// cancelled.
+async fn sleep_unless_cancelled(cancel: &CancelToken, total: std::time::Duration) -> bool {
+    let slice = std::time::Duration::from_millis(100);
+    let deadline = std::time::Instant::now() + total;
+    while std::time::Instant::now() < deadline {
+        if cancel.is_cancelled() {
+            return false;
+        }
+        tokio::time::sleep(slice.min(deadline.saturating_duration_since(std::time::Instant::now()))).await;
+    }
+    !cancel.is_cancelled()
+}
+
+fn capitalized(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
 
 /// Characters of one tool result kept in the transcript.
 ///
@@ -69,6 +96,25 @@ impl ActionResponsePolicy {
         self.disable_native_thinking = true;
         self.structured_fallback = self.invalid_since_progress >= 2;
         self.invalid_since_progress <= 2
+    }
+
+    /// A constrained final answer the run sent back (no action was taken, or
+    /// the completion check found work left) shows the constrained format is
+    /// not helping: its only way to write prose is a final answer, and a small
+    /// model uses that to announce the next step instead of taking it.
+    /// Measured in the live code suite: a 4B model whose template has no tool
+    /// support started in this format and answered "I will now add the
+    /// function..." as a final answer eight times without one tool call, while
+    /// the native format worked for it in the run before. Returns whether the
+    /// next step goes back to the native action format (two unreadable native
+    /// replies still return to the constrained one).
+    fn final_sent_back(&mut self, structured: bool) -> bool {
+        if structured && self.structured_fallback {
+            self.structured_fallback = false;
+            true
+        } else {
+            false
+        }
     }
 
     fn begin_continuation(&mut self) -> bool {
@@ -292,7 +338,28 @@ fn parse_structured_reply(text: &str) -> Option<StructuredReply> {
     }
 }
 
-const STRUCTURED_ACTION_INSTRUCTION: &str = "For this response use the enforced JSON envelope, not Markdown or native tool-call notation. Return exactly one object with all four fields: kind, name, args, answer. For an action use kind=tool, the registered tool name, its complete argument object (every required argument, for example path for file tools), and an empty answer string. For a final response use kind=final, an empty name string, an empty args object, and your nonempty final answer string. No extra fields or text. This format changes no task scope, tool permissions, or verification requirements.";
+/// Where a write's text goes, for a write or edit that arrived without it.
+/// Measured live: a 4B model writing `<|tool_call>call:append_file{path:...}<tool_call|>`
+/// sent the call without text three times, then pasted the text as a code
+/// block in a separate reply. In that syntax the call ends the turn, so a
+/// raw block meant to follow it never arrives; the text belongs inside.
+const MISSING_TEXT_HINT: &str = "\nThe text belongs in this same reply: after the arguments in <<<CONTENT ... CONTENT>>> (or <<<OLD ... OLD>>> then <<<NEW ... NEW>>> for edit_file), or, when you write calls as <|tool_call>call:NAME{...}<tool_call|>, inside the call: content:<|\"|>the exact text<|\"|> (old:<|\"|>...<|\"|>,new:<|\"|>...<|\"|> for edit_file). A code block in a separate reply is not written to the file.";
+
+/// Measured live: a 4B model ran `mkdir todo`, then `cd todo`, then wrote
+/// `index.html`, which landed in the workspace root. Its report said
+/// todo/index.html was done.
+const CD_DOES_NOT_PERSIST: &str = "\nNote: cd changes nothing for later steps. Every command starts in the workspace root (or its cwd argument), and every tool path is relative to the workspace root: write todo/index.html, not index.html, to put a file in todo.";
+
+/// `cd somewhere` on its own, which only changes the folder of a command that
+/// then ends.
+fn bare_cd(command: &str) -> bool {
+    let words = simple_command_words(command);
+    matches!(words.first().map(String::as_str), Some("cd" | "chdir" | "set-location" | "pushd")) && words.len() <= 2
+}
+
+const LEFT_STRUCTURED_FORMAT: &str = "The constrained JSON format ended the step with a statement instead of an action; switching to the native action format for the next step.";
+
+const STRUCTURED_ACTION_INSTRUCTION: &str = "For this response use the enforced JSON envelope, not Markdown or native tool-call notation. Return exactly one object with all four fields in this order: kind, name, args, answer. For an action use kind=tool, the registered tool name, its complete argument object (every required argument, for example path for file tools), and an empty answer string. Raw <<<CONTENT, <<<OLD and <<<NEW blocks do not exist in this format: put the file text in args as JSON strings, content for write_file and append_file, old and new for edit_file. For a final response use kind=final, an empty name string, an empty args object, and your nonempty final answer string. No extra fields or text. This format changes no task scope, tool permissions, or verification requirements.";
 
 /// One action found in a model reply: the call, the byte span it occupies,
 /// and the closing marker to append when the model ended its turn before
@@ -306,7 +373,7 @@ struct LocatedAction {
 /// A line that opens a fence: `Some(true)` for the fences a model may wrap an
 /// action in (the documented `tool` label, plus the `json` and bare fences
 /// smaller models substitute freely), `Some(false)` for ordinary code.
-fn fence_opener(line: &str) -> Option<bool> {
+pub(crate) fn fence_opener(line: &str) -> Option<bool> {
     let plain = line.trim_end();
     let indent = plain.bytes().take_while(|byte| *byte == b' ').count();
     if indent > 3 {
@@ -319,7 +386,7 @@ fn fence_opener(line: &str) -> Option<bool> {
     ))
 }
 
-fn known_tool(name: &str) -> bool {
+pub(crate) fn known_tool(name: &str) -> bool {
     crate::tools::registry().iter().any(|tool| tool.name == name)
 }
 
@@ -464,7 +531,21 @@ fn attach_raw_args(call: &mut ToolCall, tail: &str) -> Option<usize> {
             let Some(line) = tail[offset..].split_inclusive('\n').next() else {
                 return None; // no terminator yet
             };
-            if line.trim_end() == terminator {
+            // `<<<CONTENT>>>` closes it too: measured from a 4B model, which
+            // closed two 6 KB pages that way. A line that is exactly the opening
+            // marker with >>> appended cannot be file text by accident.
+            if line.trim_end() == terminator || line.trim() == format!("<<<{terminator}") {
+                break offset;
+            }
+            // A bare `>>>` closing the reply's last block: measured from a 4B
+            // model, which shortened `CONTENT>>>` that way. Only as the final
+            // line (a closing marker may follow), so file text holding a bare
+            // `>>>` line mid-way is never cut there.
+            // Likewise its opening marker repeated as the reply's last line
+            // (`<<<CONTENT` again, measured from the same model on a 6 KB page).
+            if (line.trim() == ">>>" || line.trim() == format!("<<<{name}"))
+                && matches!(tail[offset + line.len()..].trim(), "" | "<tool_call|>" | "```" | "</tool_call>")
+            {
                 break offset;
             }
             offset += line.len();
@@ -488,7 +569,7 @@ fn attach_raw_args(call: &mut ToolCall, tail: &str) -> Option<usize> {
 }
 
 /// The action object plus any raw argument blocks after it.
-fn parse_action_with_raw(body: &str) -> Option<(ToolCall, usize, bool)> {
+pub(crate) fn parse_action_with_raw(body: &str) -> Option<(ToolCall, usize, bool)> {
     let (mut call, consumed, enveloped) = parse_action_object_in(body)?;
     let extra = attach_raw_args(&mut call, &body[consumed..])?;
     Some((call, consumed + extra, enveloped))
@@ -584,8 +665,82 @@ pub fn salvage_action(text: &str) -> Option<ToolCall> {
     Some(call)
 }
 
+/// A saved reply as the model should see it in later history: its prose, with
+/// every action envelope removed (fenced ```tool blocks with any raw argument
+/// blocks inside them, `<tool_call>` tags, the Gemma native envelope), whether
+/// the envelope closed or was cut off.
+///
+/// A chat reply is saved as the text of all its rounds joined, including
+/// rejected and corrected attempts. Replaying that verbatim handed a small
+/// model its own malformed tool call as an example of how it answers, and it
+/// repeated it. The saved message itself is unchanged; this only shapes what
+/// is sent back. Ordinary code blocks stay.
+pub fn without_action_envelopes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut lines = text.split_inclusive('\n').peekable();
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim();
+        if trimmed.eq_ignore_ascii_case("```tool") {
+            // Skip to the closing fence. A raw argument block may itself
+            // contain fence lines (a Markdown file), so it is skipped whole.
+            while let Some(inner) = lines.next() {
+                let inner_trimmed = inner.trim();
+                if let Some(name) = inner_trimmed.strip_prefix("<<<") {
+                    let terminator = format!("{name}>>>");
+                    for raw in lines.by_ref() {
+                        if raw.trim() == terminator {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                if inner_trimmed == "```" || inner_trimmed.ends_with("```") && !inner_trimmed.starts_with("```") {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push_str(line);
+    }
+    let mut out = strip_tagged(&out, "<tool_call>", "</tool_call>");
+    out = strip_tagged(&out, "<|tool_call>", "<tool_call|>");
+    // Removing blocks leaves runs of blank lines behind.
+    let mut collapsed = String::with_capacity(out.len());
+    let mut blank_run = 0;
+    for line in out.split('\n') {
+        if line.trim().is_empty() {
+            blank_run += 1;
+            if blank_run > 1 {
+                continue;
+            }
+        } else {
+            blank_run = 0;
+        }
+        collapsed.push_str(line);
+        collapsed.push('\n');
+    }
+    collapsed.trim().to_string()
+}
+
+fn strip_tagged(text: &str, open: &str, close: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(open) {
+        out.push_str(&rest[..start]);
+        match rest[start..].find(close) {
+            Some(end) => rest = &rest[start + end + close.len()..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn has_action_marker(text: &str) -> bool {
-    text.contains("```") || text.contains("<tool_call>") || text.contains("<|tool_call>")
+    text.contains("```") || text.contains("<tool_call>") || text.contains("<|tool_call>") || text.contains("<tool_call|>")
 }
 
 /// What may follow a complete action object: nothing (the model ended its
@@ -702,34 +857,271 @@ fn locate_tagged_action(text: &str) -> Option<LocatedAction> {
     }
 }
 
-/// Normalize the native text envelope observed from the installed Gemma model.
-/// It must be one entire call, with JSON object arguments and no trailing text.
+const GEMMA_CALL_OPEN: &str = "<|tool_call>";
+const GEMMA_CALL_CLOSE: &str = "<tool_call|>";
+const GEMMA_STRING: &str = "<|\"|>";
+
+/// The tool-call syntax Gemma-family templates train (`<|tool_call>call:NAME{key:value}<tool_call|>`),
+/// read the way llama.cpp's own parser reads it: keys unquoted, strings between
+/// `<|"|>` markers taken verbatim, numbers, booleans, null, objects and arrays
+/// bare. Models trained on it keep writing it whatever the prompt documents.
+/// Measured live with a 4B model of that family, the calls it actually sent:
+/// - a progress note before the call;
+/// - JSON-style `"quoted"` keys and strings mixed with the native form;
+/// - an `args:{...}` wrapper around the arguments;
+/// - no `<tool_call|>` when the turn ended right after the arguments;
+/// - the file text in a `<<<CONTENT` block after the call.
+///
+/// Before this, only a whole reply of the form `call:NAME{args:{JSON}}<tool_call|>`
+/// was read, and six of that model's calls in one change task were rejected as
+/// unreadable. The run stopped with the function it wanted to write in hand.
+///
+/// Still refused as ambiguous: a second call, a call inside a code block, text
+/// after a closed call, an invalid name, arguments that are not an object.
 fn locate_gemma_action(text: &str) -> Option<LocatedAction> {
-    let trimmed = text.trim();
-    let body = trimmed.strip_prefix("<|tool_call>call:")?;
-    let (name, body) = body.split_once("{args:")?;
-    if name.is_empty()
-        || !name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-    {
-        return None;
+    gemma_action(text).ok()
+}
+
+fn gemma_action(text: &str) -> Result<LocatedAction, String> {
+    // Where the call starts, and where its `NAME{` begins.
+    let (start, body_offset) = match text.find(GEMMA_CALL_OPEN) {
+        Some(start) => {
+            let after_open = &text[start + GEMMA_CALL_OPEN.len()..];
+            let lead = after_open.len() - after_open.trim_start().len();
+            if !after_open[lead..].starts_with("call:") {
+                return Err("the marker is not followed by call:NAME{...}".into());
+            }
+            (start, start + GEMMA_CALL_OPEN.len() + lead + "call:".len())
+        }
+        None => opener_less_call(text).ok_or("no <|tool_call> marker")?,
+    };
+    // A call quoted inside a code block is an example, not an action.
+    let fences_before = text[..start]
+        .lines()
+        .filter(|line| line.trim_start().starts_with("```"))
+        .count();
+    if fences_before % 2 == 1 {
+        return Err("the call is inside a code block".into());
     }
-    let body = repair_json_strings(body);
-    let body: &str = &body;
-    let mut values = serde_json::Deserializer::from_str(body).into_iter::<serde_json::Value>();
-    let args = values.next()?.ok()?;
-    if !args.is_object() || body[values.byte_offset()..].trim() != "}<tool_call|>" {
-        return None;
+    let body = &text[body_offset..];
+    let name_len = body
+        .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'))
+        .unwrap_or(body.len());
+    let name = &body[..name_len];
+    if name.is_empty() {
+        return Err("the call has no tool name".into());
     }
-    Some(LocatedAction {
-        call: ToolCall {
-            name: name.to_owned(),
-            args,
-        },
-        span: 0..text.len(),
-        missing_close: None,
+    let args_text = &body[name_len..];
+    if !args_text.starts_with('{') {
+        return Err(format!("the arguments of {name} must follow its name as {{...}}"));
+    }
+    let mut reader = GemmaReader { text: args_text, at: 0 };
+    let mut args = reader.value()?;
+    let args_end = body_offset + name_len + reader.at;
+    // `{args:{...}}` (and the aliases the other envelopes accept) wraps the
+    // arguments once; any other key beside it makes the call ambiguous.
+    if let Some(object) = args.as_object() {
+        if object.len() == 1 {
+            if let Some((_, inner)) = object
+                .iter()
+                .find(|(key, _)| matches!(key.as_str(), "args" | "arguments" | "parameters"))
+            {
+                if !inner.is_object() {
+                    return Err("args must be an object".into());
+                }
+                args = inner.clone();
+            }
+        } else if object.keys().any(|key| key == "args") {
+            return Err("args next to other keys".into());
+        }
+    }
+    if !args.is_object() {
+        return Err("the arguments are not an object".into());
+    }
+    let mut call = ToolCall { name: name.to_owned(), args };
+    // Raw argument blocks may come before or after the closing marker.
+    let mut end = args_end;
+    // One or two stray closing braces right before the marker:
+    // `{args:{path:"todo/index.html"}}}<tool_call|>` (sent verbatim).
+    let stray = text[end..].trim_start();
+    let braces = stray.len() - stray.trim_start_matches('}').len();
+    if (1..=2).contains(&braces) && stray[braces..].trim_start().starts_with(GEMMA_CALL_CLOSE) {
+        end += text[end..].len() - stray.len() + braces;
+    }
+    let mut closed = false;
+    let mut extra = attach_raw_args(&mut call, &text[end..]).ok_or("a <<< block is not terminated yet")?;
+    end += extra;
+    let rest = &text[end..];
+    let spaces = rest.len() - rest.trim_start().len();
+    if rest[spaces..].starts_with(GEMMA_CALL_CLOSE) {
+        end += spaces + GEMMA_CALL_CLOSE.len();
+        closed = true;
+        if extra == 0 {
+            extra = attach_raw_args(&mut call, &text[end..]).ok_or("a <<< block is not terminated yet")?;
+            end += extra;
+        }
+    }
+    let trailing = text[end..].trim();
+    if !trailing.is_empty() {
+        return Err(if has_action_marker(trailing) {
+            "more than one action in one reply".into()
+        } else {
+            "text after the call".into()
+        });
+    }
+    Ok(LocatedAction {
+        call,
+        span: start..end,
+        missing_close: (!closed).then_some(GEMMA_CALL_CLOSE),
     })
+}
+
+/// A call that lost its `<|tool_call>call:` opener but kept its closing
+/// marker: `present_plan{plan:<|"|>...<|"|>}<tool_call|>`, sent verbatim by a 4B
+/// model after two paragraphs of the plan in prose. Accepted only for a
+/// registered tool name standing as its own word, the last one before the
+/// closing marker. Returns (span start, `NAME{` start).
+fn opener_less_call(text: &str) -> Option<(usize, usize)> {
+    let close = text.rfind(GEMMA_CALL_CLOSE)?;
+    let head = &text[..close];
+    crate::tools::registry()
+        .iter()
+        .filter_map(|tool| {
+            let at = head.rfind(&format!("{}{{", tool.name))?;
+            let standalone = !head[..at].ends_with(|ch: char| ch.is_ascii_alphanumeric() || ch == '_');
+            standalone.then(|| match head[..at].strip_suffix("call:") {
+                Some(before) => (before.len(), at),
+                None => (at, at),
+            })
+        })
+        .max_by_key(|(_, name_start)| *name_start)
+}
+
+/// A value in the Gemma call syntax, with the JSON forms models mix into it.
+struct GemmaReader<'a> {
+    text: &'a str,
+    at: usize,
+}
+
+impl GemmaReader<'_> {
+    fn rest(&self) -> &str {
+        &self.text[self.at..]
+    }
+
+    fn skip_space(&mut self) {
+        let rest = self.rest();
+        self.at += rest.len() - rest.trim_start().len();
+    }
+
+    fn eat(&mut self, token: &str) -> bool {
+        if self.rest().starts_with(token) {
+            self.at += token.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn value(&mut self) -> Result<serde_json::Value, String> {
+        self.skip_space();
+        if self.eat(GEMMA_STRING) {
+            let end = self.rest().find(GEMMA_STRING).ok_or("a <|\"|> string is not closed")?;
+            let value = self.rest()[..end].to_owned();
+            self.at += end + GEMMA_STRING.len();
+            return Ok(value.into());
+        }
+        if self.rest().starts_with('"') {
+            return self.json_string().map(Into::into);
+        }
+        if self.eat("{") {
+            let mut object = serde_json::Map::new();
+            loop {
+                self.skip_space();
+                if self.eat("}") {
+                    return Ok(object.into());
+                }
+                let key = if self.rest().starts_with('"') {
+                    self.json_string()?
+                } else {
+                    let len = self
+                        .rest()
+                        .find([':', '}', ','])
+                        .ok_or("an object is not closed")?;
+                    // `path":"."` was sent once: a stray quote is not part of the name.
+                    let key = self.rest()[..len].trim().trim_matches(['"', '\'']).to_owned();
+                    self.at += len;
+                    key
+                };
+                self.skip_space();
+                if key.is_empty() || !self.eat(":") {
+                    return Err("an object key is not followed by a value".into());
+                }
+                let value = self.value()?;
+                object.insert(key, value);
+                self.skip_space();
+                if !self.eat(",") {
+                    self.skip_space();
+                    if !self.eat("}") {
+                        return Err("an object is not closed".into());
+                    }
+                    return Ok(object.into());
+                }
+            }
+        }
+        if self.eat("[") {
+            let mut items = Vec::new();
+            loop {
+                self.skip_space();
+                if self.eat("]") {
+                    return Ok(items.into());
+                }
+                items.push(self.value()?);
+                self.skip_space();
+                if !self.eat(",") {
+                    self.skip_space();
+                    if !self.eat("]") {
+                        return Err("an array is not closed".into());
+                    }
+                    return Ok(items.into());
+                }
+            }
+        }
+        // A bare scalar: a number, true, false or null.
+        let len = self
+            .rest()
+            .find(|ch: char| matches!(ch, ',' | '}' | ']') || ch.is_whitespace())
+            .unwrap_or(self.rest().len());
+        let token = &self.rest()[..len];
+        let value = match token {
+            "true" => serde_json::Value::Bool(true),
+            "false" => serde_json::Value::Bool(false),
+            "null" => serde_json::Value::Null,
+            _ => serde_json::from_str::<serde_json::Number>(token)
+                .map(serde_json::Value::Number)
+                .map_err(|_| format!("unreadable value {token:?}"))?,
+        };
+        self.at += len;
+        Ok(value)
+    }
+
+    /// A JSON string, allowing the raw newlines small models leave inside.
+    fn json_string(&mut self) -> Result<String, String> {
+        let body = &self.rest()[1..];
+        let mut escaped = false;
+        for (index, ch) in body.char_indices() {
+            match ch {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => {
+                    let value = lenient_unescape(&body[..index]);
+                    self.at += 1 + index + 1;
+                    return Ok(value);
+                }
+                _ => {}
+            }
+        }
+        Err("a quoted string is not closed".into())
+    }
 }
 
 /// One action in any of the shapes a local model produces: a structured
@@ -752,7 +1144,7 @@ fn locate_action(text: &str) -> Option<LocatedAction> {
             missing_close: None,
         });
     }
-    if trimmed.starts_with("<|tool_call>") {
+    if text.contains(GEMMA_CALL_OPEN) || text.contains(GEMMA_CALL_CLOSE) {
         return locate_gemma_action(text);
     }
     if text.contains("<tool_call>") {
@@ -775,10 +1167,33 @@ fn parse_action_response(text: &str) -> Option<ToolCall> {
 /// it. Checked per token, so it must stay cheap on text without an action.
 pub fn action_complete(text: &str) -> bool {
     let trimmed = text.trim_start();
-    if trimmed.starts_with("<|tool_call>") {
-        return text.trim_end().ends_with("<tool_call|>") && locate_gemma_action(text).is_some();
+    if text.contains(GEMMA_CALL_OPEN) || text.contains(GEMMA_CALL_CLOSE) {
+        // A call without its closing marker is complete only when the turn
+        // ends, which the stream reports by itself; stopping earlier could cut
+        // a raw block that is still to come.
+        return locate_gemma_action(text)
+            .is_some_and(|located| located.missing_close.is_none() && !awaits_raw_text(&located.call));
     }
-    (trimmed.starts_with('{') || has_action_marker(text)) && locate_action(text).is_some()
+    if !(trimmed.starts_with('{') || has_action_marker(text)) {
+        return false;
+    }
+    // A write's text follows its object in raw blocks (rule 2b), so an object
+    // that is complete but still lacks what those blocks carry is not a
+    // finished action. Stopping there cut the file text off before its first
+    // line: measured live, a 4B model's write_file arrived as {"path"} alone
+    // three times and the run failed. A model that never sends the text still
+    // ends its reply, and the missing argument is corrected as before.
+    locate_action(text).is_some_and(|located| !awaits_raw_text(&located.call))
+}
+
+/// A write, append or edit whose text is still to come in raw blocks.
+fn awaits_raw_text(call: &ToolCall) -> bool {
+    let has = |key: &str| call.args.get(key).is_some();
+    match call.name.as_str() {
+        "write_file" | "append_file" => !has("content"),
+        "edit_file" => !has("patch") && !(has("old") && has("new")),
+        _ => false,
+    }
 }
 
 /// Why an attempted action could not be read, in the JSON parser's words,
@@ -788,6 +1203,9 @@ pub fn action_complete(text: &str) -> bool {
 pub fn action_problem(text: &str) -> Option<String> {
     if !looks_like_action_attempt(text) || locate_action(text).is_some() {
         return None;
+    }
+    if text.contains(GEMMA_CALL_OPEN) || text.contains(GEMMA_CALL_CLOSE) {
+        return gemma_action(text).err();
     }
     let mut offset = 0;
     let mut body_start = None;
@@ -822,7 +1240,7 @@ pub fn action_problem(text: &str) -> Option<String> {
 /// Did the model try to produce an action, even if none could be read? Such
 /// a reply is retried as unreadable rather than reviewed as a final answer.
 pub fn looks_like_action_attempt(text: &str) -> bool {
-    if text.contains("```tool") || text.contains("<tool_call>") || text.contains("<|tool_call>") {
+    if text.contains("```tool") || text.contains("<tool_call>") || text.contains("<|tool_call>") || text.contains("<tool_call|>") {
         return true;
     }
     let mut offset = 0;
@@ -1110,7 +1528,9 @@ async fn compact_run_transcript(
     let note = if max_tokens >= 96 {
         match client.chat_turns_without_reasoning(&request, max_tokens, cfg).await {
             // A small model may still emit an action: keep only its prose.
-            Ok((text, _)) => Some(visible_progress(&text)).filter(|note| !note.trim().is_empty()),
+            Ok((text, metrics)) => {
+                complete_note(&visible_progress(&text), metrics.finish_reason.as_deref())
+            }
             Err(error) => {
                 tracing::warn!("compaction note request failed: {error}; using the host record only");
                 None
@@ -1176,18 +1596,36 @@ async fn compact_run_transcript(
 /// oldest exchanges after it. The system prompt, the task and the latest
 /// exchange are never touched. Returns the number of turns condensed or removed.
 /// With automatic compaction on this is only the safety net behind it.
-fn prune_transcript(
-    transcript: &mut Vec<ChatTurn>,
-    task_turn_index: &mut usize,
-    n_ctx: u32,
-    output_reserve: u32,
-) -> u32 {
-    let budget = n_ctx.saturating_sub(output_reserve).saturating_sub(512);
+/// The compaction note as it may be kept. A note the model was still writing
+/// when it hit its token cap ends mid-sentence; its last line is dropped, and
+/// when fewer than two complete lines remain the note is not used at all (the
+/// host's record of completed actions still is).
+fn complete_note(text: &str, finish_reason: Option<&str>) -> Option<String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if finish_reason != Some("length") {
+        return Some(text.to_string());
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let complete: Vec<&str> = lines[..lines.len().saturating_sub(1)]
+        .iter()
+        .copied()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    (complete.len() >= 2).then(|| complete.join("\n"))
+}
+
+/// Release the bodies of older tool results (never the latest exchange) until
+/// the transcript is estimated at or under `budget` tokens. The full outputs
+/// stay in the activity journal. Returns how many results were released.
+fn release_tool_results(transcript: &mut [ChatTurn], task_turn_index: usize, n_ctx: u32, budget: u32) -> u32 {
     let estimate = |turns: &[ChatTurn]| {
         crate::agent::AgentContextUsage::for_turns(turns, n_ctx, 0, 0).estimated_tokens
     };
-    let mut pruned = 0;
-    let mut index = *task_turn_index + 1;
+    let mut released = 0;
+    let mut index = task_turn_index + 1;
     while estimate(transcript) > budget && index + 2 < transcript.len() {
         let turn = &mut transcript[index];
         if turn.role == "user"
@@ -1205,10 +1643,24 @@ fn prune_transcript(
             turn.content = format!(
                 "{head}\n{RELEASED_MARKER} {chars} characters were released from working context to stay within the model's window. The full output is in the activity journal; run the tool again if you need it.]"
             );
-            pruned += 1;
+            released += 1;
         }
         index += 1;
     }
+    released
+}
+
+fn prune_transcript(
+    transcript: &mut Vec<ChatTurn>,
+    task_turn_index: &mut usize,
+    n_ctx: u32,
+    output_reserve: u32,
+) -> u32 {
+    let budget = n_ctx.saturating_sub(output_reserve).saturating_sub(512);
+    let estimate = |turns: &[ChatTurn]| {
+        crate::agent::AgentContextUsage::for_turns(turns, n_ctx, 0, 0).estimated_tokens
+    };
+    let mut pruned = release_tool_results(transcript, *task_turn_index, n_ctx, budget);
     while estimate(transcript) > budget && *task_turn_index > 1 {
         transcript.remove(1);
         *task_turn_index -= 1;
@@ -1313,6 +1765,7 @@ pub fn system_prompt_for(
         tool_docs.push_str(&format!("- {} ({:?}): {}\n", t.name, t.risk, t.description));
         let args = match t.name {
             "list_directory" => r#"{"path":"."}"#,
+            "present_plan" => r#"{"plan":"the plan in Markdown: which files change and the steps in order"} (plan runs only; ends the run)"#,
             "read_file" => r#"{"path":"relative/path","start_line":1,"end_line":200}"#,
             "delete_file" | "open_path" => r#"{"path":"relative/path"}"#,
             "write_file" => r#"{"path":"relative/file"} (the file text follows in a <<<CONTENT block, rule 2b)"#,
@@ -1360,7 +1813,8 @@ pub fn system_prompt_for(
          const pattern = /\\d+/;\n\
          CONTENT>>>\n\
          ```\n\
-         Between the markers the text is written exactly as it stands, so quotes, backslashes and backticks need no escaping: this is the reliable way to write code. edit_file takes <<<OLD ... OLD>>> then <<<NEW ... NEW>>>. Each marker stands alone on its line.\n\
+         Text between the markers needs no escaping of any kind. edit_file takes <<<OLD ... OLD>>> then <<<NEW ... NEW>>>. Each marker stands alone on its line.\n\
+         A <|tool_call> call ends your turn, so it carries its text inside: content:<|\"|>text<|\"|> (edit_file: old:<|\"|>...<|\"|>,new:<|\"|>...<|\"|>).\n\
          2c. One response holds about {reply_chars} characters. Write a longer file in parts: write_file for the first, append_file for each next. Never shorten or simplify the work to fit, or leave a file half-written.\n\
          3. Prefer search_text before reading; read before editing; make small targeted changes with edit_file and use write_file for new files.\n\
          4. For requested implementation work, run relevant builds/tests with execute_command and iterate on failures. Do not claim that reading a file is a passing test.\n\
@@ -1502,7 +1956,42 @@ pub struct LiveRun {
     pub handle: Mutex<Option<JoinHandle<AgentState>>>,
 }
 
+/// The push a question gets when it was answered before anything was read.
+/// No "if it needs no files, answer again" way out: measured live, an 8B took it
+/// and repeated an invented description of a file it had not opened.
+const READ_BEFORE_ANSWERING: &str = "Nothing in the project has been read yet in this run, so that answer is not based on the project. Read the files this question concerns with the read-only tools (list_directory, read_file, search_text), one tool call at a time, then answer from what they contain. Change nothing for a question.";
+
+/// The event a plan run ends with when it presents a plan.
+pub fn presents_plan(event: &AgentEvent) -> bool {
+    event.kind == "final" && event.tool.as_deref() == Some("present_plan")
+}
+
+/// A question asking for information ("why does the CSV parser skip the
+/// header?", "what does orders.py export?"), read from its wording. A polite
+/// request for work ("can you create a page?") is not one.
+pub(crate) fn asks_for_information(text: &str) -> bool {
+    let lowered = text.trim().to_lowercase();
+    let first = lowered
+        .split(|c: char| !(c.is_alphanumeric() || c == '\''))
+        .find(|word| !word.is_empty())
+        .unwrap_or("");
+    const POLITE_REQUESTS: [&str; 5] = ["can", "could", "would", "will", "please"];
+    const INFORMATION: [&str; 21] = [
+        "what", "what's", "whats", "why", "how", "which", "where", "when", "who", "whose", "is", "are", "was",
+        "were", "does", "do", "did", "explain", "describe", "summarize", "summarise",
+    ];
+    if POLITE_REQUESTS.contains(&first) {
+        return false;
+    }
+    INFORMATION.contains(&first) || lowered.ends_with('?')
+}
+
 impl LiveRun {
+    /// The run ended by presenting a plan to approve.
+    pub fn plan_presented(&self) -> bool {
+        self.events.lock().expect("lock").last().is_some_and(presents_plan)
+    }
+
     pub fn emit(&self, ev: AgentEvent) {
         let _ = self.activity_tx.send(ev.clone());
         self.events.lock().expect("lock").push(ev.clone());
@@ -1534,6 +2023,10 @@ pub struct RunSummary {
     pub state: AgentState,
     pub iterations: u32,
     pub conversation_id: String,
+    /// plan runs end with a plan the user approves before any change.
+    pub mode: AgentMode,
+    /// The run ended with present_plan: there is a plan to approve.
+    pub plan_ready: bool,
 }
 
 #[derive(Default)]
@@ -1574,6 +2067,8 @@ impl AgentRegistry {
                     state: evs.last().map(|e| e.state).unwrap_or(AgentState::Idle),
                     iterations: evs.last().map(|e| e.iteration).unwrap_or(0),
                     conversation_id: r.spec.conversation_id.clone(),
+                    mode: r.spec.mode,
+                    plan_ready: evs.last().is_some_and(presents_plan),
                 }
             })
             .collect()
@@ -1633,7 +2128,12 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
         return S::Failed;
     };
     let client = match SidecarClient::new(base_url) {
-        Ok(c) => c,
+        Ok(c) => c.with_recorder(crate::api::request_recorder(
+            &state,
+            &run.spec.conversation_id,
+            &run.id,
+            "agent",
+        )),
         Err(e) => {
             run.emit(AgentEvent::new(
                 S::Failed,
@@ -1665,24 +2165,31 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
         ));
     }
     let objective = match spec.mode {
-        AgentMode::Plan => format!("Inspect the project using read-only tools and produce a practical implementation plan for this request. Do not implement changes or run commands. Request: {}", spec.task),
+        AgentMode::Plan => format!("Inspect the project using read-only tools. If this request is a question, read the files it concerns and answer from them. If it asks for a change, work out a practical implementation plan and finish by calling present_plan with it; the user approves the plan before anything changes. Do not implement changes or run commands. Request: {}", spec.task),
         AgentMode::CodeAssist => format!("Inspect the project using read-only tools and answer this exact request from evidence in the project. This is an inspection, not a request for an implementation plan. Resolve follow-up references from the preceding conversation and do not inspect unrelated sibling projects. Request: {}", spec.task),
         _ => spec.task.clone(),
     };
-    let documents_enabled = crate::documents::requested_document_kind(&spec.task).is_some();
+    let documents_enabled = crate::documents::requested_document_kind(&spec.task).is_some() && !asks_for_information(&spec.task);
     let opening_enabled = opening_requested(&spec.task);
+    // present_plan belongs to plan runs only.
+    let tools: Vec<_> = crate::tools::registry()
+        .into_iter()
+        .filter(|tool| tool.name != "present_plan" || spec.mode == AgentMode::Plan)
+        .collect();
     let mut prompt = system_prompt_for(
         &ws_key,
-        &crate::tools::registry(),
+        &tools,
         spec.search_enabled,
         documents_enabled,
         opening_enabled,
         reply_char_budget(cfg.n_ctx, ActionResponsePolicy::default().output_cap()),
     );
     if matches!(spec.mode, AgentMode::Plan | AgentMode::CodeAssist) {
-        prompt.push_str("\nThis run is READ ONLY. Only safe inspection tools are permitted. Do not write, edit, delete, create documents, execute commands or change Git state. Finish with findings or a plan, not implementation.");
+        prompt.push_str("\nThis run is READ ONLY. Only safe inspection tools are permitted. Do not write, edit, delete, create documents, execute commands or change Git state. Finish with findings, an answer, or (plan runs) the plan through present_plan, not implementation.");
     }
     let mut transcript = vec![ChatTurn::text("system", prompt)];
+    let mut task_images: Vec<String> = Vec::new();
+    let mut task_message: Option<crate::storage::Message> = None;
     // Each run starts fresh inference, not fresh product memory. Carry the
     // session's derived context and attachment excerpts into follow-up tasks.
     if !spec.conversation_id.is_empty() {
@@ -1705,26 +2212,46 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
             .map(|message| message.role == "user" && message.content.trim() == spec.task.trim())
             .unwrap_or(false)
         {
-            history.pop();
+            task_message = history.pop();
         }
         let attachments = st
             .attachments_for(&spec.conversation_id)
             .unwrap_or_default();
         let budget = crate::api::history_char_budget(cfg.n_ctx, transcript[0].content.len());
-        transcript.extend(crate::api::build_turns_budgeted(
-            &history,
-            &attachments,
-            budget,
-        ));
+        let (turns, owners) = crate::api::build_turns_with_owners(&history, &attachments, budget);
+        let offset = transcript.len();
+        transcript.extend(turns);
+        // Images reach the model on the message they were sent with, as in
+        // chat: one sent with this task goes on the task turn below. Code
+        // session questions used to go through chat, which attached them.
+        if cfg.projector_path.is_some() {
+            let (images, _) =
+                crate::api::prepare_conversation_images(&state.attachments_dir, &spec.conversation_id, &attachments);
+            let mut sent_with = history.clone();
+            sent_with.extend(task_message.clone());
+            for (attachment, url) in images {
+                match crate::api::attachment_owner(&sent_with, attachment) {
+                    Some(owner) if task_message.as_ref().is_some_and(|message| message.id == owner) => task_images.push(url),
+                    // Its message has left the window: so has the image.
+                    Some(owner) => {
+                        if let Some(index) = owners.iter().position(|id| id == owner) {
+                            transcript[offset + index].images.push(url);
+                        }
+                    }
+                    None => task_images.push(url),
+                }
+            }
+        }
     }
     transcript.push(ChatTurn::text(
             "user",
             format!(
-                "Task: {}\n\nAddress this request within its scope. Use the complete tool envelope shown in the system instructions if an action is necessary; otherwise answer directly. Do not invent a new task or mutate files for a question.",
+                "Task: {}\n\nAddress this request within its scope. Use the complete tool envelope shown in the system instructions for each action. Answer a question about the project from the files it concerns, read first. Do not invent a new task or mutate files for a question.",
                 objective
             ),
         ));
     let mut task_turn_index = transcript.len() - 1;
+    transcript[task_turn_index].images = task_images;
     let original_task = transcript[task_turn_index].content.clone();
     let compaction = CompactionPolicy::from_settings(&state.settings.read().await.memory);
     let compaction_pct = if compaction.enabled { compaction.threshold_pct } else { 0 };
@@ -1739,6 +2266,11 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
     let mut last_file: Option<String> = None;
     let mut response_policy = ActionResponsePolicy {
         disable_native_thinking: !spec.reasoning,
+        // A template the runtime says has no tool support gets the schema-
+        // constrained action format from the first step, not after failures.
+        structured_fallback: cfg
+            .template_caps
+            .is_some_and(|caps| caps.tools_supported() == crate::inference::Support::No),
         ..ActionResponsePolicy::default()
     };
     let mut pending_continuation: Option<String> = None;
@@ -1748,10 +2280,18 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
     let mut repeated_despite_changes = 0u32;
     let mut actions_since_review = 0u32;
     let mut no_action_pushback_used = false;
+    // A plan run's written plan that was not presented yet (see present_plan).
+    let mut plan_draft: Option<String> = None;
     let mut verification = VerificationState::for_task(&spec.task);
     let mut failed_calls = FailedCalls::default();
     let mut pruned_turns = 0u32;
     let mut tool_evidence: Vec<String> = Vec::new();
+    // Model-server failures: a context overflow forces compaction and widens
+    // the pruning reserve by what the server said did not fit; the estimate
+    // that let it happen is evidently low for this content.
+    let mut force_compaction = false;
+    let mut overflow_recoveries = 0u32;
+    let mut overflow_reserve = 0u32;
 
     for it in 1..=limits.max_iterations {
         if run.cancel.is_cancelled() {
@@ -1762,16 +2302,42 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
             ));
             return S::Cancelled;
         }
-        let reserve = pruning_reserve(cfg.n_ctx, response_policy.output_cap());
+        let reserve = pruning_reserve(cfg.n_ctx, response_policy.output_cap())
+            .saturating_add(overflow_reserve)
+            .min(cfg.n_ctx / 2);
         let room = history_room(cfg.n_ctx, reserve);
         // Automatic compaction happens here and only here: between steps,
         // once the previous action and its result are recorded, with no model
         // reply, tool, approval or completion check in flight. A partial
         // reply awaiting its continuation is a step still in progress.
         if pending_continuation.is_none() {
-            if let Some(pct) =
-                compaction.due(&transcript, task_turn_index, room, tokens_after_last_compaction)
-            {
+            // Releasing old tool-result bodies is free; a compaction note costs
+            // a model call. Release first, then decide whether a note is still
+            // needed.
+            if compaction.enabled && compaction.due(&transcript, task_turn_index, room, tokens_after_last_compaction).is_some() {
+                let target = room / 100 * compaction.threshold_pct.saturating_sub(10).max(1);
+                let released = release_tool_results(&mut transcript, task_turn_index, cfg.n_ctx, target);
+                if released > 0 {
+                    pruned_turns += released;
+                    run.emit(AgentEvent::activity(
+                        "status",
+                        S::Planning,
+                        format!("Released {released} older tool result(s) from working context before considering compaction; their full output stays in the activity journal."),
+                        it,
+                    ));
+                }
+            }
+            // A context overflow compacts at once when compaction is enabled;
+            // with it disabled only the wider pruning reserve applies.
+            let forced = std::mem::take(&mut force_compaction) && compaction.enabled;
+            let due = compaction
+                .due(&transcript, task_turn_index, room, tokens_after_last_compaction)
+                .or_else(|| {
+                    forced.then(|| {
+                        (u64::from(estimated_tokens(&transcript)) * 100 / u64::from(room.max(1))) as u32
+                    })
+                });
+            if let Some(pct) = due {
                 run.emit(AgentEvent::activity(
                     "status",
                     S::Compacting,
@@ -1909,32 +2475,66 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
         // A suffix continuation cannot be parsed on its own, and a schema-
         // constrained reply ends itself, so neither stops early.
         let stop_on_action = pending_continuation.is_none() && !use_structured;
-        let live_run = run.clone();
-        let live_cancel = run.cancel.clone();
-        let handlers = StreamHandlers {
-            on_token: Box::new(move |delta| {
-                live_run.emit_live(AgentEvent::activity(
-                    "thought_delta",
-                    S::Planning,
-                    delta.to_string(),
-                    it,
-                ));
-            }),
-            is_cancelled: Box::new(move || live_cancel.is_cancelled()),
-            should_stop: Box::new(move |text| stop_on_action && action_complete(text)),
-            ..StreamHandlers::default()
+        let make_handlers = || {
+            let live_run = run.clone();
+            let live_cancel = run.cancel.clone();
+            // Live text shows the model's prose only; the action itself is
+            // reported by the tool events once it is parsed and run.
+            let mut splitter = crate::stream_split::StreamSplitter::new();
+            StreamHandlers {
+                on_token: Box::new(move |delta| {
+                    for piece in splitter.push(delta) {
+                        if let crate::stream_split::Piece::Prose(text) = piece {
+                            live_run.emit_live(AgentEvent::activity("thought_delta", S::Planning, text, it));
+                        }
+                    }
+                }),
+                is_cancelled: Box::new(move || live_cancel.is_cancelled()),
+                should_stop: Box::new(move |text| stop_on_action && action_complete(text)),
+                ..StreamHandlers::default()
+            }
         };
-        let mut completion = match client
-            .agent_chat_turns_stream(
-                &request_turns,
-                output_budget,
-                &cfg,
-                response_policy.disable_native_thinking,
-                use_structured,
-                handlers,
-            )
-            .await
-        {
+        // A transient server failure (restarting, reset connection, stream cut
+        // off) repeats the same request after a short wait, in place: the
+        // transcript is untouched and the progress guard is not charged.
+        let mut transient_retries = 0u32;
+        let model_call = loop {
+            let result = client
+                .agent_chat_turns_stream(
+                    &request_turns,
+                    output_budget,
+                    &cfg,
+                    response_policy.disable_native_thinking,
+                    use_structured,
+                    make_handlers(),
+                )
+                .await;
+            let Err(error) = &result else { break result };
+            let Some(failure) = error.sidecar().filter(|failure| failure.is_transient()) else {
+                break result;
+            };
+            if transient_retries >= TRANSIENT_MODEL_RETRIES
+                || run.cancel.is_cancelled()
+                || !state.llama.write().await.is_running()
+            {
+                break result;
+            }
+            transient_retries += 1;
+            let wait = std::time::Duration::from_secs(1u64 << (transient_retries - 1));
+            run.emit(AgentEvent::activity(
+                "status",
+                S::Planning,
+                format!(
+                    "The model request did not complete ({failure}). Retrying the same request in {} s ({transient_retries} of {TRANSIENT_MODEL_RETRIES}); nothing was added to the conversation.",
+                    wait.as_secs()
+                ),
+                it,
+            ));
+            if !sleep_unless_cancelled(&run.cancel, wait).await {
+                break result;
+            }
+        };
+        let mut completion = match model_call {
             Ok(completion) => {
                 run.emit(AgentEvent::context(
                     S::Planning,
@@ -1947,20 +2547,51 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
                 completion
             }
             Err(e) => {
-                run.emit(AgentEvent::activity(
-                    "status",
-                    S::Planning,
-                    format!(
-                        "The model request failed: {e}. Attempt {} of 4 without progress.",
-                        progress_guard.attempts_without_progress()
-                    ),
-                    it,
-                ));
-                transcript.push(ChatTurn::text(
-                    "user",
-                    format!("The model call failed ({e}). Adjust and continue, or finish with a summary."),
-                ));
-                continue;
+                if run.cancel.is_cancelled() {
+                    run.emit(AgentEvent::new(S::Cancelled, "Cancelled by user.".into(), it));
+                    return S::Cancelled;
+                }
+                // Model-server failures never enter the transcript: the model
+                // cannot act on them, and an overflow notice would make the
+                // next request larger still.
+                if let Some(crate::inference::thiserror_stub::SidecarFailure::ContextExceeded {
+                    prompt_tokens,
+                    context,
+                }) = e.sidecar().cloned()
+                {
+                    if overflow_recoveries < MAX_OVERFLOW_RECOVERIES {
+                        overflow_recoveries += 1;
+                        overflow_reserve = overflow_reserve
+                            .saturating_add(prompt_tokens.saturating_sub(context))
+                            .saturating_add(256);
+                        force_compaction = true;
+                        progress_guard.refund_attempt();
+                        run.emit(AgentEvent::activity(
+                            "status",
+                            S::Planning,
+                            format!(
+                                "{}. Releasing older tool output{} and trying again ({overflow_recoveries} of {MAX_OVERFLOW_RECOVERIES}).",
+                                capitalized(&e.sidecar().map(|f| f.to_string()).unwrap_or_default()),
+                                if compaction.enabled { ", compacting earlier steps," } else { "" }
+                            ),
+                            it,
+                        ));
+                        continue;
+                    }
+                    let message = format!(
+                        "Stopped: {} even after releasing older context. Existing files and completed actions were kept. Use a larger context size or a smaller task.",
+                        e.sidecar().map(|f| f.to_string()).unwrap_or_default()
+                    );
+                    persist_final(&state, &run, &message).await;
+                    run.emit(AgentEvent::activity("error", S::Failed, message, it));
+                    return S::Failed;
+                }
+                let message = format!(
+                    "Stopped: the model request failed ({e}). Existing files and completed actions were kept; retry when the model is ready."
+                );
+                persist_final(&state, &run, &message).await;
+                run.emit(AgentEvent::activity("error", S::Failed, message, it));
+                return S::Failed;
             }
         };
         let continuation_failed = if let Some(prefix) = pending_continuation.take() {
@@ -2102,6 +2733,56 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
             // A second model critic cannot verify an implementation here and
             // can trap small local models in repeated format-correction loops.
             if matches!(spec.mode, AgentMode::Plan | AgentMode::CodeAssist) {
+                // A plan written before anything was read is a guess. Measured
+                // live in Plan mode: an 8B model replied "Let me first locate
+                // orders.py to begin the implementation plan" and the run
+                // ended on that sentence. Once per plan run, send it to inspect
+                // the project first; a second tool-free reply is the plan.
+                // A question gets the same push towards reading, towards an
+                // answer instead of a plan: measured live, an 8B asked "What
+                // does orders.py compute, and what is the tax rate?" in Plan
+                // mode answered without opening the file and invented both.
+                if spec.mode == AgentMode::Plan && tool_evidence.is_empty() && !no_action_pushback_used {
+                    no_action_pushback_used = true;
+                    run.emit(AgentEvent::activity(
+                        "status",
+                        S::Planning,
+                        "Nothing in the project has been read yet. Asking the model to inspect it first…".into(),
+                        it,
+                    ));
+                if response_policy.final_sent_back(use_structured) {
+                    run.emit(AgentEvent::activity("status", S::Planning, LEFT_STRUCTURED_FORMAT.into(), it));
+                }
+                    transcript.push(ChatTurn::text(
+                        "user",
+                        if asks_for_information(&spec.task) {
+                            READ_BEFORE_ANSWERING
+                        } else {
+                            "Nothing in the project has been read yet in this plan run. Use the read-only tools (list_directory, read_file, search_text) to inspect the files this request involves, one tool call at a time. Then call present_plan with the plan: which files change, and the concrete steps in order. Do not change anything."
+                        },
+                    ));
+                    continue;
+                }
+                // A plan is approved through present_plan. A model that writes
+                // the plan as its final reply is asked once to present it; it
+                // can do that without writing the plan again.
+                if spec.mode == AgentMode::Plan && plan_draft.is_none() && !asks_for_information(&spec.task) {
+                    plan_draft = Some(reply.trim().to_string());
+                if response_policy.final_sent_back(use_structured) {
+                    run.emit(AgentEvent::activity("status", S::Planning, LEFT_STRUCTURED_FORMAT.into(), it));
+                }
+                    run.emit(AgentEvent::activity(
+                        "status",
+                        S::Planning,
+                        "Asking the model to present the plan for approval…".into(),
+                        it,
+                    ));
+                    transcript.push(ChatTurn::text(
+                        "user",
+                        "If that reply is the plan, present it for approval now: call present_plan. Leave args.plan empty to present the plan you just wrote. If the request only asked for information, give that answer again as your final reply.",
+                    ));
+                    continue;
+                }
                 persist_final(&state, &run, &reply).await;
                 run.emit(AgentEvent::activity("final", S::Completed, reply, it));
                 return S::Completed;
@@ -2112,17 +2793,37 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
             // accepted that as an honest explanation. Once per run, say what
             // it can do and send it back to work; a second tool-free answer
             // goes to the normal check.
+            // Every code-session message reaches the agent now (Claude
+            // Code-style routing), so a question answered directly is done:
+            // no push towards tools for it (review finding: the push made
+            // small models edit files in answer to a question).
             if tool_evidence.is_empty() && !no_action_pushback_used {
                 no_action_pushback_used = true;
+                if response_policy.final_sent_back(use_structured) {
+                    run.emit(AgentEvent::activity("status", S::Planning, LEFT_STRUCTURED_FORMAT.into(), it));
+                }
+                // A question is sent to read, never to start work (review
+                // finding: the work push made small models edit files in
+                // answer to a question).
+                let question = asks_for_information(&spec.task);
                 run.emit(AgentEvent::activity(
                     "status",
                     S::Planning,
-                    "No action has been taken yet for this change request. Reminding the model which tools it has and continuing…".into(),
+                    if question {
+                        "Nothing in the project has been read yet. Asking the model to check the files before answering…"
+                    } else {
+                        "No action has been taken yet for this change request. Reminding the model which tools it has and continuing…"
+                    }
+                    .into(),
                     it,
                 ));
                 transcript.push(ChatTurn::text(
                     "user",
-                    "No action has been taken in this run, and this request asks for work in the workspace. You can create folders and files with write_file (a new path creates its folders), change files with edit_file, and run commands with execute_command. Start the work now with one tool call. Only if something specific truly blocks it, name that blocker instead.",
+                    if question {
+                        READ_BEFORE_ANSWERING
+                    } else {
+                        "No action has been taken in this run. If this request asks for work in the workspace, start it now with one tool call: write_file creates folders and files (a new path creates its folders), edit_file changes files, execute_command runs commands. Only if something specific truly blocks it, name that blocker. If the request is only a question, give the answer and change nothing."
+                    },
                 ));
                 continue;
             }
@@ -2130,6 +2831,18 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
             // especially smaller local ones, often summarize after producing a
             // subset of the requested files. Check their claim against the
             // original task and the actual tool evidence before ending the run.
+            //
+            // A question is answered, not implemented, so it skips that check,
+            // as read-only runs do: checking an answer against a "request" makes
+            // the checker invent work. Measured in the live code suite after
+            // every code-session message went to the agent: the 4B answered
+            // "order_total" correctly, the check asked for the tests to be run,
+            // and the run failed on command paths it never needed.
+            if asks_for_information(&spec.task) && !verification.needs_evidence() {
+                persist_final(&state, &run, &reply).await;
+                run.emit(AgentEvent::activity("final", S::Completed, reply, it));
+                return S::Completed;
+            }
             run.emit(AgentEvent::activity(
                 "status",
                 S::Observing,
@@ -2193,6 +2906,9 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
                         format!("Found remaining work. Continuing: {reason}"),
                         it,
                     ));
+                    if response_policy.final_sent_back(use_structured) {
+                        run.emit(AgentEvent::activity("status", S::Planning, LEFT_STRUCTURED_FORMAT.into(), it));
+                    }
                     transcript.push(ChatTurn::text(
                         "user",
                         format!(
@@ -2240,6 +2956,31 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
             }
         };
         let progress = visible_progress(&reply);
+        // A plan run's finish (Claude Code's ExitPlanMode): the plan the user
+        // approves before anything changes. A plan run that answers a question
+        // ends with a plain reply instead, so no approval is offered for it.
+        // Small models often write the plan as prose and then call the tool
+        // with a short or empty argument: the prose is the plan then.
+        if call.name == "present_plan" && spec.mode == AgentMode::Plan {
+            let argument = arg_str(&call, "plan").unwrap_or("").trim().to_string();
+            let mut plan = if argument.chars().count() >= progress.trim().chars().count() { argument } else { progress.trim().to_string() };
+            if plan.chars().count() < 80 {
+                if let Some(draft) = plan_draft.as_ref().filter(|draft| draft.len() > plan.len()) {
+                    plan = draft.clone();
+                }
+            }
+            if plan.is_empty() {
+                transcript.push(ChatTurn::text(
+                    "user",
+                    "present_plan needs the plan itself in args.plan: which files change and the steps in order.",
+                ));
+                run.emit(AgentEvent::new(S::Observing, "The plan arrived empty; asked for it again.".into(), it));
+                continue;
+            }
+            persist_final(&state, &run, &plan).await;
+            run.emit(AgentEvent::tool_activity("final", S::Completed, plan, it, call.name.clone(), call.args.clone(), None, None));
+            return S::Completed;
+        }
         if !progress.is_empty() {
             run.emit(AgentEvent::activity("thought", S::Planning, progress, it));
         }
@@ -2263,6 +3004,7 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
             continue;
         }
         let unavailable = match call.name.as_str() {
+            "present_plan" => Some("present_plan only ends a plan run. Continue the task, or answer directly."),
             "create_document" if !documents_enabled => Some("create_document is not available for this task. It saves a standalone document (report, spreadsheet, slides) to the chat's Artifacts panel, outside the project. Create project files, including any text the page should show, with write_file."),
             "open_path" if !opening_enabled => Some("open_path is not available for this task: the user did not ask for anything to be opened, and opening a file shows you nothing. Check your work by reading files, listing folders or running the project's tests or build."),
             "execute_command"
@@ -2312,7 +3054,7 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
                 .permissions
                 .read()
                 .await
-                .decide_in(&call.name, risk, true, Some(&ws_key));
+                .decide_call(&call.name, &call.args, risk, true, Some(&ws_key));
         let approved = match decision {
             PermissionDecision::Allow => true,
             PermissionDecision::Deny { reason } => {
@@ -2446,7 +3188,13 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
                 last_file = Some(path.to_string());
             }
         }
-        let shown: String = output.chars().take(tool_output_chars(room)).collect();
+        // File reads carry continuation positions and are cut from the start;
+        // command output keeps its end, where compiler and test errors are.
+        let shown: String = if call.name == "execute_command" {
+            crate::terminal::head_tail(&output, tool_output_chars(room))
+        } else {
+            output.chars().take(tool_output_chars(room)).collect()
+        };
         let tool_failed = tool_output_failed(&output);
         if let Some(entry) = work_log_entry(&call, &output, tool_failed) {
             work_log.push(entry);
@@ -2731,12 +3479,21 @@ struct VerificationState {
     /// PDF…): only a produced file fulfils it, never its content in the chat.
     document_kind: Option<&'static str>,
     document_created: bool,
+    /// Web pages this run wrote, with how the model named them. Their local
+    /// `src`/`href` references are checked on disk before a completion claim.
+    pages: HashMap<PathBuf, String>,
+    /// Folders this run's commands created (`mkdir x`), with how the model
+    /// named them. One still empty at a completion claim means the files meant
+    /// for it went elsewhere.
+    created_dirs: HashMap<PathBuf, String>,
 }
 
 impl VerificationState {
     fn for_task(task: &str) -> Self {
         Self {
-            document_kind: crate::documents::requested_document_kind(task),
+            // "Why does the CSV parser skip the header?" names a csv but asks
+            // for none: every code-session message reaches the agent now.
+            document_kind: crate::documents::requested_document_kind(task).filter(|_| !asks_for_information(task)),
             ..Self::default()
         }
     }
@@ -2745,6 +3502,33 @@ impl VerificationState {
         !self.uninspected.is_empty()
             || !self.unobserved_dirs.is_empty()
             || (self.document_kind.is_some() && !self.document_created)
+            || !self.broken_page_references().is_empty()
+            || !self.empty_created_dirs().is_empty()
+    }
+
+    fn empty_created_dirs(&self) -> Vec<String> {
+        let mut empty: Vec<String> = self
+            .created_dirs
+            .iter()
+            .filter(|(path, _)| std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none()))
+            .map(|(_, label)| format!("\"{label}\""))
+            .collect();
+        empty.sort();
+        empty
+    }
+
+    /// Local files the written pages link to that do not exist, one line per
+    /// reference, with the fix when the file exists under another relative path.
+    fn broken_page_references(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        let mut pages: Vec<_> = self.pages.iter().collect();
+        pages.sort();
+        for (page, label) in pages {
+            if let Ok(html) = std::fs::read_to_string(page) {
+                problems.extend(page_reference_problems(page, label, &html));
+            }
+        }
+        problems
     }
 
     fn label(&self, path: &Path) -> String {
@@ -2761,6 +3545,21 @@ impl VerificationState {
     }
 
     fn remaining(&self) -> String {
+        let empty = self.empty_created_dirs();
+        if !empty.is_empty() {
+            return format!(
+                "Before finishing: the folder {} you created is still empty, so the files meant for it were written somewhere else. Tool paths are relative to the workspace root (cd does not carry over): write them with the folder in the path, for example {}/index.html, and remove any copy left in the wrong place.",
+                empty.join(" and "),
+                empty[0].trim_matches('"')
+            );
+        }
+        let broken = self.broken_page_references();
+        if !broken.is_empty() {
+            return format!(
+                "Before finishing, fix the local links in the pages you wrote. The browser resolves src and href from the page's own folder, not from the workspace root: {}. Change the references with edit_file (or write the missing files), then finish.",
+                broken.join("; ")
+            );
+        }
         if let (Some(kind), false) = (self.document_kind, self.document_created) {
             return format!(
                 "The task asks for a {kind} file and none has been produced: writing its content into the chat is not the deliverable. Create it now with one create_document call (filename ending in .{kind}, complete content in the spec), then report the result."
@@ -2827,6 +3626,11 @@ impl VerificationState {
             } else {
                 // A command may partially mutate files even with nonzero exit.
                 self.labels.entry(cwd.clone()).or_insert_with(|| cwd_label.to_string());
+                if !failed {
+                    for (path, label) in created_folders(command, cwd_label, ws) {
+                        self.created_dirs.entry(path).or_insert(label);
+                    }
+                }
                 self.unobserved_dirs.insert(cwd);
             }
             return;
@@ -2845,6 +3649,12 @@ impl VerificationState {
         }
         match call.name.as_str() {
             "write_file" | "append_file" | "edit_file" => {
+                if let (Some(path), Some(label)) = (&path, path_label) {
+                    let lowered = label.to_ascii_lowercase();
+                    if lowered.ends_with(".html") || lowered.ends_with(".htm") {
+                        self.pages.insert(path.clone(), label.to_string());
+                    }
+                }
                 // A file written with the requested extension is the deliverable too.
                 if let (Some(kind), Some(label)) = (self.document_kind, path_label) {
                     if label.to_ascii_lowercase().ends_with(&format!(".{kind}")) {
@@ -2885,6 +3695,90 @@ impl VerificationState {
             _ => {}
         }
     }
+}
+
+/// The folders a plain `mkdir`/`md`/`New-Item -ItemType Directory` command
+/// names, resolved from its working directory.
+fn created_folders(
+    command: &str,
+    cwd_label: &str,
+    ws: &crate::workspace::WorkspaceManager,
+) -> Vec<(PathBuf, String)> {
+    let words = simple_command_words(command);
+    let original: Vec<&str> = command.split_whitespace().collect();
+    if !matches!(words.first().map(String::as_str), Some("mkdir" | "md")) || original.len() != words.len() {
+        return Vec::new();
+    }
+    original[1..]
+        .iter()
+        .filter(|word| !word.starts_with('-') && !word.starts_with('/'))
+        .filter_map(|name| {
+            let label = if cwd_label == "." || cwd_label.is_empty() {
+                name.to_string()
+            } else {
+                format!("{}/{name}", cwd_label.trim_end_matches(['/', '\\']))
+            };
+            ws.resolve(&label).ok().map(|path| (path, label))
+        })
+        .collect()
+}
+
+/// A page's local `src`/`href` references that do not exist next to it. A
+/// small model writing `calculator/index.html` linked `calculator/style.css`
+/// from inside that folder (tool paths are relative to the workspace root; a
+/// page's are relative to itself), so the page loaded without its style and
+/// script, and the run's own check accepted it. Only what the browser would
+/// fetch from disk is checked: links with a scheme, `//`, `#`, root-relative
+/// `/` paths and template placeholders are left alone.
+fn page_reference_problems(page: &Path, label: &str, html: &str) -> Vec<String> {
+    let Some(folder) = page.parent() else {
+        return Vec::new();
+    };
+    let lowered = html.to_ascii_lowercase();
+    let mut problems = Vec::new();
+    let mut seen = HashSet::new();
+    for attribute in ["src=", "href="] {
+        let mut from = 0;
+        while let Some(found) = lowered[from..].find(attribute) {
+            let at = from + found;
+            from = at + attribute.len();
+            // The attribute name must stand alone (not data-src=, not xhref=).
+            if at > 0 && !html[..at].ends_with(|ch: char| ch.is_whitespace()) {
+                continue;
+            }
+            let rest = &html[from..];
+            let Some(quote) = rest.chars().next().filter(|ch| matches!(ch, '"' | '\'')) else {
+                continue;
+            };
+            let Some(len) = rest[1..].find(quote) else {
+                continue;
+            };
+            let value = rest[1..1 + len].trim();
+            let target = value.split(['?', '#']).next().unwrap_or("").trim();
+            let has_scheme = target
+                .split_once(':')
+                .is_some_and(|(scheme, _)| !scheme.is_empty() && scheme.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '.' | '-')));
+            if target.is_empty()
+                || has_scheme
+                || target.starts_with('/')
+                || target.starts_with('\\')
+                || ["{{", "${", "<%", "{%"].iter().any(|marker| target.contains(marker))
+                || !seen.insert(target.to_string())
+            {
+                continue;
+            }
+            if folder.join(target).exists() {
+                continue;
+            }
+            let file_name = Path::new(target).file_name().map(|name| name.to_string_lossy().into_owned());
+            let hint = match file_name {
+                Some(name) if folder.join(&name).exists() => format!(" (that file is next to the page: use \"{name}\")"),
+                _ => String::new(),
+            };
+            problems.push(format!("{label} links \"{value}\", which does not exist relative to the page{hint}"));
+        }
+    }
+    problems
 }
 
 /// The folder a read-only listing command shows: its working directory, or
@@ -3001,6 +3895,10 @@ async fn await_approval(
         tool: call.name.clone(),
         args: call.args.clone(),
         reason: reason.into(),
+        session_grantable: crate::tools::registry()
+            .iter()
+            .find(|tool| tool.name == call.name)
+            .is_some_and(|tool| tool.risk == crate::permissions::RiskLevel::Moderate),
     };
     *run.pending.lock().expect("lock") = Some(pending.clone());
     *run.pending_tx.lock().expect("lock") = Some(tx);
@@ -3061,6 +3959,9 @@ async fn execute_local_tool(
             if !r.ok {
                 text = format!("(tool reported failure)\n{text}");
             }
+            if call.name == "execute_command" && bare_cd(arg_str(call, "command").unwrap_or_default()) {
+                text.push_str(CD_DOES_NOT_PERSIST);
+            }
             text
         }
         Err(e) => match e {
@@ -3068,8 +3969,9 @@ async fn execute_local_tool(
                 // Say exactly what was received: a model that sent
                 // {"file":"x"} instead of {"path":"x"} can correct itself only
                 // if it sees the difference.
+                let text_hint = if awaits_raw_text(call) { MISSING_TEXT_HINT } else { "" };
                 format!(
-                    "(tool error, do not retry identically)\n{e}\nYou sent args: {}",
+                    "(tool error, do not retry identically)\n{e}\nYou sent args: {}{text_hint}",
                     short_args(&call.args)
                 )
             }
@@ -3224,16 +4126,8 @@ fn mutation_diff(
     let path = arg_str(call, "path")?;
     let old = before.as_deref().unwrap_or("");
     let new = after.as_deref().unwrap_or("");
-    let removed = old
-        .lines()
-        .map(|line| format!("-{line}\n"))
-        .collect::<String>();
-    let added = new
-        .lines()
-        .map(|line| format!("+{line}\n"))
-        .collect::<String>();
     Some(format!(
-        "--- {}\n+++ {}\n@@ -1,{} +1,{} @@\n{removed}{added}",
+        "--- {}\n+++ {}\n{}",
         if before.is_some() {
             format!("a/{path}")
         } else {
@@ -3244,9 +4138,108 @@ fn mutation_diff(
         } else {
             "/dev/null".into()
         },
-        old.lines().count(),
-        new.lines().count()
+        unified_hunks(old, new, 3)
     ))
+}
+
+/// The changed lines between two texts as unified-diff hunks with `context`
+/// lines around each change. The change view used to list every old line as
+/// removed and every new line as added, so a one-function insertion showed as
+/// the whole file replaced.
+fn unified_hunks(old: &str, new: &str, context: usize) -> String {
+    let a: Vec<&str> = old.lines().collect();
+    let b: Vec<&str> = new.lines().collect();
+    let prefix = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let suffix = a[prefix..]
+        .iter()
+        .rev()
+        .zip(b[prefix..].iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count();
+    let (mid_a, mid_b) = (&a[prefix..a.len() - suffix], &b[prefix..b.len() - suffix]);
+    // Edit script over the middle: a longest common subsequence of lines, or
+    // the whole middle replaced when it is too large to compare cheaply.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Op {
+        Same,
+        Removed,
+        Added,
+    }
+    let mut ops: Vec<Op> = vec![Op::Same; prefix];
+    if mid_a.len().saturating_mul(mid_b.len()) <= 4_000_000 {
+        let (n, m) = (mid_a.len(), mid_b.len());
+        let mut lcs = vec![0u32; (n + 1) * (m + 1)];
+        for i in (0..n).rev() {
+            for j in (0..m).rev() {
+                lcs[i * (m + 1) + j] = if mid_a[i] == mid_b[j] {
+                    lcs[(i + 1) * (m + 1) + j + 1] + 1
+                } else {
+                    lcs[(i + 1) * (m + 1) + j].max(lcs[i * (m + 1) + j + 1])
+                };
+            }
+        }
+        let (mut i, mut j) = (0, 0);
+        while i < n || j < m {
+            if i < n && j < m && mid_a[i] == mid_b[j] {
+                ops.push(Op::Same);
+                i += 1;
+                j += 1;
+            } else if i < n && (j == m || lcs[(i + 1) * (m + 1) + j] >= lcs[i * (m + 1) + j + 1]) {
+                // Removals before additions, as unified diffs show a replaced line.
+                ops.push(Op::Removed);
+                i += 1;
+            } else {
+                ops.push(Op::Added);
+                j += 1;
+            }
+        }
+    } else {
+        ops.extend(std::iter::repeat(Op::Removed).take(mid_a.len()));
+        ops.extend(std::iter::repeat(Op::Added).take(mid_b.len()));
+    }
+    ops.extend(std::iter::repeat(Op::Same).take(suffix));
+
+    // Line numbers before each op, then hunks around the changes.
+    let mut positions = Vec::with_capacity(ops.len());
+    let (mut line_a, mut line_b) = (0usize, 0usize);
+    for op in &ops {
+        positions.push((line_a, line_b));
+        match op {
+            Op::Same => {
+                line_a += 1;
+                line_b += 1;
+            }
+            Op::Removed => line_a += 1,
+            Op::Added => line_b += 1,
+        }
+    }
+    let changed: Vec<usize> = ops.iter().enumerate().filter(|(_, op)| **op != Op::Same).map(|(index, _)| index).collect();
+    let mut out = String::new();
+    let mut index = 0;
+    while index < changed.len() {
+        let start = changed[index].saturating_sub(context);
+        let mut end = changed[index] + 1;
+        while index + 1 < changed.len() && changed[index + 1] <= end + 2 * context {
+            index += 1;
+            end = changed[index] + 1;
+        }
+        let end = (end + context).min(ops.len());
+        let (start_a, start_b) = positions[start];
+        let len_a = ops[start..end].iter().filter(|op| **op != Op::Added).count();
+        let len_b = ops[start..end].iter().filter(|op| **op != Op::Removed).count();
+        let header = |start: usize, len: usize| if len == 0 { start } else { start + 1 };
+        out.push_str(&format!("@@ -{},{len_a} +{},{len_b} @@\n", header(start_a, len_a), header(start_b, len_b)));
+        for (offset, op) in ops[start..end].iter().enumerate() {
+            let (pos_a, pos_b) = positions[start + offset];
+            match op {
+                Op::Same => out.push_str(&format!(" {}\n", a[pos_a])),
+                Op::Removed => out.push_str(&format!("-{}\n", a[pos_a])),
+                Op::Added => out.push_str(&format!("+{}\n", b[pos_b])),
+            }
+        }
+        index += 1;
+    }
+    out
 }
 
 async fn audit_tool(state: &crate::api::AppState, run: &LiveRun, call: &ToolCall, output: &str) {
@@ -3355,6 +4348,31 @@ mod tests {
         assert!(salvage_action("I would use write_file with content here.").is_none());
     }
 
+    #[test]
+    fn history_sees_prose_without_any_action_envelopes() {
+        // A saved chat reply with two rounds of the same malformed call.
+        let saved = "```tool\n{\"name\": \"rust_program\", \"args\": {\"code\": \"fn main() {\\n}}\"}\n``` \n\nI've started with a basic Rust program.\n```tool\n{\"name\": \"rust_program\", \"args\": {\"code\": \"fn main() {}\"}\n``` \n";
+        assert_eq!(without_action_envelopes(saved), "I've started with a basic Rust program.");
+        // A raw file body containing its own fences is removed whole, and an
+        // ordinary code block in the answer stays.
+        let mixed = concat!(
+            "Here is the plan.\n",
+            "```tool\n",
+            r#"{"name":"write_file","args":{"path":"README.md"}}"#,
+            "\n<<<CONTENT\n# Title\n```bash\nmake\n```\nCONTENT>>>\n```\n",
+            "Run it with:\n```bash\nmake test\n```\n",
+            "<tool_call>{\"name\":\"read_file\",\"args\":{}}</tool_call>\nDone.\n",
+            "<tool_call>{\"name\":\"read_file\",\"args\":{\"path\":\"a\""
+        );
+        let stripped = without_action_envelopes(mixed);
+        assert!(stripped.contains("Here is the plan."));
+        assert!(stripped.contains("```bash\nmake test\n```"));
+        assert!(stripped.contains("Done."));
+        assert!(!stripped.contains("write_file") && !stripped.contains("read_file"));
+        assert!(!stripped.contains("# Title"));
+        assert_eq!(without_action_envelopes("Plain answer."), "Plain answer.");
+    }
+
     /// The failure this envelope exists for: a file body carrying exactly the
     /// characters JSON escaping gets wrong. Written raw, none of them matter.
     const HOSTILE_JS: &str = r#"const re = /\d+\.\d+/;
@@ -3378,6 +4396,57 @@ const tpl = `line ${a}`;
         assert_eq!(call.args["path"], "app.js");
         // Byte for byte, trailing newline included.
         assert_eq!(call.args["content"], HOSTILE_JS);
+    }
+
+    #[test]
+    fn questions_are_told_apart_from_requests_for_work() {
+        for question in [
+            "What does orders.py export?",
+            "why does the CSV parser skip the header row",
+            "Explain the build",
+            "Is the test flaky?",
+            "The tests fail when I run them, any idea?",
+        ] {
+            assert!(asks_for_information(question), "{question}");
+        }
+        for work in [
+            "Create a calculator app",
+            "Can you create a PDF of the notes?",
+            "please add a low_stock function",
+            "Implement the plan",
+            "Fix the failing test",
+        ] {
+            assert!(!asks_for_information(work), "{work}");
+        }
+        assert_eq!(VerificationState::for_task("Why does the CSV export drop rows?").document_kind, None);
+        assert_eq!(VerificationState::for_task("Make a CSV of the models").document_kind, Some("csv"));
+    }
+
+    #[test]
+    fn a_write_whose_text_has_not_started_is_not_a_complete_action() {
+        let object_only = concat!("```tool
+", r#"{"name":"write_file","args":{"path":"app.js"}}"#);
+        assert!(!action_complete(object_only), "the file text follows the object");
+        assert!(!action_complete(&format!("{object_only}
+")));
+        let written = format!("{object_only}
+<<<CONTENT
+let a = 1;
+CONTENT>>>
+```
+");
+        assert!(action_complete(&written));
+        assert_eq!(parse_action_response(&written).unwrap().args["content"], "let a = 1;
+");
+        let inline = concat!("```tool
+", r#"{"name":"write_file","args":{"path":"app.js","content":"x"}}"#);
+        assert!(action_complete(inline), "text given inside the object");
+        assert!(!action_complete(concat!("```tool
+", r#"{"name":"edit_file","args":{"path":"a.js"}}"#)));
+        assert!(!action_complete(concat!("<tool_call>
+", r#"{"name":"append_file","args":{"path":"a.md"}}"#)));
+        assert!(action_complete(concat!("```tool
+", r#"{"name":"read_file","args":{"path":"a.js"}}"#)));
     }
 
     #[test]
@@ -3438,7 +4507,7 @@ const tpl = `line ${a}`;
         assert!(url.starts_with("http://127.0.0.1:"), "local probe only");
         let prompt = system_prompt("C:/isolated-fixture", &crate::tools::registry(), false, false);
         let task = std::env::var("COMPANION_ACTION_PROBE_TASK").unwrap_or_else(|_| "In this isolated evaluation fixture, inspect calculator.cjs and verify.cjs. Fix add(a,b) so it returns the sum, delete only disposable.txt, then execute node verify.cjs and report its actual result. Do not change verify.cjs, install packages, or use the network. Keep the change minimal.".into());
-        let mut turns = vec![ChatTurn::text("system", prompt), ChatTurn::text("user", format!("Task: {task}\n\nAddress this request within its scope. Use the complete tool envelope shown in the system instructions if an action is necessary; otherwise answer directly. Do not invent a new task or mutate files for a question."))];
+        let mut turns = vec![ChatTurn::text("system", prompt), ChatTurn::text("user", format!("Task: {task}\n\nAddress this request within its scope. Use the complete tool envelope shown in the system instructions for each action. Answer a question about the project from the files it concerns, read first. Do not invent a new task or mutate files for a question."))];
         let structured = std::env::var("COMPANION_ACTION_PROBE_STRUCTURED").is_ok();
         if structured {
             turns.push(ChatTurn::text("user", STRUCTURED_ACTION_INSTRUCTION));
@@ -3596,9 +4665,10 @@ const tpl = `line ${a}`;
             .unwrap()
             .unwrap();
         assert!(matches!(result, Some(ApprovalDecision::Denied)));
+        // Still Ask (reads free, edits and commands ask), not Auto.
         assert_eq!(
             state.permissions.read().await.autonomy,
-            crate::permissions::AutonomyLevel::Assisted
+            crate::permissions::AutonomyLevel::WorkspaceAgent
         );
     }
 
@@ -3993,6 +5063,139 @@ const tpl = `line ${a}`;
     }
 
     #[test]
+    fn the_prompt_and_the_missing_text_correction_say_where_text_goes_in_the_native_call_form() {
+        let prompt = system_prompt_for("C:/ws", &crate::tools::registry(), false, false, false, 12_000);
+        assert!(prompt.contains("content:<|\"|>text<|\"|>"), "rule 2b names the native form");
+        let call = ToolCall { name: "append_file".into(), args: serde_json::json!({"path": "t.py"}) };
+        assert!(awaits_raw_text(&call));
+        assert!(MISSING_TEXT_HINT.contains("content:<|\"|>") && MISSING_TEXT_HINT.contains("<<<CONTENT"));
+        // The documented native form parses to a complete write.
+        let native = "<|tool_call>call:append_file{path:<|\"|>t.py<|\"|>,content:<|\"|>    def test_x(self):\n        self.assertEqual(f(\"a\"), 1)\n<|\"|>}<tool_call|>";
+        let parsed = parse_action_response(native).unwrap();
+        assert_eq!(parsed.args["content"], "    def test_x(self):\n        self.assertEqual(f(\"a\"), 1)\n");
+        assert!(action_complete(native));
+    }
+
+    #[test]
+    fn a_folder_the_run_created_and_left_empty_holds_up_completion() {
+        let root = std::env::temp_dir().join(format!("empty-dirs-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let ws = crate::workspace::WorkspaceManager::new(root.clone());
+        let mut state = VerificationState::default();
+        let mkdir = ToolCall { name: "execute_command".into(), args: serde_json::json!({"command": "mkdir todo", "cwd": "."}) };
+        std::fs::create_dir_all(root.join("todo")).unwrap();
+        state.observe(&ws, &mkdir, "Command:\nmkdir todo\n\nExit code:\n0", false);
+        let listing = ToolCall { name: "list_directory".into(), args: serde_json::json!({"path": "."}) };
+        state.observe(&ws, &listing, "index.html\ntodo", false);
+        // Measured shape: the page went to the root instead of todo/.
+        std::fs::write(root.join("index.html"), "<html></html>").unwrap();
+        assert!(state.needs_evidence());
+        let remaining = state.remaining();
+        assert!(remaining.contains("\"todo\" you created is still empty") && remaining.contains("todo/index.html"), "{remaining}");
+        std::fs::write(root.join("todo").join("index.html"), "<html></html>").unwrap();
+        assert!(!state.needs_evidence(), "a folder with its file is done");
+        assert!(bare_cd("cd todo") && bare_cd("Set-Location todo") && !bare_cd("cd todo && npm test") && !bare_cd("mkdir todo"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_page_linking_files_from_the_workspace_root_is_reported_with_the_fix() {
+        let dir = std::env::temp_dir().join(format!("page-refs-{}", uuid::Uuid::new_v4()));
+        let calculator = dir.join("calculator");
+        std::fs::create_dir_all(&calculator).unwrap();
+        std::fs::write(calculator.join("style.css"), "body{}").unwrap();
+        // Verbatim shape from the live run: paths written from the workspace root.
+        let html = "<link rel=\"stylesheet\" href=\"calculator/style.css\">\n<script src='calculator/script.js'></script>\n\
+                    <a href=\"#top\">top</a><img src=\"https://example.com/a.png\"><img data-src=\"missing.png\">\n\
+                    <link href=\"/root.css\"><script src=\"{{ asset }}\"></script>";
+        let problems = page_reference_problems(&calculator.join("index.html"), "calculator/index.html", html);
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        let style = problems.iter().find(|problem| problem.contains("\"calculator/style.css\"")).unwrap();
+        assert!(style.contains("use \"style.css\""), "{style}");
+        let script = problems.iter().find(|problem| problem.contains("\"calculator/script.js\"")).unwrap();
+        assert!(!script.contains("next to the page"), "no such file anywhere: no hint {script}");
+        let fixed = "<link rel=\"stylesheet\" href=\"style.css?v=2\">";
+        assert!(page_reference_problems(&calculator.join("index.html"), "calculator/index.html", fixed).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_gemma_calls_are_read_as_the_model_actually_sent_them() {
+        // Verbatim from a live change task (the model's own words and paths).
+        let unclosed = "<|tool_call>call:list_directory{path:\".\"}\n";
+        let call = parse_action_response(unclosed).unwrap();
+        assert_eq!((call.name.as_str(), &call.args), ("list_directory", &serde_json::json!({"path": "."})));
+        assert!(!action_complete(unclosed), "an unclosed call is complete only when the turn ends");
+
+        let command = r#"<|tool_call>call:execute_command{command:"ls project",cwd:"C:\\Users\\someone\\project"}<tool_call|>"#;
+        let call = parse_action_response(command).unwrap();
+        assert_eq!(call.args["command"], "ls project");
+        assert_eq!(call.args["cwd"], r"C:\Users\someone\project");
+        assert!(action_complete(command));
+
+        let noted = "First, I will read `project/orders.py` to see where to add the new function.\n<|tool_call>call:read_file{\"path\":\"project/orders.py\",\"start_line\":1,\"end_line\":500}<tool_call|>";
+        let call = parse_action_response(noted).unwrap();
+        assert_eq!(call.args, serde_json::json!({"path": "project/orders.py", "start_line": 1, "end_line": 500}));
+        assert_eq!(visible_progress(noted), "First, I will read `project/orders.py` to see where to add the new function.");
+
+        let native_strings = "<|tool_call>call:edit_file{args:{new:<|\"|>\ndef low_stock(items, threshold):\n    return [item[\"name\"] for item in items]\n<|\"|>,path:<|\"|>project/orders.py<|\"|>}}<tool_call|>";
+        let call = parse_action_response(native_strings).unwrap();
+        assert_eq!(call.name, "edit_file");
+        assert_eq!(call.args["path"], "project/orders.py");
+        assert_eq!(call.args["new"], "\ndef low_stock(items, threshold):\n    return [item[\"name\"] for item in items]\n");
+        assert!(call.args.get("old").is_none(), "the missing argument is corrected by validation, not invented");
+
+        let raw_block = "<|tool_call>call:append_file{\"path\":\"project/orders.py\"}\n<<<CONTENT\n\ndef low_stock(items, threshold):\n    return []\n>>>";
+        let call = parse_action_response(raw_block).unwrap();
+        assert_eq!(call.args["content"], "\ndef low_stock(items, threshold):\n    return []\n");
+
+        // The documented form, nested values, and the text arriving after the close.
+        let documented = "<|tool_call>call:get_current_weather{location:<|\"|>Tokyo, JP<|\"|>}<tool_call|>";
+        assert_eq!(parse_action_response(documented).unwrap().args["location"], "Tokyo, JP");
+        let nested = "<|tool_call>call:x{a:[1, <|\"|>two<|\"|>, true], b:{c:null, d:-2.5}}<tool_call|>";
+        assert_eq!(parse_action_response(nested).unwrap().args, serde_json::json!({"a": [1, "two", true], "b": {"c": null, "d": -2.5}}));
+        let write = "<|tool_call>call:write_file{path:<|\"|>a.txt<|\"|>}<tool_call|>\n<<<CONTENT\nline\nCONTENT>>>";
+        assert!(!action_complete("<|tool_call>call:write_file{path:<|\"|>a.txt<|\"|>}<tool_call|>\n<<<CONTENT\nli"));
+        assert!(action_complete(write));
+        assert_eq!(parse_action_response(write).unwrap().args["content"], "line\n");
+        assert!(!action_complete("<|tool_call>call:read_file{path:<|\"|>project/ord"));
+
+        // A bare >>> mid-file is file text, not the end of the block.
+        let doctest = "<|tool_call>call:write_file{path:<|\"|>t.py<|\"|>}<tool_call|>\n<<<CONTENT\n>>>\nprint(1)\n";
+        assert!(parse_action_response(doctest).is_none());
+
+        // A block closed as `<<<CONTENT>>>` (two 6 KB pages were closed that way).
+        let doubled = "<|tool_call>call:write_file{path:\"calculator/index.html\"}\n<<<CONTENT\n<!DOCTYPE html>\n</html>\n<<<CONTENT>>>";
+        assert_eq!(parse_action_response(doubled).unwrap().args["content"], "<!DOCTYPE html>\n</html>\n");
+
+        // The opener lost, the closing marker kept (verbatim shape from a plan run).
+        let opener_less = "Plan:\n1. Add total_quantity.\n\npresent_plan{plan:<|\"|>1. Add total_quantity(items) to project/orders.py.<|\"|>}<tool_call|>";
+        let call = parse_action_response(opener_less).unwrap();
+        assert_eq!(call.name, "present_plan");
+        assert_eq!(call.args["plan"], "1. Add total_quantity(items) to project/orders.py.");
+        assert_eq!(visible_progress(opener_less), "Plan:\n1. Add total_quantity.");
+        assert!(action_complete(opener_less));
+        // Not for unknown names, or a name inside a longer word.
+        assert!(parse_action_response("helper_tool{x:1}<tool_call|>").is_none());
+        assert!(parse_action_response("myread_file{path:\"a\"}<tool_call|>").is_none());
+
+        // A stray closing brace, and a block closed by repeating its opener at the end.
+        let extra_brace = "<|tool_call>call:write_file{args:{path:\"todo/index.html\",content:<|\"|>x<|\"|>}}}<tool_call|>";
+        assert_eq!(parse_action_response(extra_brace).unwrap().args["path"], "todo/index.html");
+        let reopened = "<|tool_call>call:write_file{path:\"todo/index.html\"}\n<<<CONTENT\n<html>\n</html>\n<<<CONTENT";
+        assert_eq!(parse_action_response(reopened).unwrap().args["content"], "<html>\n</html>\n");
+        let reopened_mid = "<|tool_call>call:write_file{path:\"a.md\"}\n<<<CONTENT\nsee the marker:\n<<<CONTENT\nmore text\n";
+        assert!(parse_action_response(reopened_mid).is_none(), "only as the reply's last line");
+
+        // A stray quote after an unquoted key (sent verbatim once).
+        let stray = "<|tool_call>call:list_directory{path\":\".\"}<tool_call|>";
+        assert_eq!(parse_action_response(stray).unwrap().args, serde_json::json!({"path": "."}));
+
+        // Unreadable native calls say why, in the parser's words.
+        assert!(action_problem("<|tool_call>call:read_file{path:<|\"|>a}<tool_call|>").unwrap().contains("not closed"));
+    }
+
+    #[test]
     fn structured_tools_and_final_answers_are_distinct_and_validated() {
         let action = r#"{"kind":"tool","name":"execute_command","args":{"command":"node verify.cjs"},"answer":""}"#;
         let call = parse_action_response(action).unwrap();
@@ -4032,6 +5235,18 @@ const tpl = `line ${a}`;
             )
             .is_some());
         }
+    }
+
+    #[test]
+    fn a_constrained_final_answer_sent_back_returns_to_the_native_format() {
+        let mut policy = ActionResponsePolicy { structured_fallback: true, ..ActionResponsePolicy::default() };
+        assert!(policy.final_sent_back(true));
+        assert!(!policy.structured_fallback, "the next step uses the native format");
+        assert!(!policy.final_sent_back(false), "a native final answer changes nothing");
+        // Two unreadable native replies still return to the constrained format.
+        assert!(policy.recover_invalid());
+        assert!(policy.recover_invalid());
+        assert!(policy.structured_fallback);
     }
 
     #[test]
@@ -4085,11 +5300,9 @@ const tpl = `line ${a}`;
         let valid = "<|tool_call>call:read_file{args:{\"path\":\"x\"}}<tool_call|>";
         for text in [
             format!("{valid}{valid}"),
-            format!("Example: {valid}"),
             format!("{valid} explanation"),
             format!("```text\n{valid}\n```"),
             "<|tool_call>call:read_file{args:[]}<tool_call|>".into(),
-            "<|tool_call>call:read_file{args:{\"path\":\"x\"}}".into(),
             "<|tool_call>call:read_file;command{args:{}}<tool_call|>".into(),
             "<|tool_call>call:read_file{args:{},another:{}}<tool_call|>".into(),
         ] {
@@ -4153,6 +5366,22 @@ const tpl = `line ${a}`;
             serde_json::from_str::<AgentMode>("\"plan\"").unwrap(),
             AgentMode::Plan
         );
+    }
+
+    #[test]
+    fn a_change_shows_only_its_lines_with_context() {
+        let before: String = (1..=30).map(|n| format!("line {n}\n")).collect();
+        let after = before.replace("line 16\n", "line 16\nnew a\nnew b\n");
+        let hunks = unified_hunks(&before, &after, 3);
+        assert_eq!(hunks, "@@ -14,6 +14,8 @@\n line 14\n line 15\n line 16\n+new a\n+new b\n line 17\n line 18\n line 19\n");
+        // A new file: every line added from nothing.
+        assert_eq!(unified_hunks("", "a\nb\n", 3), "@@ -0,0 +1,2 @@\n+a\n+b\n");
+        // Two changes far apart are two hunks; a replaced line is removed then added.
+        let changed = before.replace("line 2\n", "LINE 2\n").replace("line 29\n", "");
+        let hunks = unified_hunks(&before, &changed, 3);
+        assert_eq!(hunks.matches("@@ -").count(), 2, "{hunks}");
+        assert!(hunks.contains("-line 2\n+LINE 2\n") && hunks.contains("-line 29\n"), "{hunks}");
+        assert!(!hunks.contains("line 15"), "unchanged middle stays out: {hunks}");
     }
 
     #[test]
@@ -4476,23 +5705,23 @@ const tpl = `line ${a}`;
     fn follow_up_focus_excludes_unrelated_sibling_projects() {
         let root =
             std::env::temp_dir().join(format!("companion-project-focus-{}", uuid::Uuid::new_v4()));
-        let ragev = root.join("RageV");
-        let ember = root.join("ember");
-        std::fs::create_dir_all(&ragev).unwrap();
-        std::fs::create_dir_all(&ember).unwrap();
-        std::fs::write(ragev.join("CMakeLists.txt"), "project(RageV)").unwrap();
-        std::fs::write(ember.join("Cargo.toml"), "[package]").unwrap();
+        let engine = root.join("SampleEngine");
+        let toolkit = root.join("toolkit");
+        std::fs::create_dir_all(&engine).unwrap();
+        std::fs::create_dir_all(&toolkit).unwrap();
+        std::fs::write(engine.join("CMakeLists.txt"), "project(SampleEngine)").unwrap();
+        std::fs::write(toolkit.join("Cargo.toml"), "[package]").unwrap();
 
         let follow_up = vec![
-            "What is the RageV project?".to_string(),
+            "What is the SampleEngine project?".to_string(),
             "Find the tasks that are still pending in this project.".to_string(),
         ];
         assert_eq!(
             focused_workspace_root(&root, &follow_up),
-            std::fs::canonicalize(&ragev).unwrap()
+            std::fs::canonicalize(&engine).unwrap()
         );
         assert_eq!(
-            focused_workspace_root(&root, &["Compare RageV and ember".into()]),
+            focused_workspace_root(&root, &["Compare SampleEngine and toolkit".into()]),
             root
         );
 
@@ -4684,6 +5913,10 @@ const tpl = `line ${a}`;
     fn a_project_without_tests_can_finish_after_looking_at_what_changed() {
         let root = std::env::temp_dir().join(format!("verification-site-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join("energy-drink")).unwrap();
+        // The writes below are real on disk, as in a run (a created folder left
+        // empty would hold up completion).
+        std::fs::write(root.join("energy-drink").join("index.html"), "<html></html>").unwrap();
+        std::fs::write(root.join("energy-drink").join("style.css"), "body{}").unwrap();
         let ws = crate::workspace::WorkspaceManager::new(root.clone());
         let mut state = VerificationState::default();
         let call = |name: &str, args: serde_json::Value| ToolCall { name: name.into(), args };
@@ -4813,6 +6046,29 @@ const tpl = `line ${a}`;
     fn push_write(transcript: &mut Vec<ChatTurn>, file: &str, content_chars: usize) {
         transcript.push(ChatTurn::text("assistant", format!("```tool\n{{\"name\":\"write_file\",\"args\":{{\"path\":\"site/{file}\",\"content\":\"{}\"}}}}\n```", "x".repeat(content_chars))));
         transcript.push(ChatTurn::text("user", format!("Result of write_file:\nwrote {content_chars} bytes (1 lines) to site/{file} (verified on disk)")));
+    }
+
+    #[test]
+    fn a_note_cut_off_by_its_cap_keeps_only_complete_lines() {
+        assert_eq!(complete_note("- did a\n- did b\n- next", Some("stop")).as_deref(), Some("- did a\n- did b\n- next"));
+        assert_eq!(complete_note("- did a\n- did b\n- next: wri", Some("length")).as_deref(), Some("- did a\n- did b"));
+        assert_eq!(complete_note("- did a\n- next: wri", Some("length")), None, "one complete line is not a note");
+        assert_eq!(complete_note("   ", Some("stop")), None);
+    }
+
+    #[test]
+    fn old_tool_results_are_released_before_the_latest_exchange() {
+        let mut transcript = vec![ChatTurn::text("system", "rules"), ChatTurn::text("user", "Task: read three files")];
+        for file in ["a.rs", "b.rs", "c.rs"] {
+            transcript.push(ChatTurn::text("assistant", format!("reading {file}")));
+            transcript.push(ChatTurn::text("user", format!("Result of read_file:\n{}", "y".repeat(3_000))));
+        }
+        let before = estimated_tokens(&transcript);
+        let released = release_tool_results(&mut transcript, 1, 32_768, before / 2);
+        assert!(released >= 1);
+        assert!(estimated_tokens(&transcript) < before);
+        let last = transcript.last().unwrap();
+        assert!(!last.content.contains(RELEASED_MARKER), "the latest result stays whole");
     }
 
     #[tokio::test]

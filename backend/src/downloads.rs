@@ -521,7 +521,7 @@ mod tests {
         assert!(DownloadManager::validate_request("", "https://x/y").is_err());
         assert!(DownloadManager::validate_request("../evil", "https://x/y").is_err());
         assert!(DownloadManager::validate_request("ok-id_1", "ftp://x").is_err());
-        assert!(DownloadManager::validate_request("qwen-14b", "https://hf.co/x.gguf").is_ok());
+        assert!(DownloadManager::validate_request("example-14b", "https://hf.co/x.gguf").is_ok());
     }
 
     #[tokio::test]

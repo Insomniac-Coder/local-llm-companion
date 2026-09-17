@@ -292,8 +292,8 @@ mod tests {
 
     #[test]
     fn parses_gpu_name_column() {
-        let r = parse_smi_line("12, 2048, 12226, 55, 20.1, NVIDIA GeForce RTX 5070 Ti Laptop GPU").unwrap();
-        assert_eq!(r.name.as_deref(), Some("NVIDIA GeForce RTX 5070 Ti Laptop GPU"));
+        let r = parse_smi_line("12, 2048, 12226, 55, 20.1, NVIDIA Example Laptop GPU").unwrap();
+        assert_eq!(r.name.as_deref(), Some("NVIDIA Example Laptop GPU"));
         let unreported = parse_smi_line("12, 2048, 12226, 55, 20.1, [N/A]").unwrap();
         assert_eq!(unreported.name, None);
     }

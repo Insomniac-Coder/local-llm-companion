@@ -110,6 +110,17 @@ impl ProgressGuard {
         self.attempts_without_progress
     }
 
+    pub fn max_attempts(&self) -> u32 {
+        self.max_attempts_without_progress
+    }
+
+    /// Give back the attempt just begun when it was lost to the model server
+    /// rather than to the model (a context overflow answered by compaction):
+    /// it says nothing about whether the model's work is going anywhere.
+    pub fn refund_attempt(&mut self) {
+        self.attempts_without_progress = self.attempts_without_progress.saturating_sub(1);
+    }
+
     pub fn identical_repeats(&self) -> u32 {
         self.identical_repeats
     }
