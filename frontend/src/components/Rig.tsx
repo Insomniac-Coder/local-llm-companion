@@ -209,7 +209,7 @@ export default function Rig(props: Props) {
         <div className="rig-foot">
           {loadingModel ? (
             <>
-              <div className="rig-speed"><span>Preparing the runtime</span></div>
+              <div className="rig-speed"><span>{stage?.stage === 'checking_tools' ? 'Checking how it calls tools' : 'Preparing the runtime'}</span></div>
               {(stage?.stage === 'validating' || stage?.stage === 'loading') && (
                 <Button size="sm" variant="ghost" onClick={() => cancelLoad().then(() => props.notify('info', 'Model load cancelled.')).catch((error) => props.notify('error', error.message))}>Cancel</Button>
               )}

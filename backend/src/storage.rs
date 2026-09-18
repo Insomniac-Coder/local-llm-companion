@@ -942,6 +942,17 @@ impl Storage {
         Ok(rows.next().transpose()?)
     }
 
+    /// The chats linked to one project, newest first. Removing a project
+    /// offers to take them with it; without this they would be left pointing
+    /// at a project that no longer exists.
+    pub fn conversations_in_workspace(&self, workspace: &str) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM conversations WHERE workspace=? ORDER BY created_at DESC")?;
+        let rows = stmt.query_map(params![workspace], |r| r.get::<_, String>(0))?;
+        rows.collect()
+    }
+
     pub fn delete_workspace(&self, id: &str) -> rusqlite::Result<bool> {
         Ok(self
             .conn

@@ -230,9 +230,54 @@ Settings > Performance offers **Auto**, **Fastest**, **Balanced**, **Light** and
 - **Manual** sets threads, GPU layers, batch size, cache and waiting behaviour yourself. Combinations
   that cannot work (for example an 8-bit cache with Flash Attention off) cannot be selected.
 
-A model whose chat template has no tool support is detected at load: the model list shows whether
-**Tools** are confirmed, and such models create plain-text documents (`.txt`, `.md`, `.csv`, `.html`,
-`.json`) instead of Word, PowerPoint, Excel or PDF files.
+### How models use tools
+
+The first time a model is loaded, the app checks how it calls tools, which takes a few seconds (you
+are told before the load starts). It offers the model a listing tool and a file write, and records
+what worked in `tooling.json` next to the model:
+
+- **Tools: native**: the runtime hands the tools to the model in the model's own format and reads its
+  calls back, so no model-specific syntax is involved.
+- **Tools: text format**: the native calls did not work, so the app's own text action format is used.
+- **Read-only code**: file text did not arrive intact in either format (or no format worked). Code
+  sessions with this model can read and search but not change files, so Accept edits, Plan and Auto
+  are unavailable.
+
+The check runs again automatically when the runtime is rebuilt or the model's chat template changes,
+and on request with **Check again** in the model's details (the model must be loaded). The result is
+specific to this PC and is never committed to Git.
+
+### Finding and changing code
+
+A model is given more than "read the whole file": `outline` lists what a file
+defines with the line numbers, or what a folder holds; `replace_lines` changes
+a range of lines by those numbers (the way you would say "replace lines 40 to
+52"), which local models get right far more often than reproducing the existing
+text exactly; and `project_check` finds the project's own build and test
+commands, runs them, and reports the errors as `file:line: message` instead of
+pages of output. If the project needs a toolchain this PC does not have, it
+says so instead of running something that cannot work.
+
+A project can also keep its own instructions in `AGENTS.md` (or `CLAUDE.md`,
+`MUSE.md`, `PROJECT.md`): its commands, its conventions, what not to touch.
+Code sessions read the first one they find. It guides the work; it cannot
+change what needs your approval.
+
+### Running and looking at what it builds
+
+A command that is meant to keep running - a dev server, a watcher - is started in the background, so
+the work carries on around it and its output is kept: the agent starts it, reads what it printed
+(including the address it is serving on), and it is stopped when the task ends. Anything else runs
+with a timeout, and a command stopped at its timeout still reports what it printed up to then.
+
+With a server running, the agent can open the page: the app loads it in the browser already installed
+on this PC, with no window, and reports what the page renders, what it logged, and whether it came up
+blank. Only addresses on this PC are opened; nothing is sent anywhere. Models with a context window of
+16K or more are offered this, and are asked to keep `HANDOFF.md` and `MEMORY.md` in the project so the
+next session picks up where the last one stopped.
+
+A model whose chat template has no tool support creates plain-text documents in chat (`.txt`, `.md`,
+`.csv`, `.html`, `.json`) instead of Word, PowerPoint, Excel or PDF files.
 
 ### PCs without a GPU
 

@@ -670,9 +670,24 @@ pub type RequestRecorder = Arc<dyn Fn(RecordedRequest) + Send + Sync>;
 /// request the runtime measured. Requests with images are skipped: an image
 /// is hundreds of tokens and no characters.
 fn observe_prompt_size(body: &serde_json::Value, prompt_tokens: u32) {
-    let Some(messages) = body.get("messages").and_then(|messages| messages.as_array()) else {
-        return;
-    };
+    if let Some(chars) = prompt_chars(body) {
+        crate::agent::observe_prompt(chars, prompt_tokens);
+    }
+}
+
+/// Characters a request carries, or None when it carries an image (hundreds
+/// of tokens and no characters, which would teach the estimate nonsense).
+///
+/// Everything counts, not only the message text. With tools offered through
+/// the runtime a file's text travels in a call's `arguments` and the tool
+/// definitions travel beside the messages, and the runtime's `prompt_tokens`
+/// covers all of it. Counting the text alone measured 0.9 to 1.4 characters
+/// per token on requests that actually held 3.0 to 3.6, so every later
+/// estimate came out two to three times the real size: results were released
+/// and turns dropped at about a third of the real usage, and the model kept
+/// re-reading files the host had just taken away (night decision 61).
+fn prompt_chars(body: &serde_json::Value) -> Option<usize> {
+    let messages = body.get("messages")?.as_array()?;
     let mut chars = 0usize;
     for message in messages {
         match message.get("content") {
@@ -680,7 +695,7 @@ fn observe_prompt_size(body: &serde_json::Value, prompt_tokens: u32) {
             Some(serde_json::Value::Array(parts)) => {
                 for part in parts {
                     if part.get("type").and_then(|t| t.as_str()) == Some("image_url") {
-                        return;
+                        return None;
                     }
                     if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
                         chars += text.chars().count();
@@ -689,8 +704,34 @@ fn observe_prompt_size(body: &serde_json::Value, prompt_tokens: u32) {
             }
             _ => {}
         }
+        chars += call_chars(message);
     }
-    crate::agent::observe_prompt(chars, prompt_tokens);
+    if let Some(tools) = body.get("tools") {
+        chars += tools.to_string().chars().count();
+    }
+    Some(chars)
+}
+
+/// The text of one message's tool calls, counted as the transcript estimate
+/// counts it (`AgentContextUsage::for_turns`).
+fn call_chars(message: &serde_json::Value) -> usize {
+    let Some(calls) = message.get("tool_calls").and_then(|calls| calls.as_array()) else {
+        return 0;
+    };
+    calls
+        .iter()
+        .map(|call| {
+            let function = call.get("function");
+            let field = |name: &str| {
+                function
+                    .and_then(|function| function.get(name))
+                    .and_then(|value| value.as_str())
+                    .map(|text| text.chars().count())
+                    .unwrap_or(0)
+            };
+            field("name") + field("arguments") + 16
+        })
+        .sum()
 }
 
 /// A copy of a request body with inline image data replaced: a photo is
@@ -718,10 +759,26 @@ pub struct AgentCompletion {
     pub reasoning_present: bool,
     pub reasoning_tokens: Option<u32>,
     pub native_tool_calls_present: bool,
+    /// The calls the runtime parsed from the model's own tool-call format,
+    /// when the request offered tools.
+    #[serde(default)]
+    pub tool_calls: Vec<NativeToolCall>,
     /// The host stopped reading because a complete action had already
     /// arrived; the runtime was released without generating the remainder.
     #[serde(default)]
     pub early_stopped: bool,
+}
+
+/// A tool call the runtime parsed from the model's own tool-call format. The
+/// chat template renders the offered tools the way the model was trained to
+/// read them, and the runtime's parser turns the model's reply back into this,
+/// so no model-specific syntax reaches the host.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct NativeToolCall {
+    pub id: String,
+    pub name: String,
+    /// The arguments as the runtime returned them: a JSON object in text.
+    pub arguments: String,
 }
 
 impl AgentCompletion {
@@ -738,6 +795,17 @@ pub struct ChatTurn {
     /// Stage 19: JPEG data URLs appended as image_url parts (§33).
     #[serde(default, skip_serializing)]
     pub images: Vec<String>,
+    /// Assistant turns: the calls this reply made through the runtime's tool
+    /// interface, so the template renders them in the model's own format.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<NativeToolCall>,
+    /// Tool turns: the call this result answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// Tool turns: the tool that produced the result (templates that name the
+    /// tool in the result read it here rather than from the call).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 impl ChatTurn {
@@ -746,6 +814,26 @@ impl ChatTurn {
             role: role.into(),
             content: content.into(),
             images: vec![],
+            tool_calls: vec![],
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    /// A reply that called tools: its prose (often empty) and the calls.
+    pub fn assistant_calls(content: impl Into<String>, calls: Vec<NativeToolCall>) -> Self {
+        Self {
+            tool_calls: calls,
+            ..Self::text("assistant", content)
+        }
+    }
+
+    /// What a call returned, answering that call.
+    pub fn tool_result(call: &NativeToolCall, content: impl Into<String>) -> Self {
+        Self {
+            tool_call_id: Some(call.id.clone()),
+            name: Some(call.name.clone()),
+            ..Self::text("tool", content)
         }
     }
 }
@@ -767,7 +855,16 @@ fn template_safe_turns(turns: &[ChatTurn], shape: ChatTemplateShape) -> Vec<Chat
     }
     let mut out: Vec<ChatTurn> = Vec::with_capacity(turns.len());
     let mut carried = String::new();
-    for turn in turns {
+    for original in turns {
+        // A template that demands alternation defines no tool turns: calls
+        // become text on their reply and results the user's observation.
+        let flattened;
+        let turn = if shape.strict_alternation && (!original.tool_calls.is_empty() || original.tool_call_id.is_some()) {
+            flattened = flattened_tool_turn(original);
+            &flattened
+        } else {
+            original
+        };
         let mut role = turn.role.as_str();
         // A tool result is an observation for the model to read, so it belongs
         // with the user side; no restricted template defines a tool turn.
@@ -809,6 +906,7 @@ fn template_safe_turns(turns: &[ChatTurn], shape: ChatTemplateShape) -> Vec<Chat
             role: role.to_string(),
             content,
             images: turn.images.clone(),
+            ..turn.clone()
         });
     }
     // System text with no user turn after it still has to travel.
@@ -819,6 +917,22 @@ fn template_safe_turns(turns: &[ChatTurn], shape: ChatTemplateShape) -> Vec<Chat
         }
     }
     out
+}
+
+/// A native call or result as plain text, for templates without tool turns.
+fn flattened_tool_turn(turn: &ChatTurn) -> ChatTurn {
+    if turn.role == "tool" {
+        let name = turn.name.as_deref().unwrap_or("tool");
+        return ChatTurn::text("user", format!("Result of {name}:\n{}", turn.content));
+    }
+    let mut content = turn.content.clone();
+    for call in &turn.tool_calls {
+        if !content.trim().is_empty() {
+            content.push('\n');
+        }
+        content.push_str(&format!("Called {} {}", call.name, call.arguments));
+    }
+    ChatTurn { images: turn.images.clone(), ..ChatTurn::text(turn.role.clone(), content) }
 }
 
 /// Whether a rejected request was rejected by the chat template rather than
@@ -901,10 +1015,14 @@ fn strictly_shaped_body(body: &serde_json::Value) -> Option<serde_json::Value> {
     let messages = body.get("messages")?.as_array()?;
     let mut turns = Vec::with_capacity(messages.len());
     for message in messages {
-        turns.push(ChatTurn::text(
+        let mut turn = ChatTurn::text(
             message.get("role")?.as_str()?,
             message.get("content")?.as_str()?,
-        ));
+        );
+        turn.tool_calls = native_calls_in(message.get("tool_calls"));
+        turn.tool_call_id = message.get("tool_call_id").and_then(|id| id.as_str()).map(str::to_owned);
+        turn.name = message.get("name").and_then(|name| name.as_str()).map(str::to_owned);
+        turns.push(turn);
     }
     let strict = template_safe_turns(
         &turns,
@@ -913,12 +1031,7 @@ fn strictly_shaped_body(body: &serde_json::Value) -> Option<serde_json::Value> {
             strict_alternation: true,
         },
     );
-    if strict.len() == turns.len()
-        && strict
-            .iter()
-            .zip(&turns)
-            .all(|(a, b)| a.role == b.role && a.content == b.content)
-    {
+    if strict.len() == turns.len() && strict.iter().zip(&turns).all(|(a, b)| a == b) {
         return None;
     }
     let mut reshaped = body.clone();
@@ -927,14 +1040,121 @@ fn strictly_shaped_body(body: &serde_json::Value) -> Option<serde_json::Value> {
 }
 
 fn turn_json(t: &ChatTurn) -> serde_json::Value {
-    if t.images.is_empty() {
-        return serde_json::json!({"role": t.role, "content": t.content});
+    let mut message = if t.images.is_empty() {
+        serde_json::json!({"role": t.role, "content": t.content})
+    } else {
+        let mut parts = vec![serde_json::json!({"type": "text", "text": t.content})];
+        for url in &t.images {
+            parts.push(serde_json::json!({"type": "image_url", "image_url": {"url": url}}));
+        }
+        serde_json::json!({"role": t.role, "content": parts})
+    };
+    if !t.tool_calls.is_empty() {
+        message["tool_calls"] = t
+            .tool_calls
+            .iter()
+            .map(|call| {
+                serde_json::json!({
+                    "id": call.id,
+                    "type": "function",
+                    "function": {"name": call.name, "arguments": call.arguments},
+                })
+            })
+            .collect::<Vec<_>>()
+            .into();
     }
-    let mut parts = vec![serde_json::json!({"type": "text", "text": t.content})];
-    for url in &t.images {
-        parts.push(serde_json::json!({"type": "image_url", "image_url": {"url": url}}));
+    if let Some(id) = &t.tool_call_id {
+        message["tool_call_id"] = id.clone().into();
     }
-    serde_json::json!({"role": t.role, "content": parts})
+    if let Some(name) = &t.name {
+        message["name"] = name.clone().into();
+    }
+    message
+}
+
+/// Tool calls in an OpenAI-style message (`tool_calls[].function`).
+fn native_calls_in(value: Option<&serde_json::Value>) -> Vec<NativeToolCall> {
+    value
+        .and_then(|calls| calls.as_array())
+        .map(|calls| {
+            calls
+                .iter()
+                .enumerate()
+                .filter_map(|(index, call)| {
+                    let function = call.get("function")?;
+                    let name = function.get("name")?.as_str()?.trim();
+                    if name.is_empty() {
+                        return None;
+                    }
+                    let arguments = match function.get("arguments") {
+                        Some(serde_json::Value::String(text)) => text.clone(),
+                        Some(serde_json::Value::Null) | None => "{}".into(),
+                        Some(other) => other.to_string(),
+                    };
+                    Some(NativeToolCall {
+                        id: call
+                            .get("id")
+                            .and_then(|id| id.as_str())
+                            .filter(|id| !id.is_empty())
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| format!("call_{index}")),
+                        name: name.to_owned(),
+                        arguments,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Streamed tool-call fragments, joined by their index.
+#[derive(Default)]
+struct StreamedToolCalls {
+    calls: Vec<NativeToolCall>,
+}
+
+impl StreamedToolCalls {
+    fn push(&mut self, deltas: &[serde_json::Value]) {
+        for (position, delta) in deltas.iter().enumerate() {
+            let index = delta
+                .get("index")
+                .and_then(|index| index.as_u64())
+                .map(|index| index as usize)
+                .unwrap_or(position);
+            while self.calls.len() <= index {
+                self.calls.push(NativeToolCall::default());
+            }
+            let call = &mut self.calls[index];
+            if let Some(id) = delta.get("id").and_then(|id| id.as_str()).filter(|id| !id.is_empty()) {
+                call.id = id.to_owned();
+            }
+            if let Some(function) = delta.get("function") {
+                if let Some(name) = function.get("name").and_then(|name| name.as_str()) {
+                    call.name.push_str(name);
+                }
+                if let Some(arguments) = function.get("arguments").and_then(|arguments| arguments.as_str()) {
+                    call.arguments.push_str(arguments);
+                }
+            }
+        }
+    }
+
+    fn finish(self) -> Vec<NativeToolCall> {
+        self.calls
+            .into_iter()
+            .enumerate()
+            .filter(|(_, call)| !call.name.trim().is_empty())
+            .map(|(index, mut call)| {
+                if call.id.is_empty() {
+                    call.id = format!("call_{index}");
+                }
+                if call.arguments.trim().is_empty() {
+                    call.arguments = "{}".into();
+                }
+                call
+            })
+            .collect()
+    }
 }
 
 /// Per-request knobs on top of the loaded model's sampling configuration.
@@ -947,6 +1167,10 @@ pub struct RequestOptions {
     pub response_format: Option<serde_json::Value>,
     /// Greedy decoding for machine-readable decisions.
     pub deterministic: bool,
+    /// Tool definitions (OpenAI function format) offered through the
+    /// runtime's tool interface: the chat template renders them in the
+    /// model's own format and the runtime parses calls into `tool_calls`.
+    pub tools: Option<Vec<serde_json::Value>>,
 }
 
 fn sampling_body(
@@ -979,6 +1203,13 @@ fn apply_options(body: &mut serde_json::Value, options: &RequestOptions) {
     }
     if options.deterministic {
         body["temperature"] = serde_json::json!(0);
+    }
+    if let Some(tools) = options.tools.as_ref().filter(|tools| !tools.is_empty()) {
+        body["tools"] = tools.clone().into();
+        body["tool_choice"] = "auto".into();
+        // The host runs one action per step and answers each call before the
+        // next request, so a second call in one reply would go unanswered.
+        body["parallel_tool_calls"] = false.into();
     }
 }
 
@@ -1073,6 +1304,7 @@ pub struct StreamOutcome {
     pub finish_reason: Option<String>,
     pub reasoning_present: bool,
     pub native_tool_calls_present: bool,
+    pub tool_calls: Vec<NativeToolCall>,
     pub early_stopped: bool,
     pub cancelled: bool,
 }
@@ -1089,10 +1321,23 @@ impl StreamOutcome {
             reasoning_present: self.reasoning_present,
             reasoning_tokens: None,
             native_tool_calls_present: self.native_tool_calls_present,
+            tool_calls: self.tool_calls,
             early_stopped: self.early_stopped,
             metrics: self.metrics,
         }
     }
+}
+
+/// A reply as the request log shows it: its text, then each parsed call.
+fn recorded_output(text: &str, calls: &[NativeToolCall]) -> String {
+    let mut output = text.to_owned();
+    for call in calls {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(&format!("[tool call {}] {} {}", call.id, call.name, call.arguments));
+    }
+    output
 }
 
 /// Incremental SSE frame splitter: frames end at a blank line (LF or CRLF).
@@ -1293,6 +1538,7 @@ impl SidecarClient {
         cfg: &InferenceConfig,
         disable_native_thinking: bool,
         structured: bool,
+        tools: Option<&[serde_json::Value]>,
     ) -> Result<AgentCompletion, InferenceError> {
         let mut body = sampling_body(turns, max_tokens, cfg, false);
         apply_options(
@@ -1303,6 +1549,29 @@ impl SidecarClient {
                 // request context. Never append invisible/unaccounted turns here.
                 response_format: structured.then(Self::structured_action_schema),
                 deterministic: false,
+                tools: tools.filter(|_| !structured).map(<[serde_json::Value]>::to_vec),
+            },
+        );
+        self.complete_detailed(body, cfg).await
+    }
+
+    /// One short machine-checked request (the per-model tool check): greedy,
+    /// thinking off, optionally with tools, never streamed.
+    pub async fn probe_turns(
+        &self,
+        turns: &[ChatTurn],
+        max_tokens: u32,
+        cfg: &InferenceConfig,
+        tools: Option<&[serde_json::Value]>,
+    ) -> Result<AgentCompletion, InferenceError> {
+        let mut body = sampling_body(turns, max_tokens, cfg, false);
+        apply_options(
+            &mut body,
+            &RequestOptions {
+                thinking: Some(false),
+                deterministic: true,
+                tools: tools.map(<[serde_json::Value]>::to_vec),
+                ..RequestOptions::default()
             },
         );
         self.complete_detailed(body, cfg).await
@@ -1311,6 +1580,7 @@ impl SidecarClient {
     /// Streaming variant of `agent_chat_turns`: visible deltas reach the
     /// handlers as they arrive, and `should_stop` can end the request the
     /// moment a complete action has been received.
+    #[allow(clippy::too_many_arguments)]
     pub async fn agent_chat_turns_stream(
         &self,
         turns: &[ChatTurn],
@@ -1318,12 +1588,14 @@ impl SidecarClient {
         cfg: &InferenceConfig,
         disable_native_thinking: bool,
         structured: bool,
+        tools: Option<&[serde_json::Value]>,
         handlers: StreamHandlers,
     ) -> Result<AgentCompletion, InferenceError> {
         let options = RequestOptions {
             thinking: disable_native_thinking.then_some(false),
             response_format: structured.then(Self::structured_action_schema),
             deterministic: false,
+            tools: tools.filter(|_| !structured).map(<[serde_json::Value]>::to_vec),
         };
         let outcome = self
             .stream(turns, max_tokens, cfg, &options, handlers)
@@ -1429,9 +1701,10 @@ impl SidecarClient {
         match &result {
             Ok(completion) => {
                 observe_prompt_size(&body, completion.metrics.prompt_tokens);
+                let output = recorded_output(&completion.text, &completion.tool_calls);
                 self.record_request(
                     &body,
-                    Ok((&completion.text, completion.finish_reason.as_deref(), "completed", &completion.metrics)),
+                    Ok((&output, completion.finish_reason.as_deref(), "completed", &completion.metrics)),
                 )
             }
             Err(error) => self.record_request(&body, Err(error)),
@@ -1480,9 +1753,11 @@ impl SidecarClient {
                 finish_reason.as_deref(),
                 Some("tool_calls" | "function_call")
             );
+        let tool_calls = native_calls_in(message.get("tool_calls"));
         let engine = crate::inference::EngineTimings::from_json(&v["timings"]);
         Ok(AgentCompletion {
             text,
+            tool_calls,
             metrics: Metrics {
                 tokens_per_sec: engine
                     .as_ref()
@@ -1595,9 +1870,10 @@ impl SidecarClient {
                 } else {
                     "completed"
                 };
+                let output = recorded_output(&outcome.text, &outcome.tool_calls);
                 self.record_request(
                     &body,
-                    Ok((&outcome.text, outcome.finish_reason.as_deref(), kind, &outcome.metrics)),
+                    Ok((&output, outcome.finish_reason.as_deref(), kind, &outcome.metrics)),
                 );
             }
             Err(error) => self.record_request(&body, Err(error)),
@@ -1624,6 +1900,7 @@ impl SidecarClient {
             ..StreamOutcome::default()
         };
         let mut frames = SseFrames::new();
+        let mut streamed_calls = StreamedToolCalls::default();
         let mut clock = VisibleOutputClock::default();
         let mut usage_seen = false;
         // A stream the server finished ends with a finish_reason and [DONE];
@@ -1673,12 +1950,17 @@ impl SidecarClient {
                         }
                         (handlers.on_reasoning)(reasoning);
                     }
-                    if choice
+                    if let Some(calls) = choice
                         .pointer("/delta/tool_calls")
                         .and_then(|calls| calls.as_array())
-                        .is_some_and(|calls| !calls.is_empty())
+                        .filter(|calls| !calls.is_empty())
                     {
                         outcome.native_tool_calls_present = true;
+                        streamed_calls.push(calls);
+                        if phase != "responding" {
+                            phase = "responding";
+                            (handlers.on_phase)(phase);
+                        }
                     }
                     if let Some(delta) = choice
                         .pointer("/delta/content")
@@ -1722,6 +2004,7 @@ impl SidecarClient {
         // Dropping the response stream closes the connection: llama-server
         // aborts the slot instead of finishing tokens nobody will read.
         drop(byte_stream);
+        outcome.tool_calls = streamed_calls.finish();
         if !outcome.cancelled && !outcome.early_stopped && !done_seen && outcome.finish_reason.is_none() {
             return Err(InferenceError::Sidecar(SidecarFailure::Truncated));
         }
@@ -2614,7 +2897,7 @@ mod tests {
         let turns = [ChatTurn::text("user", "Inspect the fixture")];
         let cfg = InferenceConfig::default();
         let first = client
-            .agent_chat_turns(&turns, 2048, &cfg, false, false)
+            .agent_chat_turns(&turns, 2048, &cfg, false, false, None)
             .await
             .unwrap();
         assert!(first.text.is_empty());
@@ -2628,7 +2911,7 @@ mod tests {
             .unwrap()
             .contains("PRIVATE SYNTHETIC REASONING"));
         let retry = client
-            .agent_chat_turns(&turns, 4096, &cfg, true, false)
+            .agent_chat_turns(&turns, 4096, &cfg, true, false, None)
             .await
             .unwrap();
         assert!(
@@ -2674,6 +2957,7 @@ mod tests {
                 &InferenceConfig::default(),
                 false,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -2726,7 +3010,7 @@ mod tests {
             ..InferenceConfig::default()
         };
         let completion = client
-            .agent_chat_turns(&turns, 4096, &cfg, true, true)
+            .agent_chat_turns(&turns, 4096, &cfg, true, true, None)
             .await
             .unwrap();
         assert_eq!(
@@ -2745,7 +3029,7 @@ mod tests {
             .contains("PRIVATE STRUCTURED TEST REASONING"));
         let plain_turns = [ChatTurn::text("user", "Normal request")];
         client
-            .agent_chat_turns(&plain_turns, 2048, &cfg, false, false)
+            .agent_chat_turns(&plain_turns, 2048, &cfg, false, false, None)
             .await
             .unwrap();
         client.chat_turns(&plain_turns, 512, &cfg).await.unwrap();
@@ -2960,5 +3244,158 @@ mod tests {
             (2000.0 / timing.output_ms as f64 * 10.0).round() / 10.0
         );
         server.abort();
+    }
+}
+
+#[cfg(test)]
+mod native_tool_tests {
+    use super::*;
+
+    fn read_call() -> NativeToolCall {
+        NativeToolCall { id: "call_7".into(), name: "read_file".into(), arguments: r#"{"path":"a.md"}"#.into() }
+    }
+
+    #[test]
+    fn calls_and_results_travel_as_tool_fields() {
+        let call = turn_json(&ChatTurn::assistant_calls("Reading it.", vec![read_call()]));
+        assert_eq!(call["role"], "assistant");
+        assert_eq!(call["content"], "Reading it.");
+        assert_eq!(call["tool_calls"][0]["id"], "call_7");
+        assert_eq!(call["tool_calls"][0]["type"], "function");
+        assert_eq!(call["tool_calls"][0]["function"]["name"], "read_file");
+        assert_eq!(call["tool_calls"][0]["function"]["arguments"], r#"{"path":"a.md"}"#);
+        let result = turn_json(&ChatTurn::tool_result(&read_call(), "1: hello"));
+        assert_eq!(result, serde_json::json!({"role": "tool", "content": "1: hello", "tool_call_id": "call_7", "name": "read_file"}));
+        // Plain turns are unchanged, so cached prompt prefixes still match.
+        assert_eq!(turn_json(&ChatTurn::text("user", "hi")), serde_json::json!({"role": "user", "content": "hi"}));
+    }
+
+    #[test]
+    fn a_template_without_tool_turns_gets_calls_and_results_as_text() {
+        let turns = vec![
+            ChatTurn::text("system", "instructions"),
+            ChatTurn::text("user", "task"),
+            ChatTurn::assistant_calls("", vec![read_call()]),
+            ChatTurn::tool_result(&read_call(), "1: hello"),
+        ];
+        let strict = ChatTemplateShape { system_role: false, strict_alternation: true };
+        let safe = template_safe_turns(&turns, strict);
+        let shape: Vec<(String, String)> = safe.iter().map(|turn| (turn.role.clone(), turn.content.clone())).collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("user".to_string(), "instructions\n\ntask".to_string()),
+                ("assistant".to_string(), r#"Called read_file {"path":"a.md"}"#.to_string()),
+                ("user".to_string(), "Result of read_file:\n1: hello".to_string()),
+            ]
+        );
+        assert!(safe.iter().all(|turn| turn.tool_calls.is_empty() && turn.tool_call_id.is_none()));
+        // A permissive template keeps the fields.
+        assert_eq!(template_safe_turns(&turns, ChatTemplateShape::default()), turns);
+    }
+
+    #[test]
+    fn calls_are_read_from_messages_and_streamed_fragments() {
+        let message = serde_json::json!([
+            {"id": "", "type": "function", "function": {"name": "list_directory", "arguments": {"path": "."}}},
+            {"type": "function", "function": {"name": " ", "arguments": "{}"}},
+            {"id": "x", "type": "function", "function": {"name": "read_file"}},
+        ]);
+        let calls = native_calls_in(Some(&message));
+        assert_eq!(calls.len(), 2, "a call without a name is not a call");
+        assert_eq!((calls[0].id.as_str(), calls[0].arguments.as_str()), ("call_0", r#"{"path":"."}"#));
+        assert_eq!((calls[1].id.as_str(), calls[1].arguments.as_str()), ("x", "{}"));
+
+        let mut streamed = StreamedToolCalls::default();
+        streamed.push(&[serde_json::json!({"index": 0, "id": "call_1", "type": "function", "function": {"name": "write_file", "arguments": ""}})]);
+        streamed.push(&[serde_json::json!({"index": 0, "function": {"arguments": "{\"path\":\"a.txt\","}})]);
+        streamed.push(&[serde_json::json!({"index": 0, "function": {"arguments": "\"content\":\"line \\\"one\\\"\\n\"}"}})]);
+        let calls = streamed.finish();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_1");
+        let args: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(args["content"], "line \"one\"\n");
+    }
+
+    #[test]
+    fn offered_tools_ask_for_one_call_at_a_time_and_never_join_the_constrained_format() {
+        let tools = vec![serde_json::json!({"type": "function", "function": {"name": "read_file"}})];
+        let mut body = serde_json::json!({});
+        apply_options(&mut body, &RequestOptions { tools: Some(tools.clone()), ..RequestOptions::default() });
+        assert_eq!(body["tools"], serde_json::Value::from(tools.clone()));
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["parallel_tool_calls"], false);
+        let mut empty = serde_json::json!({});
+        apply_options(&mut empty, &RequestOptions { tools: Some(vec![]), ..RequestOptions::default() });
+        assert!(empty.get("tools").is_none());
+    }
+
+    #[test]
+    fn the_measured_prompt_counts_call_arguments_and_the_tool_definitions() {
+        let file = "const answer = 42;
+".repeat(200);
+        let body = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": "rules"},
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "write_file", "arguments": file.clone()}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "wrote it"},
+            ],
+            "tools": [{"type": "function", "function": {"name": "write_file", "description": "write a file"}}],
+        });
+        let counted = prompt_chars(&body).expect("no image in this request");
+        let text_only = "rules".len() + "wrote it".len();
+        assert!(
+            counted > text_only + file.len(),
+            "the file text in the call's arguments and the definitions are tokens too: counted {counted}, text alone {text_only}"
+        );
+        // An image carries tokens without characters: the ratio must not learn from it.
+        let with_image = serde_json::json!({
+            "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}]
+        });
+        assert!(prompt_chars(&with_image).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_streamed_native_call_arrives_whole_with_the_tools_sent() {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let requests = captured.clone();
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let requests = requests.clone();
+                async move {
+                    requests.lock().unwrap().push(body);
+                    let frames = [
+                        serde_json::json!({"choices": [{"delta": {"content": "Let me read it."}}]}),
+                        serde_json::json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_9", "type": "function", "function": {"name": "read_file", "arguments": ""}}]}}]}),
+                        serde_json::json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "{\"path\":"}}]}}]}),
+                        serde_json::json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "\"a.md\"}"}}]}}]}),
+                        serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}], "usage": {"prompt_tokens": 10, "completion_tokens": 9}}),
+                    ];
+                    let mut body = String::new();
+                    for frame in frames {
+                        body.push_str(&format!("data: {frame}\n\n"));
+                    }
+                    body.push_str("data: [DONE]\n\n");
+                    ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], body)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let tools = vec![serde_json::json!({"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}})];
+        let completion = SidecarClient::new(format!("http://127.0.0.1:{port}"))
+            .unwrap()
+            .agent_chat_turns_stream(&[ChatTurn::text("user", "read a.md")], 512, &InferenceConfig::default(), true, false, Some(&tools), StreamHandlers::default())
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!(completion.text, "Let me read it.");
+        assert_eq!(completion.tool_calls, vec![NativeToolCall { id: "call_9".into(), name: "read_file".into(), arguments: r#"{"path":"a.md"}"#.into() }]);
+        assert_eq!(completion.finish_reason.as_deref(), Some("tool_calls"));
+        let sent = captured.lock().unwrap()[0].clone();
+        assert_eq!(sent["tools"][0]["function"]["name"], "read_file");
+        assert_eq!(sent["parallel_tool_calls"], false);
     }
 }

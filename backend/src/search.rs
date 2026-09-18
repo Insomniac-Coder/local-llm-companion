@@ -233,7 +233,7 @@ pub async fn extract_page(url: &str, timeout_secs: u64) -> Result<String, String
     Ok(html_to_text(&html))
 }
 
-fn html_to_text(html: &str) -> String {
+pub(crate) fn html_to_text(html: &str) -> String {
     // NB: the `regex` crate has no backreferences — close with alternation.
     let drop = regex::Regex::new(
         r"(?s)<(script|style|nav|footer|header)[^>]*>.*?</(script|style|nav|footer|header)>",

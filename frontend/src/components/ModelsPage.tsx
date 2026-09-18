@@ -112,6 +112,7 @@ export default function ModelsPage({
           <div className="model-list">
             {models.map((m) => (
               <ModelLibraryItem key={m.id} model={m} loadingModel={loadingModel} notify={notify}
+                onToolingChecked={() => void refreshModels()}
                 onLoad={() => onLoad(m.id)}
                 onDelete={() => onDelete(m)}
               />

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  canChangeSessionProject, groupActivity, groupSessionsByProject, lastSessionKey, NO_PROJECT, projectGroupOpen, projectPick, sessionProject,
+  canChangeSessionProject, groupActivity, groupSessionsByProject, lastSessionKey, NO_PROJECT, projectGroupOpen, projectPick, projectRemoval, sessionProject,
 } from './projectSessions.ts';
 
 const projects = [
@@ -101,4 +101,28 @@ test('groups stay as the user left them; otherwise only the current one is open'
   assert.equal(projectGroupOpen({ project: NO_PROJECT, current: false }, { none: true }, false), true);
   assert.equal(projectGroupOpen({ project: 'p-blog', current: false }, { 'p-blog': false }, true), true, 'a filter opens every group with a match');
   assert.equal(lastSessionKey('p-shop'), 'companion.last.code.p-shop');
+});
+
+test('removing a project says what goes with it, and refuses while its work is running', () => {
+  const sessions = [
+    { id: 'a', workspace: 'p1' },
+    { id: 'b', workspace: 'p1' },
+    { id: 'c', workspace: 'p2' },
+    { id: 'd' },
+  ];
+  const quiet = projectRemoval({ project: 'p1', sessions });
+  assert.equal(quiet.tasks, 2);
+  assert.equal(quiet.blocked, false);
+
+  // A task of that project still working blocks it; one elsewhere does not.
+  const running = projectRemoval({ project: 'p1', sessions, activity: new Map([['a', 'tool']]) });
+  assert.equal(running.blocked, true);
+  assert.match(running.reason, /still running/);
+  assert.equal(projectRemoval({ project: 'p1', sessions, activity: new Map([['c', 'tool']]) }).blocked, false);
+
+  // The app busy elsewhere, and the group of sessions without a project.
+  assert.equal(projectRemoval({ project: 'p1', sessions, busy: true }).blocked, true);
+  const none = projectRemoval({ project: '', sessions });
+  assert.equal(none.blocked, true);
+  assert.match(none.reason, /no project/);
 });

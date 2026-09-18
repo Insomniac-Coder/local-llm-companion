@@ -411,6 +411,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/models/load", post(load_model))
         .route("/api/models/unload", post(unload_models))
         .route("/api/models/scan", post(scan_models))
+        .route("/api/models/:id/tooling/check", post(recheck_model_tooling))
         .route(
             "/api/models/downloads",
             get(list_downloads).post(start_download),
@@ -654,6 +655,17 @@ async fn list_models(State(s): State<AppState>) -> Json<Vec<crate::models::Model
         tracing::warn!("{warning}");
     }
     let mut list = s.models.read().await.list();
+    // Each model's tool check (`tooling.json`) and whether it is current for
+    // this runtime and the model's template.
+    let binary = SidecarBinary::detect(&s.runtime_dir()).ok();
+    for model in &mut list {
+        let profile = crate::tooling::read_profile(&crate::tooling::profile_dir(&model.gguf_path()));
+        if let Some(binary) = &binary {
+            let (runtime, template) = tooling_identity(binary, model);
+            model.tooling_state = Some(crate::tooling::profile_state(profile.as_ref(), &runtime, &template));
+        }
+        model.tooling = profile;
+    }
     // Tool support as llama.cpp reported it for each file when it was last
     // loaded; the chat template's own source only until then.
     let st = s.storage.lock().await;
@@ -867,6 +879,125 @@ async fn inference_start(
         .to_string();
     set_progress(&s, &label, "ready", "Inference running and healthy.").await;
     Ok(Json(out))
+}
+
+/// The runtime build and chat template a model's tool check has to match.
+fn tooling_identity(binary: &SidecarBinary, model: &crate::models::ModelMetadata) -> (String, String) {
+    (
+        crate::tooling::runtime_identity(&binary.0),
+        model.template_fingerprint.clone().unwrap_or_else(|| "none".into()),
+    )
+}
+
+/// The tool profile a load uses: the current `tooling.json`, or the result of
+/// checking the model now (written beside it), with a notice for the person
+/// loading when a check ran. Night decision 59.
+async fn tooling_for_load(
+    s: &AppState,
+    model: &crate::models::ModelMetadata,
+    binary: &SidecarBinary,
+    base_url: &str,
+    cfg: &crate::inference::InferenceConfig,
+) -> (Option<crate::tooling::ToolingProfile>, Option<String>) {
+    let (runtime, template) = tooling_identity(binary, model);
+    let dir = crate::tooling::profile_dir(&cfg.model_path);
+    let existing = crate::tooling::read_profile(&dir);
+    let state = crate::tooling::profile_state(existing.as_ref(), &runtime, &template);
+    if state == crate::tooling::ProfileState::Current {
+        return (existing, None);
+    }
+    set_progress(
+        s,
+        &model.id,
+        "checking_tools",
+        "Checking how this model calls tools. This happens on its first load and takes a few seconds.",
+    )
+    .await;
+    let outcome = run_tool_check(s, model, base_url, cfg, runtime, template).await;
+    let why = if state == crate::tooling::ProfileState::Stale {
+        "checked again because the check, the runtime or the model's chat template changed"
+    } else {
+        "first load"
+    };
+    match outcome {
+        Ok(profile) => {
+            let notice = format!(
+                "Tool check ({why}, {:.1} s): this model {}.",
+                profile.duration_ms as f64 / 1000.0,
+                profile.summary()
+            );
+            (Some(profile), Some(notice))
+        }
+        Err(error) => (
+            None,
+            Some(format!(
+                "The tool check could not run ({error}). Code sessions use the app's text format until it does; use Check again in the model's details."
+            )),
+        ),
+    }
+}
+
+/// Run the checks on a loaded model and save the result beside it.
+async fn run_tool_check(
+    s: &AppState,
+    model: &crate::models::ModelMetadata,
+    base_url: &str,
+    cfg: &crate::inference::InferenceConfig,
+    runtime: String,
+    template: String,
+) -> Result<crate::tooling::ToolingProfile, String> {
+    let client = SidecarClient::new(base_url.to_string())
+        .map_err(|error| error.to_string())?
+        .with_recorder(request_recorder(s, "", &format!("tool-check-{}", model.id), "tool_check"));
+    let profile = crate::tooling::check(&client, cfg, runtime, template, cfg.template_caps).await?;
+    let dir = crate::tooling::profile_dir(&cfg.model_path);
+    if let Err(error) = crate::tooling::write_profile(&dir, &profile) {
+        // The run still uses the result; the next load checks again.
+        tracing::warn!("could not save {} for {}: {error}", crate::tooling::PROFILE_FILE, model.id);
+    }
+    tracing::info!(model = %model.id, method = ?profile.method, can_write = profile.can_write, ms = profile.duration_ms, "tool check finished");
+    Ok(profile)
+}
+
+/// Check again how the loaded model calls tools (the model's details).
+async fn recheck_model_tooling(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    guard_agent_running(&s, false).await?;
+    let model = s
+        .models
+        .read()
+        .await
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| ApiError::not_found(format!("unknown model '{id}'")))?;
+    let loaded = s.models.read().await.current().map(|current| current.id.clone());
+    let running = {
+        let mut llama = s.llama.write().await;
+        if llama.is_running() {
+            llama.running.as_ref().map(|running| (running.base_url.clone(), running.cfg.clone()))
+        } else {
+            None
+        }
+    };
+    let Some((base_url, cfg)) = running.filter(|_| loaded.as_deref() == Some(id.as_str())) else {
+        return Err(ApiError::bad(
+            "this model is not loaded",
+            "The check runs on the loaded model. Load this model, then check again.",
+        ));
+    };
+    let _update = s.runtime_update.lock().await;
+    let binary = SidecarBinary::detect(&s.runtime_dir())
+        .map_err(|error| ApiError::bad(format!("runtime not found: {error}"), "Build the runtime first."))?;
+    let (runtime, template) = tooling_identity(&binary, &model);
+    let profile = run_tool_check(&s, &model, &base_url, &cfg, runtime, template)
+        .await
+        .map_err(|error| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, format!("the tool check could not run: {error}"), "Try again when the model is ready."))?;
+    if let Some(running) = s.llama.write().await.running.as_mut() {
+        running.cfg.tooling = Some(profile.clone());
+    }
+    Ok(Json(serde_json::json!({"tooling": profile, "summary": format!("This model {}.", profile.summary())})))
 }
 
 #[derive(Deserialize, Default)]
@@ -1894,6 +2025,16 @@ async fn start_sidecar(
                     tracing::warn!("could not remember the template capabilities: {error}");
                 }
             }
+            // How this model calls tools: its check from `tooling.json`, or a
+            // new check now when it has none for this runtime and template.
+            let tooling_notice = match model.as_ref() {
+                Some(model) => {
+                    let (profile, notice) = tooling_for_load(s, model, &binary, &base_url, &sidecar.cfg).await;
+                    sidecar.cfg.tooling = profile;
+                    notice
+                }
+                None => None,
+            };
             let cfg = sidecar.cfg.clone();
             s.llama.write().await.running = Some(sidecar);
             s.llama.write().await.last_error = None;
@@ -1914,6 +2055,9 @@ async fn start_sidecar(
                     // Everything the person loading the model should be told.
                     "notices": notice.iter().cloned().chain(context_notice).chain(chat_format_notice).collect::<Vec<String>>(),
                     "runtime_policy": cfg.runtime_policy,
+                    // The result of a tool check this load ran, if it ran one.
+                    "tooling_notice": tooling_notice,
+                    "tooling": cfg.tooling,
                 }),
             )
         }
@@ -7129,14 +7273,62 @@ async fn get_workspace(
     }
 }
 
+#[derive(serde::Deserialize, Default)]
+struct RemoveProjectQuery {
+    /// `tasks=delete` removes the project's chats with it. Anything else keeps
+    /// them: they report a missing project until they are linked to another.
+    #[serde(default)]
+    tasks: String,
+}
+
+/// Remove a project from the app. The folder on disk is never touched: this
+/// deletes the app's own record of it, and (on request) the chats that work
+/// in it, whose transcripts would otherwise point at a project that is gone.
 async fn delete_workspace(
     State(s): State<AppState>,
     Path(id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<RemoveProjectQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // Conversations keep their history; only the link target disappears.
-    // (Linked chats report "workspace missing" until relinked.)
-    match s.storage.lock().await.delete_workspace(&id) {
-        Ok(true) => Ok(Json(serde_json::json!({"deleted": id}))),
+    let with_tasks = query.tasks == "delete";
+    let storage = s.storage.lock().await;
+    if storage.get_workspace(&id).ok().flatten().is_none() {
+        return Err(ApiError::not_found("unknown workspace"));
+    }
+    let chats = storage
+        .conversations_in_workspace(&id)
+        .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
+    // A run still working in one of these chats would keep writing to a
+    // conversation that is being deleted underneath it.
+    let working: Vec<String> = s
+        .agents
+        .read()
+        .await
+        .summaries()
+        .into_iter()
+        .filter(|run| run.state.is_active() && chats.contains(&run.conversation_id))
+        .map(|run| run.task.chars().take(60).collect())
+        .collect();
+    if let Some(task) = working.first() {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "a task is still running in this project",
+            format!("Stop the task {task:?} before removing the project."),
+        ));
+    }
+    let mut removed_chats = 0usize;
+    if with_tasks {
+        for chat in &chats {
+            if storage.delete_conversation(chat).unwrap_or(false) {
+                removed_chats += 1;
+            }
+        }
+    }
+    match storage.delete_workspace(&id) {
+        Ok(true) => Ok(Json(serde_json::json!({
+            "deleted": id,
+            "chats": chats.len(),
+            "chats_deleted": removed_chats,
+        }))),
         Ok(false) => Err(ApiError::not_found("unknown workspace")),
         Err(e) => Err(ApiError::internal(format!("storage error: {e}"))),
     }
@@ -8890,12 +9082,6 @@ async fn put_settings(
         return Err(ApiError::bad(
             "unknown KV cache precision",
             "Use f16 (compatibility) or q8_0 (half the cache memory).",
-        ));
-    }
-    if next.agent.max_iterations == 0 || next.agent.max_iterations > 200 {
-        return Err(ApiError::bad(
-            "max_iterations out of range",
-            "Use 1–200 (default 30, §29).",
         ));
     }
     if !["automatic", "low", "medium", "high"].contains(&next.reasoning.budget.as_str()) {
@@ -13099,6 +13285,97 @@ Would you like me to fix it?")]));
         let kept = state.storage.lock().await.get_conversation(&conversation).unwrap().unwrap();
         assert_eq!(kept.workspace, second);
         assert_eq!(kept.title, "Renamed");
+    }
+
+    #[tokio::test]
+    async fn removing_a_project_can_take_its_tasks_with_it_and_never_the_folder() {
+        let state = AppState::new_stub();
+        let (a, kept_project) = seed_workspace(router(state.clone()), "Kept").await;
+        let (a, gone_project) = seed_workspace(a, "Gone").await;
+        let folder = state
+            .storage
+            .lock()
+            .await
+            .get_workspace(&gone_project)
+            .unwrap()
+            .unwrap()
+            .path;
+        let session = |workspace: &str, title: &str| {
+            let a = a.clone();
+            let (workspace, title) = (workspace.to_string(), title.to_string());
+            async move {
+                let response = a
+                    .oneshot(json_req(
+                        "POST",
+                        "/api/conversations",
+                        serde_json::json!({"title": title, "model_id": "", "mode": "code", "workspace": workspace}),
+                    ))
+                    .await
+                    .unwrap();
+                body_json(response).await["id"].as_str().unwrap().to_string()
+            }
+        };
+        let first = session(&gone_project, "First task").await;
+        let second = session(&gone_project, "Second task").await;
+        let elsewhere = session(&kept_project, "Another project's task").await;
+
+        // By default the chats stay: they report a missing project until relinked.
+        let response = a
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/workspaces/{kept_project}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["chats"], 1, "{body}");
+        assert_eq!(body["chats_deleted"], 0, "{body}");
+        assert!(state.storage.lock().await.get_conversation(&elsewhere).unwrap().is_some());
+
+        // Asked to, it takes them with it - and only them.
+        let response = a
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/workspaces/{gone_project}?tasks=delete"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["chats"], 2, "{body}");
+        assert_eq!(body["chats_deleted"], 2, "{body}");
+        let storage = state.storage.lock().await;
+        assert!(storage.get_conversation(&first).unwrap().is_none());
+        assert!(storage.get_conversation(&second).unwrap().is_none());
+        assert!(storage.get_conversation(&elsewhere).unwrap().is_some(), "another project's task is untouched");
+        assert!(storage.get_workspace(&gone_project).unwrap().is_none());
+        drop(storage);
+
+        // The user's own files are never what "remove project" means.
+        assert!(std::path::Path::new(&folder).is_dir(), "the folder on disk stays: {folder}");
+
+        // A project that is already gone says so rather than pretending.
+        let response = a
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/workspaces/{gone_project}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

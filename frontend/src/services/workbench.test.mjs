@@ -62,6 +62,10 @@ test('Shift+Tab cycles Ask, Accept edits and Plan, and never passes through Auto
   assert.equal(nextPermissionMode('accept_edits'), 'plan');
   assert.equal(nextPermissionMode('plan'), 'ask');
   assert.equal(nextPermissionMode('auto'), 'ask');
+  // A read-only model (its tool check) leaves only Ask to cycle to.
+  assert.equal(nextPermissionMode('ask', ['ask']), 'ask');
+  assert.equal(nextPermissionMode('auto', ['ask']), 'ask');
+  assert.equal(nextPermissionMode('ask', ['ask', 'plan']), 'plan');
   assert.equal(nextPermissionMode('unknown'), 'ask');
 });
 

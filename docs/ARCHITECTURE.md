@@ -21,7 +21,11 @@ Source of truth: `Local_LLM_PC_Companion_Design.md` (§§1–107).
 | Context Manager (§21) | — | Stage 6 |
 | Conversation Manager (§20) | `storage.rs` | edit+truncate, attachments, tool audit |
 | Agent Engine (§28–30) | `agent.rs` + `agent_runner.rs` | LLM loop, approvals, registry, SSE tail |
-| Tool Registry (§60) | `tools.rs` + `terminal.rs` | real write/patch/search/delete, timeout cmds |
+| Tool Registry (§60) | `tools.rs` + `terminal.rs` | real write/patch/search/delete, timed and background commands |
+| Page preview (§119) | `preview.rs` | loopback page: status, rendered text, console, layout, picture |
+| Browser control | `cdp.rs` | DevTools protocol over a hand-written WebSocket |
+| Project map | `outline.rs` | a file's definitions with line numbers, a folder's files with sizes |
+| Project check | `project_check.rs` | finds the project's own build and tests, reports parsed problems |
 | Permission Manager (§25) | `permissions.rs` | RiskLevel + AutonomyLevel gate |
 | Workspace Manager (§27) | `workspace.rs` | traversal-proof `resolve()` |
 | Hardware Monitor (§11/47) | `hardware.rs` | sysinfo CPU/RAM; GPU stubbed |
@@ -192,6 +196,38 @@ Source of truth: `Local_LLM_PC_Companion_Design.md` (§§1–107).
   never journaled), stop at the first complete action object, prune the
   transcript by estimated size (release old tool-result bodies first), run
   tools on the blocking pool, and honour the run's `reasoning` flag.
+- Tool calling per model (2026-09-17, night decision 59, `tooling.rs`). At a
+  model's first load (and again when the runtime build, the model's chat
+  template or the check itself changes) `tooling::check` offers a listing
+  tool and a file write through the runtime's tool interface (OpenAI-style
+  `tools`; the template renders them in the model's own format and the
+  runtime's parser returns `tool_calls`), and requires a parsed call and a
+  small code file whose text arrives byte for byte. If either fails, the same
+  two checks run in the text action format below. The result is written to
+  `models/<folder>/tooling.json` (git-ignored): method native | text | none and
+  `can_write`. The load returns `tooling_notice`; `GET /api/models` adds
+  `tooling` and `tooling_state` (current | stale | unchecked); `POST
+  /api/models/:id/tooling/check` re-checks the loaded model.
+  - Native method: the agent sends `tools` (only those the run may use),
+    `tool_choice: auto`, `parallel_tool_calls: false`, and a system prompt
+    without the text tool list or envelope rules. The first parsed call is the
+    step's action; the transcript keeps it as an assistant turn with
+    `tool_calls` only (the note written before it is journaled, not kept: a
+    template may render it after the result, where it read as the next step
+    and the call was repeated) and its result as a `tool` turn with
+    `tool_call_id`, so every
+    later request renders history in the model's own format. Every outcome of
+    a call (result, refusal, denial, blocked in read-only) answers it as a tool
+    turn. `repair_tool_pairs` runs after pruning and compaction so no call or
+    result is left alone. File text in call arguments stays verbatim (a note
+    in the content argument was copied as file content by a small model) and
+    is released oldest-first only when the window is short, like old results.
+    Templates that demand strict alternation get calls and results flattened
+    to text.
+  - `can_write` false: the run is read-only whatever the permission mode
+    (writes answered with the reason), and the UI offers only Ask.
+  - Method none (or no current check with a template the runtime reports
+    without tools): the schema-constrained envelope from the first step.
 - Action parsing (`agent_runner::locate_action`) accepts every shape local
   models produce: `tool`/`json`/bare fences (the latter two only for a
   registered tool name), an unterminated fence when the turn ends after the
@@ -203,7 +239,9 @@ Source of truth: `Local_LLM_PC_Companion_Design.md` (§§1–107).
 - Recovery and budgets (`ActionResponsePolicy`, `agent_progress`): unreadable
   reply → native retry with reminder → schema-constrained envelope → stop;
   six consecutive non-successful steps end a run, identical repeats warn at
-  two and stop at five, any successful action resets both. Every tool error
+  two and stop at five, any successful action resets both. The same call
+  failing three times stops the run only with no successful file change in
+  between (a test failing again after a fix is new evidence). Every tool error
   echoes the received arguments; `edit_file` reports the closest region for a
   missing `old` and the count for an ambiguous one; a missing `path` names the
   last file; rejected completion claims are journaled as `thought` events.
@@ -220,6 +258,81 @@ Source of truth: `Local_LLM_PC_Companion_Design.md` (§§1–107).
   evidence than the window holds; the repeat stop fails a run only when
   nothing changed between checks, and a check repeating itself after changes
   ends the run completed with its finding quoted.
+- A run is ended by its own lack of progress, not by a step count.
+  `agent_progress::LoopWatch` counts steps that changed nothing in the project
+  and how many of them repeat an earlier inspection: at 8 steps with 3 repeats
+  the model is shown what it has already inspected and asked for the next
+  change, and at 18 with 6 — or 30 steps with nothing changed at all — the run
+  stops with its work kept. A run that may not write (plan, question) is judged
+  on repetition alone. `ProgressGuard` still ends a run after six steps with no
+  successful tool and after five identical results in a row.
+  There is no step ceiling: a count cannot tell a long build from a loop, and
+  real work runs to hundreds of steps (owner, 2026-09-18). The run ends on
+  evidence or on the user; `max_iterations` is gone from settings, the API and
+  the UI, and an old settings file's key is ignored.
+- Commands: `terminal::run` collects both streams as they arrive and kills the
+  whole process tree at a timeout, so what a command printed before it was
+  stopped is still reported (killing the shell alone left the program running
+  and the pipe open, and every timed-out command came back empty). A command
+  meant to keep running goes to the background instead —
+  `execute_command {"background": true}` watches it settle and returns an id,
+  `{"background_id": N}` reads it later, `"stop": true` ends it — and every
+  background command a run started is stopped when the run ends. An unknown
+  command is answered with this shell's own equivalent.
+- `preview_page {"url": "http://localhost:5173"}` waits for the server, then
+  drives the installed browser through the DevTools protocol (`cdp.rs`, a
+  hand-written WebSocket client: handshake, masked frames out, unmasked frames
+  in). It reports the status line, title, the text a reader would see, what the
+  page logged (from `Runtime.consoleAPICalled`, `Runtime.exceptionThrown` and
+  `Log.entryAdded`), and **where things ended up**: window and page size, how
+  far the page scrolls sideways and what is too wide, what sits below the first
+  screen, what is outside the window, and boxes with content but no size. A
+  page that renders perfectly below the fold is the failure reading its text
+  can never catch. A screenshot is taken through the same session and stored
+  in the conversation's Artifacts panel, because the user can see it even
+  though a local model cannot. If the browser cannot be driven on a PC, the
+  older dump-the-page path still answers.
+  Loopback addresses only. Offered on windows of 16K or more, where the report
+  fits beside the work; the same threshold decides whether the prompt asks for
+  HANDOFF.md and MEMORY.md to be kept in the project.
+- Editing by line number (`replace_lines {path, from, to, text, expect?}`) sits
+  beside `edit_file`. Exact-text replacement asks a model to reproduce code
+  byte for byte, which is what every run that died on 2026-09-18 got wrong;
+  the line numbers are already in front of it, printed by `read_file`. The
+  optional `expect` carries the first line being replaced and refuses when it
+  does not match, because a number that has moved would otherwise destroy the
+  wrong lines. The result says how the numbering shifted.
+- `outline {path}` answers "what is in here" without the text: a file's
+  definitions with their line numbers (which feed `replace_lines`), or a
+  folder's files with their sizes and line counts. Reading whole files to find
+  things is what filled the window in the runs that got stuck.
+- `project_check {path?}` finds what the project is (package.json scripts,
+  Cargo.toml, go.mod, Python tests), runs its build and then its tests, and
+  reports the problems as `file:line: message`, deduplicated and capped. A
+  failed build stops it before the tests. A toolchain this PC does not have is
+  named as missing (looked for on PATH, `.exe`/`.cmd`/`.bat` on Windows,
+  Python under python/python3/py) rather than run; a folder that is not a
+  project is told so.
+- The project's own instructions reach code sessions: the first of AGENTS.md,
+  CLAUDE.md, MUSE.md or PROJECT.md is appended to the system prompt, cut to the
+  window's share, and framed as how to work in this project — explicitly not as
+  something that changes the host's rules or what needs approval, so a file in
+  a repository cannot talk its way past them.
+- `changes` lists what the run has created, changed or deleted with each
+  file's size now. The host kept that record for compaction from the start; a
+  run could not ask for it, so a model whose earlier turns were summarized away
+  could not tell what it had already built without reading the folder again.
+- `remember {"note": "..."}` keeps up to 12 short facts in the task turn, which
+  pruning and compaction never touch, and they are re-attached after each
+  compaction. The summary written at a compaction is fresh prose every time, so
+  a fact the model worked out and did not repeat in it was lost with the turns
+  it came from; this is the part of its context the model itself chooses to
+  hold on to. `web_search` and `remember` are carried out by the run, not by the
+  tool registry (`tools::runs_in_the_agent`).
+- A follow-up run in a session that already did work starts from that work: the
+  host's record (rebuilt from `tool_executions`) and the project's own
+  HANDOFF.md and MEMORY.md are appended to its task turn, because the previous
+  run's working transcript went with the run.
 - Tool offer per task: `create_document` only when the task names a document
   type, `open_path` and window-opening shell commands (`start`, `explorer`,
   `xdg-open`, `Start-Process`…) only when it asks for something to be opened;
@@ -236,6 +349,14 @@ Source of truth: `Local_LLM_PC_Companion_Design.md` (§§1–107).
   when it fits under 70% of the room. Applied only when it frees a tenth of
   the room; repeated only after a sixth of the room of growth. Pruning
   (`pruning_reserve` = a quarter of the window) is the safety net behind it.
+  Compaction is decided before anything is released: releasing old results is
+  free and a note costs a model call, so the free step used to run first and
+  dropped usage back under the threshold every time, which meant no run ever
+  wrote a note (night decision 61). The note carries the host's record of
+  completed actions **and of every place the run has already looked** (a line
+  per file read, folder listed, search and preview), so a released file is not
+  read again; the note left in a released result says so instead of inviting a
+  repeat.
   Chat: before a reply, saved history at the threshold of
   `RequestContext::history_room_chars` is folded into the conversation
   summary in window-sized chunks (`fold_conversation_summary`), keeping what
@@ -252,6 +373,15 @@ Source of truth: `Local_LLM_PC_Companion_Design.md` (§§1–107).
   (registered tools only, never on a truncated reply). The prompt states the
   reply budget in characters (`reply_char_budget`) and directs longer files to
   `write_file` then `append_file`, and names the shell commands run through.
+- The estimate the thresholds use is measured against what the runtime
+  reports, and counts everything a request carries: message text, each call's
+  `arguments` (where a file's text travels) and the tool definitions. Counting
+  the text alone learned 0.9–1.4 characters per token where requests held
+  3.0–3.6, which made every estimate two to three times the real size and
+  released file text at a third of the real usage (night decision 61).
+- A write whose text is the host's own release note is refused: a model that
+  saw its earlier write rewritten that way copied the note back as content,
+  and two components were written as 169-byte placeholder files.
 - Transcript growth per step is bounded so the compaction threshold is not
   crossed before it is checked: a tool result keeps at most a fifth of the
   room (`tool_output_chars`), and a file body the host verified on disk is

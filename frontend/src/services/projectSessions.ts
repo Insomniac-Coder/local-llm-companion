@@ -154,3 +154,33 @@ export function projectGroupOpen(group: { project: string; current: boolean }, s
   const key = group.project || 'none';
   return saved[key] ?? group.current;
 }
+
+/** What removing a project would take with it, and whether it can be done now. */
+export function projectRemoval({
+  project,
+  sessions,
+  busy = false,
+  activity,
+}: {
+  project: string;
+  sessions: readonly SessionLike[];
+  busy?: boolean;
+  activity?: ReadonlyMap<string, string | undefined>;
+}): { tasks: number; blocked: boolean; reason: string } {
+  const mine = sessions.filter((session) => (session.workspace ?? '') === project);
+  const working = activity
+    ? mine.some((session) => ['thinking', 'tool', 'waiting'].includes(activity.get(session.id) ?? ''))
+    : false;
+  const blocked = busy || working || !project;
+  return {
+    tasks: mine.length,
+    blocked,
+    reason: !project
+      ? 'These tasks have no project to remove.'
+      : working
+        ? 'A task in this project is still running. Stop it first.'
+        : busy
+          ? 'Wait for the current work to finish.'
+          : '',
+  };
+}

@@ -103,8 +103,26 @@ pub fn registry() -> Vec<ToolDescriptor> {
         },
         ToolDescriptor {
             name: "edit_file",
-            description: "Replace exact existing text: old (copied from read_file, without the line-number labels) becomes new. old must occur once; add surrounding lines to make it unique. A unified-diff patch argument is also accepted.",
+            description: "Replace exact existing text: old (copied from the file, without the line-number labels) becomes new and must occur once. replace_lines is easier when you know the line numbers.",
             risk: RiskLevel::Moderate,
+            permission_required: "explicit",
+        },
+        ToolDescriptor {
+            name: "replace_lines",
+            description: "Replace lines by number, as read_file shows them",
+            risk: RiskLevel::Moderate,
+            permission_required: "explicit",
+        },
+        ToolDescriptor {
+            name: "outline",
+            description: "What a file defines, or what a folder holds",
+            risk: RiskLevel::Safe,
+            permission_required: "none",
+        },
+        ToolDescriptor {
+            name: "project_check",
+            description: "Run this project's own build and tests and report what failed",
+            risk: RiskLevel::Dangerous,
             permission_required: "explicit",
         },
         ToolDescriptor {
@@ -123,6 +141,24 @@ pub fn registry() -> Vec<ToolDescriptor> {
             name: "execute_command",
             description: "Run a shell command with captured output",
             risk: RiskLevel::Dangerous,
+            permission_required: "explicit",
+        },
+        ToolDescriptor {
+            name: "changes",
+            description: "Every file this task has created, changed or deleted, with its size now",
+            risk: RiskLevel::Safe,
+            permission_required: "none",
+        },
+        ToolDescriptor {
+            name: "remember",
+            description: "Keep one short fact in front of you (it survives summarizing)",
+            risk: RiskLevel::Safe,
+            permission_required: "none",
+        },
+        ToolDescriptor {
+            name: "preview_page",
+            description: "Open a page this project serves; reports what it renders and logs",
+            risk: RiskLevel::Moderate,
             permission_required: "explicit",
         },
         ToolDescriptor {
@@ -173,16 +209,45 @@ pub fn registry() -> Vec<ToolDescriptor> {
 pub fn risk_of(name: &str) -> RiskLevel {
     match name {
         "execute_command" | "delete_file" => RiskLevel::Dangerous,
-        "write_file" | "append_file" | "edit_file" | "web_search" | "create_document"
-        | "git_commit" | "open_path" => RiskLevel::Moderate,
+        "project_check" => RiskLevel::Dangerous,
+        "write_file" | "append_file" | "edit_file" | "replace_lines" | "web_search"
+        | "create_document" | "git_commit" | "open_path" | "preview_page" => RiskLevel::Moderate,
         _ => RiskLevel::Safe,
     }
 }
 
+/// Tools the run itself carries out rather than the registry: a web search
+/// needs the async request path and its own consent, and a kept note belongs
+/// to the run's own context. `execute` refuses both by name.
+pub fn runs_in_the_agent(name: &str) -> bool {
+    matches!(name, "web_search" | "remember" | "changes" | "preview_page")
+}
+
 /// Tools that write files inside the project: what Accept edits mode runs
 /// without asking. Deletion is not an edit.
+/// The note the host leaves in place of file text it released from a model's
+/// working context. A model that sees its own earlier write rewritten this
+/// way can send the note back as the file's content: two components were
+/// written as 169-byte files holding this sentence, and the next run spent
+/// four steps trying to understand them (night decision 61).
+pub const RELEASED_NOTE: &str = "[Released:";
+
+/// Whether this text is the host's own release note rather than file text.
+pub fn is_released_note(text: &str) -> bool {
+    text.trim_start().starts_with(RELEASED_NOTE)
+}
+
+fn reject_released_note(tool: &str, text: &str) -> Result<(), ToolError> {
+    if is_released_note(text) {
+        return Err(ToolError::InvalidArgs(format!(
+            "{tool} was given the host's context note instead of file text. That note replaced text released from your working context; it is not the file. Send the complete text the file should hold, or read the file first if you need what is in it."
+        )));
+    }
+    Ok(())
+}
+
 pub fn is_file_edit(tool: &str) -> bool {
-    matches!(tool, "write_file" | "append_file" | "edit_file" | "create_document")
+    matches!(tool, "write_file" | "append_file" | "edit_file" | "replace_lines" | "create_document")
 }
 
 /// A file edit inside a `.git` folder. Git runs commands named there (hooks,
@@ -207,8 +272,12 @@ pub fn required_args(tool: &str) -> &'static [(&'static str, bool)] {
         "present_plan" => &[("plan", false)],
         "write_file" | "append_file" => &[("path", true), ("content", false)],
         "edit_file" => &[("path", true), ("old", true), ("new", false)],
+        "replace_lines" => &[("path", true), ("from", true), ("to", true), ("text", false)],
+        "outline" => &[("path", true)],
         "search_text" => &[("query", true)],
         "execute_command" => &[("command", true)],
+        "preview_page" => &[("url", true)],
+        "remember" => &[("note", true)],
         "git_commit" => &[("message", true)],
         _ => &[],
     }
@@ -226,6 +295,7 @@ pub fn chat_safe(name: &str) -> bool {
         "list_directory"
             | "read_file"
             | "search_text"
+            | "outline"
             | "system_info"
             | "list_processes"
             | "create_document"
@@ -342,6 +412,7 @@ pub fn execute(
                     "content too large ({} bytes, max {MAX_FILE_BYTES})", content.len()
                 )));
             }
+            reject_released_note("write_file", content)?;
             let p = ws.resolve(rel).map_err(ToolError::Workspace)?;
             if let Some(parent) = p.parent() {
                 std::fs::create_dir_all(parent).map_err(ToolError::Io)?;
@@ -394,6 +465,7 @@ pub fn execute(
                     "file would exceed {MAX_FILE_BYTES} bytes ({existing} already written)"
                 )));
             }
+            reject_released_note("append_file", content)?;
             if let Some(parent) = p.parent() {
                 std::fs::create_dir_all(parent).map_err(ToolError::Io)?;
             }
@@ -439,6 +511,7 @@ pub fn execute(
                 let new = req.args.get("new").and_then(|v| v.as_str()).ok_or_else(|| {
                     ToolError::InvalidArgs(USAGE.into())
                 })?;
+                reject_released_note("edit_file", new)?;
                 let replace_all = req.args.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
                 apply_replacement(&original, old, new, replace_all).map_err(ToolError::InvalidArgs)?
             } else if let Some(patch) = req.args.get("patch").and_then(|v| v.as_str()) {
@@ -452,6 +525,98 @@ pub fn execute(
                 original.len(),
                 updated.len()
             )))
+        }
+        // Editing by line number: a model that has just read a file with its
+        // lines labelled has the numbers in front of it, where reproducing the
+        // old text byte for byte is what it keeps getting wrong (owner,
+        // 2026-09-18; every run stopped that day died on edit_file arguments).
+        "replace_lines" => {
+            require_approved(req, approved, "File modifications need explicit approval.")?;
+            const USAGE: &str = "replace_lines requires {\"path\": \"...\", \"from\": 12, \"to\": 18, \"text\": \"the replacement lines\"} - the line numbers read_file shows, and text may be empty to delete those lines";
+            let rel = req.args.get("path").and_then(|v| v.as_str()).ok_or_else(|| ToolError::InvalidArgs(USAGE.into()))?;
+            let from = req.args.get("from").and_then(|v| v.as_u64()).ok_or_else(|| ToolError::InvalidArgs(USAGE.into()))? as usize;
+            let to = req.args.get("to").and_then(|v| v.as_u64()).map(|to| to as usize).unwrap_or(from);
+            let text = req.args.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            reject_released_note("replace_lines", text)?;
+            if from == 0 {
+                return Err(ToolError::InvalidArgs("line numbers start at 1".into()));
+            }
+            if to < from {
+                return Err(ToolError::InvalidArgs(format!("to ({to}) is before from ({from})")));
+            }
+            let p = ws.resolve(rel).map_err(ToolError::Workspace)?;
+            let original = std::fs::read_to_string(&p).map_err(|error| missing_path(ws, rel, error))?;
+            let lines: Vec<&str> = original.lines().collect();
+            if from > lines.len() {
+                return Err(ToolError::InvalidArgs(format!(
+                    "{rel} has {} lines; from {from} is past its end. Read it again for the current numbers.",
+                    lines.len()
+                )));
+            }
+            let last = to.min(lines.len());
+            // An optional anchor: the first line being replaced, as the model
+            // read it. Line numbers move after every edit, and a wrong number
+            // silently destroys the wrong lines.
+            if let Some(expect) = req.args.get("expect").and_then(|v| v.as_str()).map(str::trim).filter(|text| !text.is_empty()) {
+                let actual = lines[from - 1].trim();
+                if actual != expect {
+                    return Err(ToolError::InvalidArgs(format!(
+                        "line {from} of {rel} is {actual:?}, not {expect:?}. Read the file again: the numbers have moved."
+                    )));
+                }
+            }
+            let mut updated: Vec<&str> = Vec::with_capacity(lines.len());
+            updated.extend_from_slice(&lines[..from - 1]);
+            let replacement: Vec<&str> = if text.is_empty() { Vec::new() } else { text.lines().collect() };
+            updated.extend_from_slice(&replacement);
+            updated.extend_from_slice(&lines[last..]);
+            let mut body = updated.join("\n");
+            if original.ends_with('\n') && !body.is_empty() {
+                body.push('\n');
+            }
+            if body.len() as u64 > MAX_FILE_BYTES {
+                return Err(ToolError::InvalidArgs(format!("file would exceed {MAX_FILE_BYTES} bytes")));
+            }
+            std::fs::write(&p, &body).map_err(ToolError::Io)?;
+            let on_disk = std::fs::read_to_string(&p).map_err(ToolError::Io)?;
+            if on_disk != body {
+                return Err(ToolError::Io(std::io::Error::other(format!("{rel} did not read back as written"))));
+            }
+            Ok(ToolResult::ok(format!(
+                "replaced lines {from}-{last} of {rel} ({} line(s) -> {} line(s)); it is now {} lines {WRITE_VERIFIED}. Line numbers after {from} have moved: read it again before editing by number.",
+                last - from + 1,
+                replacement.len(),
+                updated.len()
+            )))
+        }
+        "outline" => {
+            let rel = req.args.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
+                ToolError::InvalidArgs("outline requires {\"path\": \"a file or folder; \\\".\\\" for the workspace root\"}".into())
+            })?;
+            let p = ws.resolve(rel).map_err(ToolError::Workspace)?;
+            if !p.exists() {
+                return Err(ToolError::InvalidArgs(format!("no such path {rel:?} in the workspace")));
+            }
+            crate::outline::outline(&p, rel)
+                .map(ToolResult::ok)
+                .map_err(ToolError::InvalidArgs)
+        }
+        // Running the project's own build and tests is running its code, so it
+        // carries the same weight as any other command.
+        "project_check" => {
+            require_approved(req, approved, "Running the project's build and tests needs explicit approval.")?;
+            let rel = req.args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+            let root = ws.resolve(rel).map_err(ToolError::Workspace)?;
+            if !root.is_dir() {
+                return Err(ToolError::InvalidArgs(format!("{rel} is not a folder")));
+            }
+            let timeout = req
+                .args
+                .get("timeout_secs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_else(|| crate::project_check::default_timeout().as_secs())
+                .clamp(5, crate::terminal::MAX_TIMEOUT_SECS);
+            Ok(ToolResult::ok(crate::project_check::run(&root, timeout)))
         }
         "delete_file" => {
             require_approved(req, approved, "File deletion needs explicit approval.")?;
@@ -480,6 +645,31 @@ pub fn execute(
         }
         "execute_command" => {
             require_approved(req, approved, "Command execution needs explicit approval.")?;
+            // A command already started is read or stopped by its id: a dev
+            // server keeps running while the work carries on around it.
+            if let Some(id) = req.args.get("background_id").and_then(|v| v.as_u64()) {
+                let id = id as u32;
+                let stopping = req.args.get("stop").and_then(|v| v.as_bool()).unwrap_or(false);
+                let status = if stopping {
+                    crate::terminal::stop_background(id)
+                } else {
+                    crate::terminal::background_status(id)
+                };
+                return match status {
+                    Some(status) => Ok(ToolResult::ok(crate::terminal::format_background(&status))),
+                    None => {
+                        let running = crate::terminal::background_commands();
+                        let known = if running.is_empty() {
+                            "none is running".to_string()
+                        } else {
+                            running.iter().map(|(id, cmd)| format!("{id}: {cmd}")).collect::<Vec<_>>().join("; ")
+                        };
+                        Err(ToolError::InvalidArgs(format!(
+                            "no background command {id} ({known}). Start one with {{\"command\": \"...\", \"background\": true}}."
+                        )))
+                    }
+                };
+            }
             let cmd = req.args.get("command").and_then(|v| v.as_str()).ok_or_else(|| {
                 ToolError::InvalidArgs("execute_command requires {\"command\": \"...\"}".into())
             })?;
@@ -488,6 +678,33 @@ pub fn execute(
                 .map_err(ToolError::Workspace)?;
             if !cwd.is_dir() {
                 return Err(ToolError::InvalidArgs("cwd is not a directory".into()));
+            }
+            // A server run in the foreground holds the whole task still until
+            // the timeout and then reports that it was killed. Saying so at
+            // once costs a step; letting it run costs two minutes, twice over
+            // in one live run (owner watching, 2026-09-18).
+            let background = req.args.get("background").and_then(|v| v.as_bool()).unwrap_or(false);
+            if !background {
+                if let Some(what) = crate::terminal::keeps_running(cmd) {
+                    return Err(ToolError::InvalidArgs(format!(
+                        "{what:?} does not exit on its own, so running it here would hold this task still until the timeout. Send the same command with \"background\": true; it keeps running, you get its output and the address it prints, and it is stopped when the task ends."
+                    )));
+                }
+            }
+            if background {
+                // Watched only long enough to print its address or to fail.
+                let settle = std::time::Duration::from_secs(
+                    req.args.get("wait_secs").and_then(|v| v.as_u64()).unwrap_or(10).clamp(1, 120),
+                );
+                let owner = ws.root().to_string_lossy().into_owned();
+                return match crate::terminal::start_background(cmd, &cwd, &owner, settle) {
+                    Ok(status) => {
+                        let mut res = ToolResult::ok(crate::terminal::format_background(&status));
+                        res.exit_code = status.exit_code;
+                        Ok(res)
+                    }
+                    Err(e) => Err(ToolError::InvalidArgs(e)),
+                };
             }
             match crate::terminal::run(cmd, &cwd, timeout) {
                 Ok(r) => {
@@ -498,6 +715,9 @@ pub fn execute(
                 Err(e) => Err(ToolError::InvalidArgs(e)),
             }
         }
+        "preview_page" => Err(ToolError::InvalidArgs(
+            "preview_page is carried out by the run, which knows the conversation its picture belongs to".into(),
+        )),
         "system_info" => Ok(ToolResult::ok(format!(
             "os={} arch={}",
             std::env::consts::OS,
@@ -590,6 +810,12 @@ pub fn execute(
         // never here. The registry entry above documents it for the model.
         "web_search" => Err(ToolError::InvalidArgs(
             "web_search executes in the async request path with explicit Search consent, not via sync execute()".into(),
+        )),
+        "remember" => Err(ToolError::InvalidArgs(
+            "remember is kept by the run itself, not by the tool registry".into(),
+        )),
+        "changes" => Err(ToolError::InvalidArgs(
+            "changes is answered by the run itself, which is what knows them".into(),
         )),
         other => Err(ToolError::UnknownTool(other.into())),
     }
@@ -995,7 +1221,7 @@ mod tests {
     #[test]
     fn every_listed_required_argument_is_refused_when_missing() {
         let w = ws();
-        for tool in registry() {
+        for tool in registry().into_iter().filter(|tool| !runs_in_the_agent(tool.name)) {
             for (missing, _) in required_args(tool.name) {
                 let args: serde_json::Map<String, serde_json::Value> = required_args(tool.name)
                     .iter()
@@ -1221,6 +1447,102 @@ mod tests {
             std::fs::read_to_string(w.root().join("sub/b.txt")).unwrap(),
             "hello"
         );
+    }
+
+    #[test]
+    fn lines_are_replaced_by_number_and_a_wrong_number_is_refused() {
+        let dir = std::env::temp_dir().join(format!("companion-lines-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let w = crate::workspace::WorkspaceManager::new(dir.clone());
+        let original = "one\ntwo\nthree\nfour\nfive\n";
+        std::fs::write(dir.join("a.txt"), original).unwrap();
+        let call = |args: serde_json::Value| ToolRequest { name: "replace_lines".into(), args, approved: true };
+
+        // Three lines become one, and the answer says where the numbers moved.
+        let result = execute(&call(serde_json::json!({"path": "a.txt", "from": 2, "to": 4, "text": "TWO-FOUR"})), &w, true).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "one\nTWO-FOUR\nfive\n");
+        assert!(result.output.contains("replaced lines 2-4"), "{}", result.output);
+        assert!(result.output.contains("3 line(s) -> 1 line(s)"), "{}", result.output);
+        assert!(result.output.contains("it is now 3 lines"), "{}", result.output);
+        assert!(result.output.contains("read it again"), "{}", result.output);
+
+        // The anchor catches a number that has moved, and changes nothing.
+        let stale = execute(&call(serde_json::json!({"path": "a.txt", "from": 2, "to": 2, "text": "x", "expect": "two"})), &w, true).unwrap_err();
+        assert!(format!("{stale}").contains("not \"two\""), "{stale}");
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "one\nTWO-FOUR\nfive\n");
+
+        // With the right anchor it goes through.
+        execute(&call(serde_json::json!({"path": "a.txt", "from": 2, "to": 2, "text": "second", "expect": "TWO-FOUR"})), &w, true).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "one\nsecond\nfive\n");
+
+        // Empty text deletes those lines.
+        execute(&call(serde_json::json!({"path": "a.txt", "from": 3, "to": 3, "text": ""})), &w, true).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "one\nsecond\n");
+
+        // A number past the end says how many lines there are, rather than appending.
+        let past = execute(&call(serde_json::json!({"path": "a.txt", "from": 9, "to": 9, "text": "x"})), &w, true).unwrap_err();
+        assert!(format!("{past}").contains("has 2 lines"), "{past}");
+        assert!(execute(&call(serde_json::json!({"path": "a.txt", "from": 0, "to": 1, "text": "x"})), &w, true).is_err(), "lines start at 1");
+        assert!(execute(&call(serde_json::json!({"path": "a.txt", "from": 2, "to": 1, "text": "x"})), &w, true).is_err(), "to before from");
+        assert!(execute(&call(serde_json::json!({"path": "gone.txt", "from": 1, "to": 1, "text": "x"})), &w, true).is_err());
+
+        // A range that runs past the end takes what is there.
+        std::fs::write(dir.join("b.txt"), "a\nb\nc\n").unwrap();
+        let clamped = execute(&call(serde_json::json!({"path": "b.txt", "from": 2, "to": 99, "text": "B"})), &w, true).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "a\nB\n");
+        assert!(clamped.output.contains("replaced lines 2-3"), "{}", clamped.output);
+
+        // The host's own context note is not file text here either.
+        let note = "[Released: 900 characters of file text were released from working context.]";
+        assert!(execute(&call(serde_json::json!({"path": "b.txt", "from": 1, "to": 1, "text": note})), &w, true).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_outline_answers_where_things_are_without_the_whole_file() {
+        let dir = std::env::temp_dir().join(format!("companion-outline-tool-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let w = crate::workspace::WorkspaceManager::new(dir.clone());
+        std::fs::write(dir.join("app.py"), "import os\n\n\ndef load(path):\n    return path\n\n\nclass Store:\n    pass\n").unwrap();
+        let file = execute(&ToolRequest { name: "outline".into(), args: serde_json::json!({"path": "app.py"}), approved: false }, &w, false).unwrap();
+        assert!(file.output.contains("4: def load(path):"), "{}", file.output);
+        assert!(file.output.contains("8: class Store:"), "{}", file.output);
+        let folder = execute(&ToolRequest { name: "outline".into(), args: serde_json::json!({"path": "."}), approved: false }, &w, false).unwrap();
+        assert!(folder.output.contains("app.py (9 lines"), "{}", folder.output);
+        assert!(execute(&ToolRequest { name: "outline".into(), args: serde_json::json!({"path": "nope.py"}), approved: false }, &w, false).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_hosts_own_context_note_is_never_written_into_a_file() {
+        let dir = std::env::temp_dir().join(format!("companion-note-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = crate::workspace::WorkspaceManager::new(dir.clone());
+        std::fs::write(dir.join("app.js"), "const real = 1;\n").unwrap();
+        let note = "[Released: 1403 characters of file text were released from working context to stay within the model's window. The file on disk has them.]";
+        for tool in ["write_file", "append_file"] {
+            let request = ToolRequest { name: tool.into(), args: serde_json::json!({"path": "app.js", "content": note}), approved: true };
+            let error = execute(&request, &ws, true).unwrap_err();
+            assert!(format!("{error}").contains("context note"), "{tool}: {error}");
+        }
+        let edit = ToolRequest {
+            name: "edit_file".into(),
+            args: serde_json::json!({"path": "app.js", "old": "const real = 1;", "new": note}),
+            approved: true,
+        };
+        assert!(execute(&edit, &ws, true).is_err());
+        assert_eq!(std::fs::read_to_string(dir.join("app.js")).unwrap(), "const real = 1;\n", "the file keeps its text");
+        // Text that merely mentions the note is still file text.
+        let honest = ToolRequest {
+            name: "write_file".into(),
+            args: serde_json::json!({"path": "notes.md", "content": "The host writes [Released: ...] when it frees context."}),
+            approved: true,
+        };
+        assert!(execute(&honest, &ws, true).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

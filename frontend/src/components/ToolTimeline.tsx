@@ -53,13 +53,16 @@ function arg(e: AgentEvent, name: string): string {
 
 function actionTitle(e: AgentEvent, kind: ActivityKind): string {
   if (!e.tool) return META[kind].label;
-  const target = arg(e, 'path') || arg(e, 'query') || arg(e, 'command');
+  const target = arg(e, 'path') || arg(e, 'query') || arg(e, 'command') || arg(e, 'url') || arg(e, 'note');
   return target || e.tool.replace(/_/g, ' ');
 }
 
 export function DiffLines({ value, className = 'activity-diff' }: { value: string; className?: string }) {
   return (
     <pre className={className} aria-label="File changes">
+      {/* The lines sit in one box as wide as the longest of them: a changed
+          line is then coloured the whole way across, however far it scrolls. */}
+      <code className="diff-lines">
       {value.split('\n').map((line, i) => {
         const tone = line.startsWith('+++') || line.startsWith('---') || line.startsWith('diff ')
           ? 'file'
@@ -72,6 +75,7 @@ export function DiffLines({ value, className = 'activity-diff' }: { value: strin
                 : '';
         return <span key={i} className={tone}>{line || ' '}{'\n'}</span>;
       })}
+      </code>
     </pre>
   );
 }

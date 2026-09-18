@@ -852,7 +852,12 @@ a.chip:hover { border-color: var(--line-3); color: var(--text); background: var(
 .sb-project-toggle .lamp { width: 6px; height: 6px; box-shadow: none; flex: none; }
 .sb-project-count { font-size: 11.5px; font-weight: 400; }
 .sb-project-new { margin-right: 3px; opacity: 0; }
+/* Removing a project is a deliberate act: its button appears with the group's
+   others on hover or focus, never on a project the user is not pointing at. */
+.sb-project-remove { margin-right: 3px; opacity: 0; }
 .sb-project-head:hover .sb-project-new, .sb-project-head:focus-within .sb-project-new, .sb-project.current .sb-project-new { opacity: 1; }
+.sb-project-head:hover .sb-project-remove, .sb-project-head:focus-within .sb-project-remove { opacity: 1; }
+.sb-project-remove:hover { color: var(--error-ink); }
 .sb-project .sb-row-main { padding-left: 23px; }
 .sb-project .sb-empty { padding: 4px 10px 6px 23px; }
 
@@ -1229,6 +1234,7 @@ a.chip:hover { border-color: var(--line-3); color: var(--text); background: var(
 .composer-hint .lamp { width: 6px; height: 6px; box-shadow: none; }
 
 .permission-mode { display: inline-flex; flex: none; gap: 2px; margin: 0 2px; padding: 2px; border: 1px solid var(--line); border-radius: 9px; background: var(--bg); transition: border-color 0.12s; }
+.permission-mode-note { align-self: center; padding: 0 6px; color: var(--caution-ink); font-size: 11.5px; white-space: nowrap; }
 .permission-mode button { height: 22px; padding: 0 9px; border-radius: 6px; color: var(--text-3); font-size: 12px; transition: background-color 0.12s, color 0.12s; }
 .permission-mode button:hover:not(:disabled):not([aria-pressed='true']) { color: var(--text-2); }
 .permission-mode button[aria-pressed='true'] { background: var(--raised-2); color: var(--text); box-shadow: inset 0 0 0 1px var(--line-2); }
@@ -1417,7 +1423,13 @@ a.chip:hover { border-color: var(--line-3); color: var(--text); background: var(
 .activity-details { margin-top: 6px; animation: rise-in 0.18s var(--ease) both; }
 .activity-output, .activity-diff { max-height: 360px; margin: 0; overflow: auto; padding: 10px 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--code-bg); color: var(--text-2); font: 12px/1.55 var(--font-mono); white-space: pre; }
 .activity-diff { padding: 8px 0; }
-.activity-diff span { display: block; min-height: 18px; padding: 0 12px; }
+/* A changed line is coloured the whole way across, however far the diff is
+   scrolled. The lines share one box as wide as the longest of them
+   (max-content, at least the full width), and each line fills that box: sizing
+   each line to its own text left short lines ending in mid-air, and sizing
+   them to the container cut the colour off at the right edge. */
+.activity-diff .diff-lines, .diff-view .diff-lines { display: block; width: max-content; min-width: 100%; }
+.activity-diff span { display: block; width: 100%; min-height: 18px; padding: 0 12px; }
 .activity-diff .file { color: var(--text); font-weight: 600; }
 .activity-diff .hunk { color: var(--text-3); background: var(--selected); }
 .activity-diff .add { color: var(--diff-add); background: var(--diff-add-bg); }
@@ -1585,7 +1597,7 @@ button.launch-card:hover:not(:disabled) { border-color: var(--line-3); backgroun
 .policy-status dd { margin: 0; color: var(--text); font-weight: 500; }
 .policy-status dd.auto { color: var(--caution-ink); }
 .diff-view { max-height: 60dvh; margin: 0; overflow: auto; padding: 8px 0; border: 1px solid var(--line); border-radius: 10px; background: var(--code-bg); font: 12px/1.55 var(--font-mono); white-space: pre; }
-.diff-view span { display: block; min-height: 18px; padding: 0 14px; color: var(--text-2); }
+.diff-view span { display: block; width: 100%; min-height: 18px; padding: 0 14px; color: var(--text-2); }
 .diff-view .file { color: var(--text); font-weight: 600; }
 .diff-view .hunk { color: var(--text-3); background: var(--selected); }
 .diff-view .add { color: var(--diff-add); background: var(--diff-add-bg); }

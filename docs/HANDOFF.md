@@ -82,6 +82,18 @@ code.
 
 ## Uncommitted work (written; compile/test status noted)
 
+**2026-09-18 (night decisions 61-62), uncommitted, backend 480 tests / frontend 109 tests green.** Why
+big-model coding runs got stuck, and the seven fixes for it. Read decision 61 (the diagnosis, with the
+numbers from the owner's own runs) and 62 (what was built) before touching the agent loop. In short: the
+token estimate counted only message text and so ran 1.2-2.8x high once models wrote files through the
+tool interface; releasing old results ran before compaction and left the summary never written; the
+repeat guard only compared consecutive steps, so a rotation of file reads was invisible; a timed-out
+command lost everything it had printed and left its real process running; nothing could look at the page
+being built; a follow-up run started with no record of earlier work; and the host's own release note could
+be copied back into a file. New: `preview.rs`, `agent_progress::LoopWatch`, background commands in
+`terminal.rs`, `earlier_work_block`/`project_notes` in `agent_runner.rs`.
+
+
 Compiled and tested (backend 333 tests, frontend 64 tests at that point):
 - `api.rs`: truthful chat identity; `document_tool_note` only on document requests; `ChatToolOffer`
   (only offered tools run / stop / get corrected; withheld registered tools in code sessions still
@@ -151,6 +163,12 @@ Compiled and tested (backend 333 tests, frontend 64 tests at that point):
     `llama-gguf-split --split --split-max-size 1500M`, tracked in `.gitattributes`, with a `.gitignore`
     exception per folder. Every clone that fetches both pays 6.8 GiB of the owner's 10 GiB monthly LFS
     bandwidth; the README shows `lfs.fetchinclude` for fetching one.
+  - **Tool calling per model (night decision 59, `backend/src/tooling.rs`):** each model is checked at its first
+    load (native call + byte-exact file text through the runtime's `tools`, then the text format if that fails)
+    and the result is `models/<folder>/tooling.json` (git-ignored, per machine). The agent uses native `tools`
+    with `tool_calls`/`tool` turns for `native`, the text envelope for `text`, and the constrained JSON for
+    `none`; `can_write: false` makes code sessions read-only and the UI offers only Ask. Re-check: the model's
+    details, "Check again". Bump `tooling::PROFILE_VERSION` whenever the checks change meaning.
   - `scripts/bench/*.mjs`: runtime/bin default, no default model.
   - `.gitignore`: `/build/`, `/runtime/*` except the lock file, downloader exception.
 - Docs: the three audit documents above; this handoff.

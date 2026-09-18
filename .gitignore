@@ -58,3 +58,6 @@ Desktop.ini
 !/models/gemma-4-e4b-it-qat/*.gguf
 !/models/gemma-4-e2b-it/
 !/models/gemma-4-e2b-it/*.gguf
+# A model's tool check depends on this machine's runtime build: never committed.
+/models/**/tooling.json
+/models/**/tooling.json.tmp

@@ -166,7 +166,18 @@ impl AgentContextUsage {
     ) -> Self {
         // Text + a small estimated message-framing allowance. Only the
         // runtime's tokenizer can report actual tokens, especially for images.
-        let text_chars: usize = turns.iter().map(|turn| turn.content.chars().count()).sum();
+        // Native tool calls travel as structured fields beside the text.
+        let text_chars: usize = turns
+            .iter()
+            .map(|turn| {
+                turn.content.chars().count()
+                    + turn
+                        .tool_calls
+                        .iter()
+                        .map(|call| call.name.len() + call.arguments.chars().count() + 16)
+                        .sum::<usize>()
+            })
+            .sum();
         Self {
             estimated_tokens: ((text_chars as f64 / chars_per_token()).ceil() as usize)
                 .saturating_add(turns.len().saturating_mul(8))

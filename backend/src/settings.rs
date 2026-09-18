@@ -39,7 +39,6 @@ pub struct HardwareSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSettings {
-    pub max_iterations: u32,
     pub command_timeout_secs: u64,
     pub autonomous_enabled: bool,
     /// ask | accept_edits | plan | auto (`permissions::PERMISSION_MODES`).
@@ -437,7 +436,6 @@ impl Default for AppSettings {
                 kv_cache_gpu: true,
             },
             agent: AgentSettings {
-                max_iterations: 30,
                 command_timeout_secs: 120,
                 autonomous_enabled: false,
                 permission_mode: "ask".into(),

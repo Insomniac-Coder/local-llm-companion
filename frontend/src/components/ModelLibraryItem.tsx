@@ -1,13 +1,50 @@
 import { useEffect, useId, useRef, useState } from 'react';
-import { modelDetail, type ModelDetail, type ModelMeta } from '../services/api';
+import { modelDetail, recheckTooling, type ModelDetail, type ModelMeta } from '../services/api';
 import { Badge, Button, IconButton, Lamp } from '../ui/primitives';
 import { toolSupportLabel, documentKindsNote } from '../services/toolSupport';
+import { checkLabel, currentTooling, toolingBadge, toolingSummary } from '../services/tooling';
 import RecommendCard from './RecommendCard';
 import CalibrationCard from './CalibrationCard';
 import OptimizeCard from './OptimizeCard';
 
 type Notify = (kind: 'info' | 'success' | 'warning' | 'error', text: string) => void;
-type Props = { model: ModelMeta; loadingModel: boolean; onLoad: () => void; onDelete: () => void; notify: Notify };
+type Props = { model: ModelMeta; loadingModel: boolean; onLoad: () => void; onDelete: () => void; notify: Notify; onToolingChecked?: () => void };
+
+/** What the model's tool check found, with Check again for the loaded model. */
+export function ToolingDetails({ model, notify, onChecked }: { model: ModelMeta; notify: Notify; onChecked?: () => void }) {
+  const [checking, setChecking] = useState(false);
+  const profile = currentTooling(model);
+  const shown = profile ?? model.tooling ?? null;
+  const recheck = () => {
+    setChecking(true);
+    recheckTooling(model.id)
+      .then((result) => { notify(result.tooling.can_write ? 'success' : 'warning', `Tool check: ${result.summary}`); onChecked?.(); })
+      .catch((failure) => notify('error', failure instanceof Error ? failure.message : 'The tool check could not run.'))
+      .finally(() => setChecking(false));
+  };
+  return <section className="model-tooling" aria-label={`Tool check for ${model.name}`}>
+    <h3>Tool check</h3>
+    {shown ? <>
+      <p className="model-library-note">
+        {toolingSummary(shown)}{' '}
+        {profile ? `Checked ${new Date(shown.checked_at).toLocaleString()} in ${(shown.duration_ms / 1000).toFixed(1)} s.` : 'This check was made with an earlier check, runtime or chat template, so it runs again on the next load.'}
+      </p>
+      <ul className="model-tooling-checks">
+        {shown.checks.map((check) => (
+          <li key={check.name} className={check.passed ? 'passed' : 'failed'}>
+            <span className="model-tooling-check-name">{checkLabel(check.name)}</span>
+            <strong>{check.passed ? 'Passed' : 'Failed'}</strong>
+            <code>{check.detail}</code>
+          </li>
+        ))}
+      </ul>
+    </> : <p className="model-library-note">Not checked yet. The first load checks how this model calls tools, which takes a few seconds.</p>}
+    <div className="model-tooling-actions">
+      <Button size="sm" variant="ghost" icon="refresh" disabled={!model.loaded || checking} onClick={recheck}>{checking ? 'Checking…' : 'Check again'}</Button>
+      {!model.loaded && <span className="model-library-note">Load this model to check it again.</span>}
+    </div>
+  </section>;
+}
 
 export function ModelDetails({ detail, notify }: { detail: ModelDetail; notify: Notify }) {
   const { metadata, estimates } = detail;
@@ -38,7 +75,7 @@ export function ModelDetails({ detail, notify }: { detail: ModelDetail; notify: 
   </>;
 }
 
-function ModelLibraryCard({ model, loadingModel, onLoad, onDelete, notify }: Props) {
+function ModelLibraryCard({ model, loadingModel, onLoad, onDelete, notify, onToolingChecked }: Props) {
   const [expanded, setExpanded] = useState(false);
   const [attempt, setAttempt] = useState(0);
   const [detail, setDetail] = useState<ModelDetail | null>(null);
@@ -83,7 +120,7 @@ function ModelLibraryCard({ model, loadingModel, onLoad, onDelete, notify }: Pro
       </div>
       <div className="model-library-capabilities">
         {model.loaded && <Badge tone="ok">Loaded</Badge>}
-        {model.tool_calling && <Badge tone="info">Tools</Badge>}
+        {(model.tool_calling || model.tooling) && <Badge tone={toolingBadge(model).tone}>{toolingBadge(model).label}</Badge>}
         {model.vision && <Badge tone="info">Vision</Badge>}
       </div>
       <div className="model-library-actions">
@@ -105,7 +142,10 @@ function ModelLibraryCard({ model, loadingModel, onLoad, onDelete, notify }: Pro
       {expanded && <>
         {loading && <p className="model-library-note" role="status">Loading details for {model.name}…</p>}
         {error && <div className="model-library-error" role="alert"><p>{error}</p><Button size="sm" onClick={() => { setLoading(true); setError(''); setAttempt((value) => value + 1); }}>Retry details</Button></div>}
-        {!loading && !error && detail && <ModelDetails detail={detail} notify={notify} />}
+        {!loading && !error && detail && <>
+          <ToolingDetails model={model} notify={notify} onChecked={onToolingChecked} />
+          <ModelDetails detail={detail} notify={notify} />
+        </>}
       </>}
     </div>
   </article>;

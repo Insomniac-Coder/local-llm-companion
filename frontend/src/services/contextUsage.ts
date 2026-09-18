@@ -14,7 +14,14 @@ export function contextDisplay(ctx: ContextInfo) {
   const room = usage ? usage.history_room ?? 0 : ctx.history_room_tokens ?? 0;
   const percent = tokens == null ? 0 : !usage && ctx.usage_pct != null && room > 0 ? ctx.usage_pct : room > 0 ? tokens / room * 100 : limit > 0 ? tokens / limit * 100 : 0;
   const healthPercent = room > 0 ? percent : tokens != null && limit > 0 ? (tokens + reserve) / limit * 100 : 0;
-  const compactAt = usage ? usage.compact_at_pct ?? 0 : ctx.auto_compact === false ? 0 : ctx.compact_at_pct ?? 0;
+  // The setting as it stands now, except while a run is going: that run read
+  // the threshold when it started and keeps to it. Reading the last recorded
+  // step instead showed the old number after the setting was changed.
+  const compactAt = ctx.auto_compact === false
+    ? 0
+    : agent?.active
+      ? usage?.compact_at_pct ?? ctx.compact_at_pct ?? 0
+      : ctx.compact_at_pct ?? usage?.compact_at_pct ?? 0;
   return {
     tokens, limit, reserve, pending, estimated: !reported, room, compactAt,
     compactions: usage?.compactions ?? 0,

@@ -28,12 +28,13 @@ import { PERMISSION_MODE_DESCRIPTIONS, PERMISSION_MODE_LABELS, PROJECT_BOUNDARY_
 import { VisibleOutputMeter, type GenerationPhase, type OutputTiming } from './services/outputTiming';
 import { applyAgentContext } from './services/contextUsage';
 import { currentActivitySnapshot, parseActivityStart, visibleWorkActivity } from './services/workElapsed';
-import { groupActivity, groupSessionsByProject, lastSessionKey, projectGroupOpen, projectPick, type ProjectGroup } from './services/projectSessions';
+import { groupActivity, groupSessionsByProject, lastSessionKey, projectGroupOpen, projectPick, projectRemoval, type ProjectGroup } from './services/projectSessions';
+import { availablePermissionModes, codeSessionsReadOnly, firstLoadNotice, READ_ONLY_MODE_REASON } from './services/tooling';
 import { APPROVE_PLAN_MESSAGE, autoTitle, matchesShortcut, nextPermissionMode, PERMISSION_MODE_SETTLE_MS, PERMISSION_MODES, PermissionModeSaver, selectAvailableModel, shouldStartAgent, updateMessage, WORKBENCH_DESTINATIONS } from './services/workbench';
 import { Button, Dialog, IconButton, Kbd, Lamp, Notice, PopDivider, PopItem, PopLabel, Popover, Toggle } from './ui/primitives';
 import { Icon, type IconName } from './ui/Icon';
 import {
-  agentRuns, compactConversation, createConversation, deleteConversation, deleteModel, discardStale, editMessage, exportConversation, forkConversation,
+  agentRuns, compactConversation, createConversation, deleteConversation, deleteModel, deleteWorkspace, discardStale, editMessage, exportConversation, forkConversation,
   getContext, getConversationMetrics, getMessages, getRecovery, getPermissionMode, getSettings, inferenceStart,
   inferenceStatus, listCommands, listConversations, listDownloads,
   listModels, listSessions, listTools, listWorkspaces, patchSession, stopAgent,
@@ -123,6 +124,10 @@ export default function App() {
     try { return JSON.parse(localStorage.getItem('companion.projectGroups') ?? '{}') ?? {}; } catch { return {}; }
   });
   const [projectLauncherOpen, setProjectLauncherOpen] = useState(false);
+  /** The project the user is removing from the app, with what would go with it. */
+  const [projectToRemove, setProjectToRemove] = useState<{ project: string; name: string; path: string; tasks: number } | null>(null);
+  const [removeProjectTasks, setRemoveProjectTasks] = useState(true);
+  const [removingProject, setRemovingProject] = useState(false);
   const [projectMenuOpen, setProjectMenuOpen] = useState(false);
   const [showShare, setShowShare] = useState(false);
   const [focusRun, setFocusRun] = useState<string | null>(null);
@@ -224,6 +229,10 @@ export default function App() {
       preferredDefaultModel.current = value.general?.default_model ?? '';
       setShowGenerationSpeed(value.diagnostics?.show_generation_speed ?? true);
       setShowDetailedMetrics(value.diagnostics?.show_detailed_metrics ?? false);
+      // The context meter reads the compaction threshold from the server, so
+      // a changed threshold only showed up after the next agent step.
+      const open = conversationRef.current;
+      if (open) getContext(open).then((context) => { if (conversationRef.current === open) setCtx(context); }).catch(() => {});
     };
     window.addEventListener('companion:settings', onSettings);
     getSettings().then((settings) => {
@@ -344,6 +353,37 @@ export default function App() {
     openProjectGroup(nextId);
     if (pick.kind === 'open') void selectConv(pick.session);
     else if (pick.kind === 'new') showNewTask();
+  }
+
+  /** Remove a project from the app: its record, and (by choice) the sessions
+   *  that work in it. The folder on disk is never touched. */
+  async function removeProject() {
+    if (!projectToRemove || removingProject) return;
+    const { project, name } = projectToRemove;
+    const check = projectRemoval({
+      project,
+      sessions: convs.filter((conversation) => conversation.mode === 'code'),
+      busy: busy || agentBusy,
+      activity: new Map(sessions.map((session) => [session.id, session.activity])),
+    });
+    if (check.blocked) { notify('warning', check.reason); return; }
+    setRemovingProject(true);
+    try {
+      const result = await deleteWorkspace(project, removeProjectTasks ? 'delete' : 'keep');
+      setProjectToRemove(null);
+      const openWasRemoved = removeProjectTasks
+        && convs.some((conversation) => conversation.id === conversationRef.current && conversation.workspace === project);
+      if (wsId === project) setWsId('');
+      await refreshWorkspaces();
+      await refreshConvs(undefined, openWasRemoved);
+      notify('success', result.chats_deleted > 0
+        ? `Removed ${name} and ${result.chats_deleted} ${result.chats_deleted === 1 ? 'task' : 'tasks'}. The folder on disk was not touched.`
+        : `Removed ${name}. ${result.chats > 0 ? `${result.chats} ${result.chats === 1 ? 'task keeps' : 'tasks keep'} their history and ask for a project when opened. ` : ''}The folder on disk was not touched.`);
+    } catch (error) {
+      notify('error', error instanceof Error ? error.message : 'Could not remove the project.');
+    } finally {
+      setRemovingProject(false);
+    }
   }
 
   function toggleProjectGroup(project: string, open: boolean) {
@@ -918,7 +958,7 @@ export default function App() {
     if (mode === 'code' && e.key === 'Tab' && e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
       e.preventDefault();
       if (!busy && !agentBusy && !permissionModeBusy) {
-        const next = nextPermissionMode(permissionMode);
+        const next = nextPermissionMode(permissionMode, availableModes);
         setPermissionModeState(next);
         modeSaver.current.schedule(next, PERMISSION_MODE_SETTLE_MS);
       }
@@ -1093,9 +1133,12 @@ export default function App() {
   async function guardedSwitch(kind: 'load' | 'start', id: string, force: boolean) {
     setLoadingModel(true);
     try {
+      // A load that runs the model's tool check takes a few seconds longer.
+      const checking = firstLoadNotice(models.find((model) => model.id === id));
+      if (checking) notify('info', checking);
       // The load reports what the person should know about it (a CPU
       // fallback, a context larger than the model supports).
-      const started: { notices?: string[] } | undefined = kind === 'load'
+      const started: { notices?: string[]; tooling_notice?: string | null; tooling?: { can_write?: boolean } | null } | undefined = kind === 'load'
         ? await loadModel(id, force)
         : await inferenceStart(id, force);
       await refreshModels();
@@ -1105,6 +1148,7 @@ export default function App() {
       if (!force) notify('success', kind === 'load' ? `${name} is loaded and ready.` : 'Inference started.');
       const notices = started?.notices ?? [];
       for (const notice of notices) notify('warning', notice);
+      if (started?.tooling_notice) notify(started.tooling?.can_write === false || !started.tooling ? 'warning' : 'info', started.tooling_notice);
       if (status.runtime_notice && !notices.includes(status.runtime_notice)) notify('info', status.runtime_notice);
     } catch (e: any) {
       if (e?.status === 409 && !force) {
@@ -1252,6 +1296,9 @@ export default function App() {
   const loadedMeta = models.find((model) => model.loaded && inf?.running);
   const modelReady = !!inf?.running && loadedModel === modelId && !!modelId;
   const headWorkspace = workspaces.find((workspace) => workspace.id === (activeConv?.workspace ?? wsId));
+  // A model whose tool check found file text damaged only reads (decision 48).
+  const readOnlyModel = codeSessionsReadOnly(loadedMeta);
+  const availableModes = availablePermissionModes(PERMISSION_MODES, loadedMeta);
   const branch = useWorkspaceBranch(mode === 'code' ? headWorkspace?.id : undefined);
   const rail = collapsed && !narrow;
   const anySessionLive = sessions.some((s) => s.id !== convId && (s.activity === 'thinking' || s.activity === 'tool'));
@@ -1355,6 +1402,21 @@ export default function App() {
           </button>
           {/* A native tooltip: the styled one extends past the list and scrolled it sideways. */}
           {group.project && <IconButton className="sb-project-new" icon="plus" size="sm" label={`New task in ${group.name}`} tip={false} title={`New task in ${group.name}`} onClick={() => void newChat(group.project)} />}
+          {group.project && (
+            <IconButton
+              className="sb-project-remove"
+              icon="trash"
+              size="sm"
+              label={`Remove ${group.name}`}
+              tip={false}
+              title={`Remove ${group.name} from the app (the folder on disk is kept)`}
+              disabled={busy || agentBusy}
+              onClick={() => {
+                setRemoveProjectTasks(true);
+                setProjectToRemove({ project: group.project, name: group.name, path: group.path, tasks: group.sessions.length });
+              }}
+            />
+          )}
         </div>
         {open && group.sessions.map(renderRow)}
         {open && group.sessions.length === 0 && modeConvs.length > 0 && <p className="sb-empty">No tasks in this project yet.</p>}
@@ -1535,6 +1597,39 @@ export default function App() {
         />
       </aside>
 
+      {projectToRemove && (
+        <Dialog
+          size="sm"
+          role="alertdialog"
+          icon="trash"
+          title={`Remove ${projectToRemove.name}?`}
+          description={`This removes the project from the app only. Nothing in ${projectToRemove.path || 'the folder'} is deleted or changed.`}
+          onClose={() => setProjectToRemove(null)}
+          footer={<>
+            <Button variant="ghost" onClick={() => setProjectToRemove(null)}>Cancel</Button>
+            <Button variant="danger" icon="trash" loading={removingProject} onClick={() => void removeProject()}>
+              {removeProjectTasks && projectToRemove.tasks > 0 ? `Remove project and ${projectToRemove.tasks} ${projectToRemove.tasks === 1 ? 'task' : 'tasks'}` : 'Remove project'}
+            </Button>
+          </>}
+        >
+          {projectToRemove.tasks > 0 ? (
+            <>
+              <Toggle on={removeProjectTasks} icon={removeProjectTasks ? 'check' : 'chat'} onClick={() => setRemoveProjectTasks((on) => !on)}>
+                {removeProjectTasks
+                  ? `Delete its ${projectToRemove.tasks} ${projectToRemove.tasks === 1 ? 'task' : 'tasks'} as well`
+                  : `Keep its ${projectToRemove.tasks} ${projectToRemove.tasks === 1 ? 'task' : 'tasks'}`}
+              </Toggle>
+              <p className="muted" style={{ marginTop: 10 }}>
+                {removeProjectTasks
+                  ? 'Their transcripts, tool history and attachments are deleted with them. This cannot be undone.'
+                  : 'They keep their history and ask for a project the next time you open one.'}
+              </p>
+            </>
+          ) : (
+            <p className="muted">No tasks belong to this project.</p>
+          )}
+        </Dialog>
+      )}
       {projectLauncherOpen && (
         <ProjectLauncher
           recent={workspaces}
@@ -1837,8 +1932,9 @@ export default function App() {
                       {mode === 'code' && (
                         <span className={`permission-mode ${permissionMode}`} role="group" aria-label="Permission mode (Shift+Tab to cycle)" title={`${PROJECT_BOUNDARY_DESCRIPTION} ${SEARCH_PERMISSION_DESCRIPTION}`}>
                           {PERMISSION_MODES.map((option) => (
-                            <button key={option} type="button" disabled={permissionModeBusy || busy || agentBusy} className={permissionMode === option ? 'active' : ''} aria-pressed={permissionMode === option} title={PERMISSION_MODE_DESCRIPTIONS[option]} onClick={() => void changePermissionMode(option)}>{PERMISSION_MODE_LABELS[option]}</button>
+                            <button key={option} type="button" disabled={permissionModeBusy || busy || agentBusy || !availableModes.includes(option)} className={permissionMode === option ? 'active' : ''} aria-pressed={permissionMode === option} title={availableModes.includes(option) ? PERMISSION_MODE_DESCRIPTIONS[option] : READ_ONLY_MODE_REASON} onClick={() => void changePermissionMode(option)}>{PERMISSION_MODE_LABELS[option]}</button>
                           ))}
+                          {readOnlyModel && <span className="permission-mode-note" title={READ_ONLY_MODE_REASON}>Read-only model</span>}
                         </span>
                       )}
                       <Toggle

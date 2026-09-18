@@ -1292,6 +1292,376 @@ Updated continuously so it survives context compaction. Read this after `docs/HA
     - Not changed: the verify data holds two registered projects with the same name and path, which show as two
       groups. Registering a project does not deduplicate by path.
     - **Not committed (owner commits when asked).**
+    - Committed and pushed as `dc3dad3` (owner: "commit and push everything").
+
+59. **18:40 E2B code sessions answer with the text of a tool call; owner: make tool support model-agnostic for
+    every model whose template supports tools.**
+    - **Symptom (decision 57):** asked a code question, the E2B replied `list_directory\n{"path":"."}` (10 tokens);
+      after one "read first" pushback it repeated it, and the run completed with that text as the answer.
+    - **Not stripped tokens (measured):**
+      - In both Gemma 4 files `<|tool_call>`, `<tool_call|>` and `<|"|>` are user-defined tokens (rendered as
+        text); `<|turn>`/`<turn|>` are control. The two chat templates are byte-identical (18,808 chars).
+      - Only difference: the E2B file marks `<eos>` normal with eos id 106; the E4B marks it control, eos 1, eot 106.
+      - The recorded request (no `tools`, text tool list in the system prompt) replayed to the sidecar's
+        `/completion`: the E2B's greedy reply is 11 ordinary text tokens, `list` `_` `directory` `\n` `{"` `path`
+        `":"` `."` `}` `\n` `<eos>`. The chat endpoint returns the same text with no tool_calls.
+    - **Model behaviour, not the runtime:** first-token probabilities for that same prompt:
+      - E2B: `list` 57%, `print` 24%, a control token 14%; `<|tool_call>` not in the top eight.
+      - E4B: `<|tool_call>` 79%, `list` 0.45%.
+      - With the app's sampling (seed 1) the E2B wrote a sentence, then `<|tool_call>call:list_directory{path:` —
+        it copies the app's own tool list (`- list_directory …` / `args: {"path":"."}`) when that list is
+        the only description of the tools it gets.
+    - **Why it was accepted as an answer:** no parser shape matches a bare name + object, so
+      `looks_like_action_attempt` was false; the reply was a tool-free answer; the no-action pushback runs once;
+      the second tool-free reply to a question with no pending evidence completes the run.
+    - **Native tool calling measured (scratch harness, runtime's own tool definitions, read-only tools run on a
+      copy of the demo project, same system prompt without the text tool list and envelope rules):**
+      - The template renders the tools natively (`<|tool>declaration:list_directory{…}<tool|>`); the runtime
+        (pinned build: PEG Gemma 4 parser, template-derived auto-parser, lazy grammar for call arguments) returns
+        `tool_calls`.
+      - E2B greedy: list `.`, list `project`, read README.md, read orders.py, answer naming `order_total`
+        (5 steps, 1.3 s). Seed 2: the same, 1.1 s. Seed 1: one list, then a 1-token empty reply.
+      - E4B greedy: the same 5 steps, 1.5 s. Seed 1: one list, then a 1-token empty reply. Seed 2: listed the
+        absolute workspace path the prompt named, which the harness (not the app) rejects.
+      - 17 of 17 calls arrived parsed; no call text leaked into content.
+      - 7 of the 8 library models report template tool support (all but the Gemma 2 2B).
+    - **Owner decisions:**
+      - Not a parser patch for one model's shape: tool support is model-agnostic for models that support tooling.
+      - A tool check per model, at the model's **first load** (new model, or its template or the runtime
+        changed), with the user told beforehand that the first load takes a few seconds longer.
+      - The result is a small configuration file **next to the model**, `models/<folder>/tooling.json`: the
+        method that works (native calls, the text format, or none), where file text goes, when it was checked,
+        and the runtime and template it was checked against. The agent follows it; no model names in code.
+      - A model with no working method gets chat + read-only code (rule 48). A "Check again" in the UI.
+      - Live code suite afterwards on the E2B, E4B and Qwen3 8B, one model at a time. Solo, no agents.
+
+60. **19:00–20:45 Model-agnostic tool calling built (decision 59) and measured live.**
+    - **Built:**
+      - `backend/src/tooling.rs`: the per-model check (a native listing call, then a small Python file whose
+        text must arrive byte for byte; if either fails, the same two in the text format), `tooling.json` next
+        to the model (method native | text | none, `can_write`, `file_text`, runtime build, template
+        fingerprint, each check's detail), staleness by version, runtime and template.
+      - Load (`start_sidecar`): an unchecked or stale model is checked after the runtime starts (progress stage
+        `checking_tools`), and the load returns `tooling_notice`. `GET /api/models` adds `tooling` and
+        `tooling_state`; `POST /api/models/:id/tooling/check` re-checks the loaded model.
+      - Runtime client: `ChatTurn` carries `tool_calls` / `tool_call_id` / `name`; requests can offer `tools`
+        (`tool_choice auto`, `parallel_tool_calls false`); streamed call fragments are joined by index; the
+        request log shows parsed calls. Strict-alternation templates get calls and results flattened to text.
+      - Agent: native method = tool definitions for exactly the tools the run may use, a prompt without the
+        text tool list, the parsed call as the step's action, every outcome of a call answered as a `tool`
+        turn, `repair_tool_pairs` after pruning/compaction. `can_write: false` = read-only whatever the mode.
+      - UI: a notice before a load that runs the check ("takes a few seconds longer"), "Checking how it calls
+        tools" in the machine panel, the badge (Tools: native / text format / Read-only code), a Tool check
+        section in the model's details with each check and Check again (loaded model only), and only Ask
+        offered for a read-only model (Shift+Tab skips the others).
+      - Also fixed: model details sized a split model by its first part ("0 GB"); `tooling.json` is
+        git-ignored.
+    - **Probe text, corrected:** the first file text had "first line with" and "last line:"; the E2B dropped
+      them as labels in both formats while every backslash arrived intact, so it was marked read-only. The
+      probe is now a small Python file (quotes, a Windows path, a `\n` escape, a tab, braces, non-ASCII) and
+      the check version is 2. Results: E2B native in 0.6 s, E4B native in 0.7 s, Qwen3 8B native in 1.5 s, all
+      writing (158 characters intact).
+    - **Three app defects found by the live runs, all fixed:**
+      1. *A note copied as file content.* Verified native writes had their text replaced by a note inside the
+         `content` argument; after four such writes the E2B wrote the note itself into `clock/script.js`
+         (144 bytes). Native call text now stays verbatim and is released oldest-first only when the window
+         is short (`release_call_text`), like old results. After the fix the E2B's clock works.
+      2. *The repeat stop ignored corrections.* `FailedCalls` counted identical failures for the whole run, so
+         a test command failing again after a fix still reached "failed three times without a correction"
+         (stopped the E4B and the Qwen3 8B mid-fix). A successful file change now resets the counts.
+      3. *Repeated calls after a note.* The Gemma 4 template renders an assistant turn's text after the call's
+         result, so "I will create __init__.py" read as the next step and the call was sent again. Over the
+         evening's native runs: the next call repeated the previous one 7 times in 15 after a call with a
+         note, 0 in 91 after one without. Native call turns now keep the call only (the note is journaled).
+    - **Live code suite (native; before defects 2 and 3 were fixed):**
+
+      | model | question | change | calculator | clock |
+      |---|---|---|---|---|
+      | E2B | answered, 4.1 s (named `order_total`, skipped what the project does) | failed: wrote the function into the test file, ran tests from a doubled path | page built; "=" types a space, so no result | works (three files, not one) |
+      | E4B | answered, 4.0 s | failed: replaced `order_total`, missing import | page built; "=" computes but never updates the display; "." unlabelled | works |
+      | Qwen3 8B | answered, 6.1 s | failed: wrong expectation in its own test | 7, 8, 9 missing; 30-step limit (completion check kept finding work) | works |
+
+      Every call in every task arrived parsed. The remaining failures are the models' own code; the two
+      calculators were clicked through (7 + 8 = shows 8) and their bugs read in the source.
+    - **Change task, native vs text, after all fixes (E4B, alternating):** native passed 3 of 3 (8.1, 12.1,
+      16.1 s); text passed 1 of 3 (20.2 s; the failures were format errors: two actions in one reply, an
+      unterminated `<<<` block, an unclosed object, then a loop). Qwen3 8B native: 1 of 2 (30.2 s; the failure
+      was its own test, a stray `}` and one edit sent three times unchanged, a correct stop). Small samples;
+      the native path is not worse than the text format on the demo task and avoids its format failures.
+    - Tests: backend 462 pass (4 ignored), frontend 108 pass, tsc clean. Not committed.
+
+61. **2026-09-18 04:45–06:00 Why the big-model runs got stuck: diagnosis from the owner's own runs plus one live
+    reproduction (owner asked, no fixes applied yet).**
+    - **Evidence read:** the owner's four runs of 2026-09-17 evening (27B build + "resume from the last
+      checkpoint", E4B, 26B) from the history database, and one live reproduction of the owner's prompt on the
+      E4B (isolated data directory, 32K window, Auto mode, 30-step default): FAILED at the step limit, 344.8 s,
+      24 tool calls, no runnable project (no index.html, no vite config, no entry point).
+    - **1. The token estimate is inflated since native tool calling landed.** `observe_prompt_size` counts only
+      each message's `content`, while the runtime's `prompt_tokens` covers the whole request. A native write
+      carries the file text in the call's *arguments*, and the tool definitions (~4,400 characters) travel
+      outside the messages, so the learned characters-per-token ratio collapses: measured on the owner's E4B run,
+      content alone gives 0.86–1.4 characters per token where the real request is 3.0–3.6. The estimate the
+      thresholds use is then 1.2–2.8x the truth (owner's E4B run: 94,587 estimated vs 34,219 real at step 22;
+      live reproduction: 2.42x at step 13). Releases and pruning therefore start at about a third of the real
+      usage — on a 128K window the E4B began losing file text at 34K.
+    - **2. Compaction never runs on a coding task.** When compaction is due the loop releases old tool results
+      first (down to threshold-10%), then re-checks: the release has already brought usage under the threshold,
+      so the summary never happens. `compactions: 0` in all four owner runs and in the reproduction, while
+      "Released N older tool result(s)" fired at steps 23, 26, 30, 34, 36 of the resume run. The destructive
+      half of context management runs; the half that preserves the plan does not.
+    - **3. Nothing sees a read loop.** `ProgressGuard` compares only against the *previous* success, so a
+      rotation through 14 files never matches. The owner's resume run: 43 steps, 34 reads, 6 listings, **zero
+      file changes**, 20 of the 43 calls identical to an earlier one, 16 targets read two or three times. No
+      warning, no stop; the owner stopped it. The released-result marker even says "run the tool again if you
+      need it", and the host's work log records only changes, never reads, so after a release the model has no
+      record that it has already seen a file.
+    - **4. Each step reprocesses the whole window once pruning starts.** Dropping the oldest turn every step
+      invalidates the prefix: cached tokens fell to 1,257 of ~15,000 from step 22 on, and the step time went
+      from a median 1.8 s to 18.4 s.
+    - **5. "Resume from the last checkpoint" has no checkpoint.** A follow-up run gets the conversation's
+      *messages* only — the run's work log, journal and progress note are never carried — so the first request
+      was 3,206 tokens: the rules plus one sentence. The model re-explored from zero.
+    - **6. The app wrote its own placeholder into two files.** After a release replaced an earlier write's text
+      with `[Released: N characters ...]`, the 27B copied that sentence back as `content`: Header.tsx and
+      PlanetView.tsx were written as 169-byte placeholder files. The next run then spent four steps trying to
+      understand the file the app had corrupted. Nothing rejects a write whose text is the marker.
+    - **7. A timed-out command loses everything it printed, and its real process survives.** `terminal.rs` kills
+      `cmd.exe` only; the grandchild keeps the pipe. Measured with the same shape as the runner: 0 bytes
+      captured, `node.exe` still running after the kill. Every `npm run dev` in the owner's runs came back
+      "exit 1, (timed out and was killed), stdout (empty)" — and in the reproduction the model concluded from
+      that "the development server is running successfully".
+    - **8. There is no way to look at the result.** The registry has no page/preview tool; `search::extract_page`
+      exists but is not wired to anything. Rule 8 of the prompt tells the model that opening a browser shows it
+      nothing, which is true today, so "review it yourself and fix obvious UI issues" cannot be done.
+    - **9. Smaller things measured:** the compaction threshold in the context popup comes from the last run's
+      recorded usage, so a 90 -> 80 change only appears after the next step (`contextUsage.ts` prefers
+      `usage.compact_at_pct`, and nothing refetches `/context` when settings are saved); POSIX pipelines fail on
+      `cmd.exe` with no corrective hint (`'tail' is not recognized`, twice in one run); `npx tailwindcss init -p`
+      failed three times identically in the 26B run (Tailwind 4 has no `init`; the identical-failure stop allows
+      three).
+
+62. **2026-09-18 05:30-06:55 The seven fixes from decision 61, built (owner approved 1-6, then 7 after an
+    explanation; the owner also asked that models be taught to keep HANDOFF.md and MEMORY.md, and that the
+    iteration limit stop being what ends a run).**
+    1. **The token estimate measures the whole request.** `llamaserver::prompt_chars` now counts a call's
+       `arguments` and the tool definitions, not only message text, so the learned characters-per-token ratio
+       stops collapsing when a model writes files through the tool interface.
+    2. **Compaction runs before releasing.** The loop used to release old tool results first and then re-check
+       whether a summary was due, which it never was. The note is written first; pruning stays as the safety
+       net below. The compaction block now also carries **what the run has already inspected** (a line per
+       file read, folder listed, search and preview), and the released-result note no longer invites a re-read.
+    3. **Loops are caught across a run, not between two steps.** `agent_progress::LoopWatch` counts steps with
+       no change to the project and how many of them repeat earlier inspections: at 8 steps with 3 repeats the
+       model is told what it has already looked at and asked for the next change; at 18 with 6 (or 30 steps
+       with nothing changed at all) the run stops and keeps its work. A run that may not write (a plan or a
+       question) is judged on repetition alone. `max_iterations` is now a safety ceiling of 400 (settings
+       accept 1-5000) rather than the thing that ends a run.
+    4. **Commands keep their output and take their children with them.** `terminal::run` collects both streams
+       as they arrive and kills the whole process tree (`taskkill /T /F` on Windows, the process group
+       elsewhere), so a timed-out command returns what it printed. A command meant to keep running goes to the
+       background instead: `execute_command {"background": true}` returns an id after watching it settle,
+       `{"background_id": N}` reads it later, `{"background_id": N, "stop": true}` ends it, and every
+       background command started by a run is stopped when the run ends.
+    5. **A run can look at what it built.** New tool `preview_page {"url": "http://localhost:5173"}`: it waits
+       for the server, renders the page in the installed browser with no window (`--headless=new --dump-dom`),
+       and reports the status line, the title, the text a reader would see, and what the page logged, saying so
+       plainly when the page is blank. Loopback addresses only; nothing leaves the machine. Offered on windows
+       of 16K or more, where a page report fits.
+    6. **A follow-up continues instead of starting over.** A run in a session that already did work seeds its
+       task turn with the host's record of that work (rebuilt from `tool_executions`) and with HANDOFF.md and
+       MEMORY.md if the project has them.
+    7. (a) A write whose text is the host's own release note is refused with an explanation, so the note can
+       never become a file again. (b) The context meter reads the compaction threshold from the setting unless
+       a run is going (a run keeps the threshold it started with), and the meter refreshes when settings are
+       saved. (c) A command the shell does not have is answered with the shell's own equivalent.
+    - **Also asked for and done:** models are told to keep HANDOFF.md and MEMORY.md as they work (rule 8b, on
+      windows with room for it), and a changed line in the agent tab's diff is coloured across the whole line
+      (`width: max-content; min-width: 100%`), measured at 1,106 px of 1,106 where it was 519 px before, so
+      scrolling right no longer shows unpainted background.
+    - **Measured on the same prompt, the same model and the same window (32K), before and after:**
+
+      | | before | after |
+      |---|---|---|
+      | steps | 30 (the ceiling) | 45, ended by the repeat guard on a failing edit |
+      | what was built | no project at all: no index.html, no vite config, no entry point | a scaffolded Vite project, dependencies installed, dev server running |
+      | `npm run dev` | timed out, exit 1, stdout `(empty)`; the model concluded "the development server is running successfully" | returned what it printed, and the model restarted it with `"background": true` and got an id |
+      | estimate vs real prompt | 1.13x to 2.42x | 0.89x to 1.14x |
+      | compactions | 0 | 2 (one summarized 39 turns, 22,694 to 7,627 tokens, note plus host record) |
+
+      The app the model produced still does not compile: its own JSX in a 295-line component. That is the
+      model, not the host - and this time the host said so and stopped instead of circling.
+    - Two smaller things the owner asked about while this was built: a model is now told whether the workspace
+      is itself a project or a folder of projects (one built in the root and another made a folder, and neither
+      had been told which this was), and rule 4 absorbed the old "run builds and tests" rule rather than
+      repeating it.
+    - Tests: backend 480 pass (4 ignored), frontend 109 pass, tsc clean. Not committed.
+
+63. **2026-09-18 06:55-07:05 Verification on the owner's other model, then two more owner decisions: notes the
+    model keeps, and no step ceiling at all.**
+    - **The 26B, the owner's prompt, the fixed build, a fresh workspace.** 60 steps in 10.5 minutes (a
+      mixture-of-experts model, 26B total with 4B active, loaded hybrid at 32K in 50 s): a scaffolded Vite
+      project and 30 files under `src/components`, and - unprompted by anything but rule 4b - MEMORY.md and
+      HANDOFF.md as its fifth and sixth actions. The estimate tracked the real prompt at 1.03x. It reached the
+      step ceiling the test set while still producing.
+    - **Then "resume from the last checkpoint" on it**, the same words that had sent the 27B into 43 steps of
+      re-reading. The run opened with "Continuing work already done in this session: 59 recorded action(s) and
+      the project's own notes", worked for 58 steps (21 edits, 12 writes, 3 compactions) and was stopped by the
+      repeat guard when the same edit_file failed three times. The build went from broken syntax to six tidy-up
+      errors (unused imports, one missing prop). The remaining weakness is the model's edit_file arguments, not
+      the host.
+    - **Notes the model keeps (owner: "implement and measure it").** The summary written at each compaction is
+      fresh prose, so anything the model worked out but did not repeat in it was lost. New tool `remember`
+      ({"note": "...", "replace": "..."}): up to 12 short facts that live in the task turn, which nothing
+      prunes, and are re-attached after every compaction. Measured on a task that reads a configuration first,
+      writes ten modules in the middle (forcing compaction at 45%), and must state the configuration's values
+      at the end; see the table below.
+    - **The step ceiling is gone (owner).** `max_iterations` is removed from settings, from the API and from
+      the UI, and the run loop is unbounded. What ends a run is evidence: six steps with nothing executed
+      (`ProgressGuard`), the same call failing three times (`FailedCalls`), 18 steps with nothing changed and
+      six of them repeats or 30 with nothing changed at all (`LoopWatch`), the completion check, or the user.
+      An old settings file keeps its `max_iterations` key; it is ignored.
+    - **One guard added with the ceiling gone:** writing the same file over and over without ever building,
+      testing or opening the project is the other way to look busy while going nowhere, and nothing bounded it
+      any more. `LoopWatch` now counts writes of one path with no command or preview in between: at four the
+      model is told to check what it has written, at seven the run stops and says which file it was. A build
+      or a preview between writes clears the count, and writing different files never counts at all.
+      **Corrected the same day, on the owner's point:** counting any repeated write would have stopped a model
+      writing a long file in parts, which rule 2c tells it to do. Only writes of the *same text* with nothing
+      run in between end a run (three of them); different edits are warned about once and never stopped, and
+      `append_file` never counts.
+    - **The kept-notes measurement (owner: "implement and measure it").** Task: read `config/service.json`,
+      write twelve modules (6 to 10 compactions in an 8K window), then report the configuration's values.
+      Three arms of the same model, three runs each, in `docs/validation/2026-09-18-agent-context-and-loops.md`.
+      The tool alone changed nothing: the E4B never called it. What changed the outcome was the compaction
+      instruction: asking for the values themselves rather than where they were read turned "I have read
+      config/service.json previously" into "Service Name observatory-relay, Port 8412, Region eu-west-3,
+      Retry Count 7", and that run wrote its report without reading the file again (1 read where every earlier
+      run needed 2). With a reminder in the block the model then used `remember` in two runs of three.
+    - **The loop watch proved itself while measuring.** With no ceiling in force, a run that had already
+      finished its twelve modules and its report carried on reading them back and ended itself at step 72:
+      "18 steps passed without a single change to the project, and 9 of them repeated something already
+      inspected." Work kept, circling stopped - which is what the owner asked for instead of a step count.
+
+64. **2026-09-18 ~07:15 Remove a project, and its tasks with it (owner: "right now I can just add and it stays
+    there").** `DELETE /api/workspaces/:id?tasks=delete|keep`: the default keeps the chats (they report a
+    missing project until relinked, as before), `tasks=delete` removes them with their transcripts, tool
+    history and attachments, and the answer says how many there were and how many went
+    (`{deleted, chats, chats_deleted}`). A run still working in one of those chats is a 409 naming the task.
+    **The folder on disk is never touched** - asserted in the test, because that is the one way this could be
+    a disaster rather than a tidy-up. In the UI each project group in the code sidebar has a remove button
+    beside its "+", which opens an alert dialog naming the folder that stays, a switch for "delete its N tasks
+    as well" (on by default, the wording and the confirm button change with it), and the warning that
+    transcripts go with them. Checked live: removing a project with two tasks left the other project and its
+    task untouched, the folder on disk in place, and the toast said so.
+
+65. **2026-09-18 ~07:30 Four tools the runs asked for, and three noted for later (owner picked 1-4 of the
+    seven suggested).**
+    - **`replace_lines {path, from, to, text, expect?}`** - editing by the line numbers `read_file` already
+      prints. Every run that died on 2026-09-18 died on `edit_file` arguments: the E4B sent it without a path,
+      the 26B's `old` text never matched, and both were stopped by the repeat guard for it. Reproducing code
+      byte for byte is the hard part for a small model; two numbers are not. `expect` optionally carries the
+      first line as the model read it, and a mismatch refuses rather than destroying the wrong lines. The
+      answer says how the numbering moved.
+    - **`outline {path}`** - a file's definitions with their line numbers, or a folder's files with their
+      sizes and line counts (`outline.rs`). Reading is what filled the window: one run read fourteen whole
+      files to find things, another paged the same 450-line component over and over. The line numbers feed
+      `replace_lines` directly.
+    - **The project's own instructions reach code sessions.** `AGENTS.md` / `CLAUDE.md` / `MUSE.md` /
+      `PROJECT.md` were shown in chat since Stage 24 and never in a code run, which is where they apply. The
+      first one found is appended to the system prompt, cut to the window's share, and framed as how to work
+      in this project - explicitly not as something that changes the host's rules or what needs approval, so a
+      file in a repository cannot talk its way past them.
+    - **`project_check {path?}`** (`project_check.rs`) - finds what the project is (package.json scripts,
+      Cargo.toml, go.mod, Python tests), runs its build and then its tests, and reports the problems as
+      `file:line: message`, deduplicated and capped, instead of a wall of output. A failed build stops it
+      before the tests, which would say nothing. A placeholder `"test": "echo no test specified"` is not a
+      test. A folder that is not a project is told so, with what to do instead.
+    - **A PC without the toolchain (owner question).** The app itself needs none of this: Python, npm, cargo
+      and go are the *project's* tools, not the app's. `project_check` now looks for the program on PATH the
+      way a shell does (`.exe`, `.cmd`, `.bat` on Windows; Python under python, python3 or py) and, when it is
+      not there, says "npm is not installed on this PC (it is not on PATH)" and points at execute_command
+      instead of running a command that would fail with a shell error nobody can act on.
+    - **Found by the first live run of the new tools:** `python -m unittest discover -q` from the project root
+      found nothing (exit code 5) on the ordinary layout - a `tests/` folder with no `__init__.py` beside the
+      code it imports - and the report called that "no error line could be picked out". Discovery now runs
+      inside `tests` with the project root on the import path, which is what a person would type; exit code 5
+      is reported as "the runner found no tests to run"; and a build that cannot compile stops the run before
+      the tests.
+    - **Room:** the instructions may not take more than half of a small window's history room, and each tool
+      costs its description and arguments in every request. `preview_page`, `project_check`, `git_commit`,
+      `list_processes` and `system_info` are therefore offered only on windows of 16K or more, and `edit_file`
+      now points at `replace_lines` in one line instead of explaining itself in three.
+    - **Noted for later (the owner's "we will get back to them"):** a layout report on top of `preview_page`
+      (element boxes, off-screen and overflowing elements - the 26B's dashboard rendered correctly and sat
+      below the fold, which reading the page text would never catch); screenshots into the chat's artifacts
+      panel so the user can see what was built even though local models cannot; and a changes view for the run
+      (what it has written, with sizes and a diff against where it started) as both a tool and a panel.
+
+66. **2026-09-18 ~08:00 The other three tools (owner: "target the last 3 too").**
+    - **The browser is now driven, not just started** (`cdp.rs`). The command-line flags can dump a page and
+      take a picture of it and nothing else, so `preview_page` could not say how big anything was or where it
+      ended up - which is how the 26B's dashboard passed as "renders fine" while sitting entirely below the
+      fold. `cdp.rs` speaks the DevTools protocol over a WebSocket written by hand (handshake, masked frames
+      out, unmasked frames in, pings answered; base64 was already a dependency, nothing new was added). The
+      browser is started with `--remote-debugging-port=0` and its port read from its own output, so nothing is
+      assumed about what is free.
+    - **`preview_page` now reports the layout**: window and page size, how many elements, how far the page
+      overflows sideways and what is too wide, what sits below the first screen, what is outside the window
+      altogether, and boxes with content but no size. Console messages now come from the browser's own events
+      (`Runtime.consoleAPICalled`, `Runtime.exceptionThrown`, `Log.entryAdded`) rather than from parsing its
+      error stream, and the build-error overlay is detected by looking for it rather than by matching text.
+      When the browser cannot be driven on a PC, the old dump-the-page path still answers.
+    - **Screenshots go to the conversation's Artifacts panel** (`preview_for_run` in the agent runner). A local
+      model cannot look at an image; the person who asked for the work can, and that is the point. The picture
+      is taken through the same session (`Page.captureScreenshot`), stored with the conversation, and named in
+      the report the model reads.
+    - **`changes`** answers what this task has created, changed or deleted, with each file's size now. The host
+      has always kept that record for compaction; a run could not ask for it, so a model whose earlier turns
+      had been summarized away could not tell what it had already built without reading the folder again.
+    - Room again: `changes` joins the tools offered only on windows of 16K or more, so a 4K window's
+      instructions still leave more than half its room for history.
+    - **Checked against a real browser and real runs.** An ignored test (`preview_measures_a_real_page`, run
+      with `cargo test -- --ignored`) drives a page built to fail the way the 26B's did - content under a
+      full-height sidebar, a strip wider than the window, a thrown exception - and the report came back:
+      "window 1258x702, page 1824x905, 8 elements / The page is 566 px wider than the window ... div.too-wide
+      1800x40 at 24,841 / Below the first screen ... main.main 1258x184 at 0,721", with the page's own log,
+      its 404 and its ReferenceError, and a screenshot on disk. Then in a live run against the 26B's own
+      project the model called preview_page and reported back that the dashboard's panels sit below the first
+      screen; its screenshot is in that conversation's Artifacts panel (12 KB PNG). A second live run edited a
+      file - with `replace_lines`, unprompted - and `changes` answered "1 file(s) changed by this task:
+      src/App.css: changed, now 23 lines (504 bytes)".
+    - **Two bugs found by those checks, both fixed:** the browser's debugging port answers HTTP but never
+      closes the connection, so reading to the end of the stream timed out (it is read by Content-Length
+      now); and the 16-bit WebSocket length was parsed from the wrong two bytes, which mangled every frame
+      over 125 bytes. Also: tools the run carries out itself (preview_page, changes, remember) were missing
+      from the audit trail, which records every other tool - they are recorded now.
+
+67. **2026-09-18 ~08:30 Two minutes of nothing, twice (owner: "I need you to watch what the app is doing
+    right now it seems stuck").** Watching a live run: at 02:51:30 and again at 02:54:22 the model ran
+    `npx serve .` in the foreground. That command is not meant to finish, so each one sat there for the full
+    two-minute timeout and then came back as "killed after 120s" - four minutes of a run spent on nothing,
+    and in between the model had already started the same server correctly in the background. Two changes:
+    - **A command that never exits is now refused in the foreground before it is run** (`keeps_running` in
+      `terminal.rs`, checked in `execute_command`). It recognises the usual dev and static servers, watchers
+      and `--watch` flags, and answers immediately with what to do instead: send the same command with
+      `"background": true`, and you get its output and the address it prints. The refusal costs one step
+      rather than two minutes. Ordinary commands (`npm run build`, `npm install`, `cargo test`, `git status`)
+      are untouched - both halves are in the test.
+    - **The same server started twice gives back the one already running.** A run that asks for a command it
+      already has up, still alive, gets that process back instead of a second one binding a second port
+      (measured live: four servers for one folder). Commands are grouped per run, so this never reaches
+      another conversation's processes.
+    - **The diff colours now cover the whole line** (owner: "no matter how right I scroll it should have that
+      colour"). The red and green stopped where the text stopped. The lines now share one box as wide as the
+      longest of them and each line fills that box: sizing each line to its own text left short lines ending
+      in mid-air, and sizing them to the container cut the colour off at the right edge. Measured in the
+      browser pane: every line 954 px, the same as the scroll width.
+    - Green after all three: 497 backend tests, 110 frontend tests, `tsc` clean, both builds rebuilt so the
+      running app picks them up.
+
+    - *Times in entries 62-67 were corrected afterwards against the files' own timestamps
+      (`agent_progress.rs` 06:55, `api.rs` 07:16, `project_check.rs` 07:38, `cdp.rs` 08:00): the clock
+      readings written at the time ran several hours ahead of the machine's.*
 
 ## Blocked / needs the owner
 

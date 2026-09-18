@@ -292,6 +292,11 @@ pub struct InferenceConfig {
     /// read (older runtimes do not report them).
     #[serde(default)]
     pub template_caps: Option<TemplateCaps>,
+    /// How this model calls tools, as its tool check measured it on this
+    /// machine (`models/<folder>/tooling.json`). None when it has no current
+    /// check; the agent then keeps the app's text action format.
+    #[serde(default)]
+    pub tooling: Option<crate::tooling::ToolingProfile>,
     pub temperature: f32,
     pub top_p: f32,
     pub top_k: u32,
@@ -328,6 +333,7 @@ impl Default for InferenceConfig {
             builtin_chat_format: None,
             chat_template: ChatTemplateShape::default(),
             template_caps: None,
+            tooling: None,
             temperature: 0.7,
             top_p: 0.9,
             top_k: 40,

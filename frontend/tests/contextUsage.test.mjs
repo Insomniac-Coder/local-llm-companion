@@ -50,3 +50,13 @@ test('historical input uses its recorded window instead of a newly configured mo
   context.agent_context.usage.context_limit = 4096;
   assert.equal(contextDisplay(context).health, 'critical');
 });
+
+test('a changed compaction threshold shows at once, and a running agent keeps the one it started with', () => {
+  // The setting is lowered from 90 to 80 while the last run's record still says 90.
+  const idle = { ...saved, compact_at_pct: 80, agent_context: { active: false, run_id: 'run', iteration: 9, usage: { ...usage, compact_at_pct: 90 } } };
+  assert.equal(contextDisplay(idle).compactAt, 80);
+  const running = { ...idle, agent_context: { ...idle.agent_context, active: true } };
+  assert.equal(contextDisplay(running).compactAt, 90, 'a run keeps the threshold it read when it started');
+  assert.equal(contextDisplay({ ...idle, auto_compact: false }).compactAt, 0, 'off is off whatever was recorded');
+  assert.equal(contextDisplay({ ...saved, compact_at_pct: 85 }).compactAt, 85, 'with no run at all the setting stands');
+});

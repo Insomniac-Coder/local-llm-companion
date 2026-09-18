@@ -79,6 +79,17 @@ pub struct ModelMetadata {
     /// template's source suggests it. Filled in by the model list.
     #[serde(default, skip_deserializing)]
     pub tool_support_source: Option<String>,
+    /// A fingerprint of the chat template the model is served with (its own,
+    /// or the runtime's built-in format), so a tool check made with another
+    /// template is known to be out of date.
+    #[serde(default, skip_deserializing)]
+    pub template_fingerprint: Option<String>,
+    /// How the model calls tools, from `tooling.json` beside it.
+    #[serde(default, skip_deserializing)]
+    pub tooling: Option<crate::tooling::ToolingProfile>,
+    /// Whether that check is current for this runtime and template.
+    #[serde(default, skip_deserializing)]
+    pub tooling_state: Option<crate::tooling::ProfileState>,
     #[serde(default)]
     pub projector_file: Option<String>,
     /// GGUF filename inside `dir`. Older metadata omits this and continues to
@@ -460,10 +471,12 @@ impl AttentionShape {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct TemplateHints {
     thinking: bool,
     tools: bool,
+    /// `tooling::template_fingerprint` of the template text.
+    fingerprint: Option<String>,
     /// What the template refuses outright. Default permissive: a template is
     /// only called strict when it raises on the shape itself.
     shape: crate::inference::ChatTemplateShape,
@@ -474,6 +487,7 @@ impl Default for TemplateHints {
         Self {
             thinking: false,
             tools: false,
+            fingerprint: None,
             shape: crate::inference::ChatTemplateShape::default(),
         }
     }
@@ -507,6 +521,7 @@ fn template_hints(template: &str) -> TemplateHints {
             || lower.contains("reasoning_effort")
             || lower.contains("thinking_mode"),
         tools: template_handles_tools(&lower),
+        fingerprint: Some(crate::tooling::template_fingerprint(template)),
         shape: template_shape(&lower),
     }
 }
@@ -1044,6 +1059,9 @@ fn inferred_metadata(
         load_issues: load_issues(header.layout, header.architecture.as_deref()),
         builtin_chat_format: fallback_chat_format(header),
         tool_support_source: None,
+        template_fingerprint: served_template_fingerprint(header),
+        tooling: None,
+        tooling_state: None,
         kv_bytes_per_token: header.kv_bytes_per_token,
         weights_bytes: Some(model_set_bytes(gguf)).filter(|bytes| *bytes > 0),
         block_count: header.block_count,
@@ -1062,6 +1080,16 @@ fn inferred_metadata(
         },
         loaded: false,
     }
+}
+
+/// The template a model is served with: its own, or for a file without one
+/// the runtime's built-in format that the load path selects.
+fn served_template_fingerprint(header: &GgufHeader) -> Option<String> {
+    header
+        .template
+        .fingerprint
+        .clone()
+        .or_else(|| fallback_chat_format(header).map(|format| format!("built-in {format}")))
 }
 
 /// Scan model folders and root-level GGUF files. A metadata.json remains the
@@ -1163,6 +1191,7 @@ pub fn scan_models_dir(dir: &std::path::Path) -> (Vec<ModelMetadata>, Vec<String
                         continue;
                     };
                     m.builtin_chat_format = fallback_chat_format(&header);
+                    m.template_fingerprint = served_template_fingerprint(&header);
                     m.load_issues = load_issues(header.layout, header.architecture.as_deref());
                     if let Some(architecture) = header.architecture {
                         m.architecture = architecture;
@@ -1276,6 +1305,9 @@ mod tests {
             load_issues: Vec::new(),
             builtin_chat_format: None,
             tool_support_source: None,
+            template_fingerprint: None,
+            tooling: None,
+            tooling_state: None,
             parameters: "8B".into(),
             context_length: 32768,
             vision: false,
@@ -1523,11 +1555,15 @@ mod tests {
             TemplateHints {
                 thinking: true,
                 tools: true,
+                fingerprint: Some(crate::tooling::template_fingerprint(thinking_template)),
                 shape: Default::default(),
             }
         );
         let chatml = "{% for message in messages %}<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>\n{% endfor %}";
-        assert_eq!(template_hints(chatml), TemplateHints::default());
+        assert_eq!(
+            template_hints(chatml),
+            TemplateHints { fingerprint: Some(crate::tooling::template_fingerprint(chatml)), ..TemplateHints::default() }
+        );
         // A file whose template declares thinking is registered as reasoning-
         // capable even without metadata.json; a plain template is not.
         let root = scan_fixture();

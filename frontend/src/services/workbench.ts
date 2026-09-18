@@ -19,9 +19,12 @@ export const KEYBOARD_PERMISSION_MODES = ['ask', 'accept_edits', 'plan'] as cons
 
 /** Shift+Tab in a code session: the next permission mode, wrapping around.
  *  From Auto it returns to Ask. */
-export function nextPermissionMode(mode: string): PermissionModeName {
-  const index = (KEYBOARD_PERMISSION_MODES as readonly string[]).indexOf(mode);
-  return index < 0 ? 'ask' : KEYBOARD_PERMISSION_MODES[(index + 1) % KEYBOARD_PERMISSION_MODES.length];
+/** `available`: the modes the loaded model allows; others are skipped. */
+export function nextPermissionMode(mode: string, available: readonly string[] = PERMISSION_MODES): PermissionModeName {
+  const cycle = KEYBOARD_PERMISSION_MODES.filter((option) => available.includes(option));
+  if (cycle.length === 0) return 'ask';
+  const index = (cycle as readonly string[]).indexOf(mode);
+  return index < 0 ? cycle[0] : cycle[(index + 1) % cycle.length];
 }
 
 /** How long Shift+Tab waits for the next press before saving where it stopped. */

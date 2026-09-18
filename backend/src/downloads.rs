@@ -469,7 +469,8 @@ pub fn describe_model(
     ram_gb: f64,
 ) -> ModelEstimates {
     let gguf = meta.gguf_path();
-    let file_bytes = std::fs::metadata(&gguf).map(|m| m.len()).ok();
+    // Every part of a split model: the first part alone is its metadata.
+    let file_bytes = Some(crate::models::model_set_bytes(&gguf)).filter(|bytes| *bytes > 0);
     let file_gb = file_bytes.map(|b| (b as f64) / 1_073_741_824.0);
     let gguf_present = gguf.is_file();
     let projector_present = meta

@@ -1,6 +1,8 @@
 import type { GenerationPhase, OutputTiming } from './outputTiming';
 export const API = '';
 
+import type { ToolingProfile, ToolingState } from './tooling';
+
 export interface ModelMeta {
   id: string;
   name: string;
@@ -14,6 +16,10 @@ export interface ModelMeta {
   supports_reasoning?: boolean;
   /** Structural reasons this file may not load or chat correctly (advisory). */
   load_issues?: string[];
+  /** How the model calls tools, from its tool check (tooling.json beside it). */
+  tooling?: ToolingProfile | null;
+  /** Whether that check was made for this runtime and chat template. */
+  tooling_state?: ToolingState | null;
   loaded: boolean;
 }
 
@@ -66,6 +72,11 @@ export async function loadModel(id: string, force = false) {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ id }),
   });
+}
+
+/** Check again how the loaded model calls tools. */
+export async function recheckTooling(id: string): Promise<{ tooling: ToolingProfile; summary: string }> {
+  return req(`/api/models/${encodeURIComponent(id)}/tooling/check`, { method: 'POST' });
 }
 
 export async function unloadModels() {
@@ -440,6 +451,12 @@ export interface Workspace {
 
 export async function listWorkspaces(): Promise<Workspace[]> {
   return req('/api/workspaces');
+}
+
+/** Remove a project from the app. The folder on disk is never touched; `tasks`
+ *  decides whether the sessions that work in it go with it. */
+export async function deleteWorkspace(id: string, tasks: 'delete' | 'keep'): Promise<{ deleted: string; chats: number; chats_deleted: number }> {
+  return req(`/api/workspaces/${id}?tasks=${tasks}`, { method: 'DELETE' });
 }
 
 export async function createWorkspace(name: string, path: string, create = false): Promise<Workspace> {

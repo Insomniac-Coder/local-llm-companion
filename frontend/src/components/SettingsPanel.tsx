@@ -335,7 +335,6 @@ export default function SettingsPanel({ setToasts }: { setToasts: React.Dispatch
               <SettingField label="Top-k"><Num obj={s.inference} k="top_k" set={(value) => set(['inference', 'top_k'], value)} /></SettingField>
               <SettingField label="Repeat penalty"><Num obj={s.inference} k="repeat_penalty" set={(value) => set(['inference', 'repeat_penalty'], value)} /></SettingField>
               <SettingField label="Recent messages kept after compaction"><Num obj={s.memory} k="compaction_keep_turns" set={(value) => set(['memory', 'compaction_keep_turns'], value)} /></SettingField>
-              <SettingField label="Agent iteration limit"><Num obj={s.agent} k="max_iterations" set={(value) => set(['agent', 'max_iterations'], value)} /></SettingField>
               <SettingField label="Maximum search results"><Num obj={s.search} k="max_results" set={(value) => set(['search', 'max_results'], value)} /></SettingField>
               <SettingField label="Search timeout (seconds)"><Num obj={s.search} k="timeout_secs" set={(value) => set(['search', 'timeout_secs'], value)} /></SettingField>
             </div>
