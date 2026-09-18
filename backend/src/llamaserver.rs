@@ -52,10 +52,10 @@ impl SidecarBinary {
         let stderr = Arc::new(Mutex::new(Vec::new()));
         let mut tasks = Vec::new();
         if let Some(pipe) = child.stdout.take() {
-            tasks.push(drain_worker_log(pipe, stdout.clone()));
+            tasks.push(drain_worker_log(pipe, stdout.clone(), None));
         }
         if let Some(pipe) = child.stderr.take() {
-            tasks.push(drain_worker_log(pipe, stderr.clone()));
+            tasks.push(drain_worker_log(pipe, stderr.clone(), None));
         }
         let success = match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
             Ok(Ok(status)) => status.success(),
@@ -384,6 +384,11 @@ fn explain_load_failure(log: &str) -> Option<String> {
 pub struct RunningSidecar {
     child: Child,
     log_tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// The last 8 KB the model server printed (the full output is in the
+    /// model server's log on disk).
+    log_tail: Arc<Mutex<Vec<u8>>>,
+    /// Set once the process is seen to have ended by itself.
+    exited: Option<std::process::ExitStatus>,
     pub base_url: String,
     pub cfg: InferenceConfig,
     pub started_at: chrono::DateTime<chrono::Utc>,
@@ -416,6 +421,7 @@ impl RunningSidecar {
         drop(port_check);
         let args = server_args(&cfg, port);
         tracing::info!("spawning {} {}", binary.display(), args.join(" "));
+        crate::logfile::model_server_note(&format!("starting {} {}", binary.display(), args.join(" ")));
         let mut command = Command::new(binary);
         command
             .args(&args)
@@ -437,10 +443,10 @@ impl RunningSidecar {
         let log_tail = Arc::new(Mutex::new(Vec::new()));
         let mut log_tasks = Vec::new();
         if let Some(stdout) = child.stdout.take() {
-            log_tasks.push(drain_worker_log(stdout, log_tail.clone()));
+            log_tasks.push(drain_worker_log(stdout, log_tail.clone(), crate::logfile::model_server()));
         }
         if let Some(stderr) = child.stderr.take() {
-            log_tasks.push(drain_worker_log(stderr, log_tail.clone()));
+            log_tasks.push(drain_worker_log(stderr, log_tail.clone(), crate::logfile::model_server()));
         }
         let base_url = format!("http://127.0.0.1:{port}");
         // Wait for /health before returning so callers never race startup.
@@ -477,15 +483,19 @@ impl RunningSidecar {
                 (None, Some(line)) => format!("{started} The runtime's last error: {line}"),
                 (None, None) => started,
             };
+            crate::logfile::model_server_note(&format!("did not become ready: {plain}"));
             return Err(InferenceError::Generation(if tail.is_empty() {
                 plain
             } else {
                 format!("{plain}{RUNTIME_DIAGNOSTIC_MARKER}{tail}")
             }));
         }
+        crate::logfile::model_server_note(&format!("ready at {base_url}"));
         Ok(Self {
             child,
             log_tasks,
+            log_tail,
+            exited: None,
             base_url,
             cfg,
             started_at: chrono::Utc::now(),
@@ -494,6 +504,9 @@ impl RunningSidecar {
 
     /// Graceful stop: SIGTERM-equivalent, then hard kill after 5 s.
     pub async fn stop(mut self) {
+        if self.exited.is_none() {
+            crate::logfile::model_server_note("stopped by Companion");
+        }
         // `Child::kill` on Windows terminates; on unix it SIGKILLs. Good enough
         // for Stage 3; graceful SIGTERM negotiation lands with log streaming.
         let _ = self.child.start_kill();
@@ -505,7 +518,84 @@ impl RunningSidecar {
     }
 
     pub fn is_alive(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
+        if self.exited.is_some() {
+            return false;
+        }
+        match self.child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(status)) => {
+                let how = describe_exit(status);
+                tracing::warn!(base_url = %self.base_url, "the model server ended by itself: {how}");
+                crate::logfile::model_server_note(&format!("ended by itself: {how}"));
+                self.exited = Some(status);
+                false
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// When the process ended by itself: how it ended, and the last error
+    /// line it printed if there was one.
+    pub fn stop_report(&self) -> Option<String> {
+        let status = self.exited?;
+        let tail = self
+            .log_tail
+            .lock()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default();
+        Some(match last_runtime_error(&tail) {
+            Some(line) => format!("{}; its last error: {line}", describe_exit(status)),
+            None => describe_exit(status),
+        })
+    }
+}
+
+/// How a process ended, in plain words. Windows reports it only as a number,
+/// so the common ones are named; the number is always kept.
+fn describe_exit(status: std::process::ExitStatus) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            let what = match signal {
+                6 => "it aborted",
+                9 => "it was killed",
+                11 => "it crashed",
+                15 => "it was asked to stop",
+                _ => "it was ended by a signal",
+            };
+            return format!("{what} (signal {signal})");
+        }
+    }
+    let Some(code) = status.code() else {
+        return "it ended without an exit code".into();
+    };
+    if code == 0 {
+        return "it exited normally (code 0)".into();
+    }
+    let raw = code as u32;
+    let number = if raw >= 0xC000_0000 {
+        format!("{raw:#010X}")
+    } else {
+        code.to_string()
+    };
+    let meaning = if cfg!(windows) {
+        match raw {
+            1 => Some("an error it reported, or it was ended from outside: Task Manager and taskkill end a program with code 1"),
+            3 => Some("it aborted after a failed internal check"),
+            0xC000_0005 => Some("it crashed (memory access violation)"),
+            0xC000_0409 => Some("it stopped itself after a fatal error"),
+            0xC000_00FD => Some("it crashed (stack overflow)"),
+            0xC000_0017 | 0xC000_012D => Some("it ran out of memory"),
+            0xC000_013A => Some("it was closed the way Ctrl+C closes a program"),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    match meaning {
+        Some(meaning) => format!("exit code {number}: {meaning}"),
+        None => format!("exit code {number}"),
     }
 }
 
@@ -544,13 +634,17 @@ fn normalized_executable_path(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
+/// Reads a pipe to its end, keeping the last 8 KB in `tail` and, for the
+/// model server itself, every line in its log on disk.
 fn drain_worker_log(
     mut pipe: impl tokio::io::AsyncRead + Unpin + Send + 'static,
     tail: Arc<Mutex<Vec<u8>>>,
+    disk: Option<&'static crate::logfile::RotatingLog>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         use tokio::io::AsyncReadExt;
         let mut chunk = [0u8; 4096];
+        let mut lines = crate::logfile::LineStamper::default();
         while let Ok(count) = pipe.read(&mut chunk).await {
             if count == 0 {
                 break;
@@ -559,6 +653,18 @@ fn drain_worker_log(
                 bytes.extend_from_slice(&chunk[..count]);
                 let excess = bytes.len().saturating_sub(8192);
                 bytes.drain(..excess);
+            }
+            if let Some(disk) = disk {
+                let stamped = lines.push(&chunk[..count]);
+                if !stamped.is_empty() {
+                    disk.append(&stamped);
+                }
+            }
+        }
+        if let Some(disk) = disk {
+            let rest = lines.finish();
+            if !rest.is_empty() {
+                disk.append(&rest);
             }
         }
     })
@@ -1623,6 +1729,37 @@ impl SidecarClient {
         self.complete(body, cfg).await
     }
 
+    /// A host-side request on the run's own transcript: the completion check
+    /// and the compaction note. As `chat_turns_without_reasoning`, plus the
+    /// run's tool list with `tool_choice: "none"`. Templates write the tool
+    /// definitions at the top of the prompt, so the same request without them
+    /// matched none of the run's cached prompt, and it and the step after it
+    /// were read in full (35,087 and 33,734 tokens in one 26B run). With the
+    /// list it reads only what it adds. "none" keeps the model from calling a
+    /// tool; a call written out as text is no verdict, so it cannot pass a
+    /// check.
+    pub async fn chat_turns_on_run_prompt(
+        &self,
+        turns: &[ChatTurn],
+        max_tokens: u32,
+        cfg: &InferenceConfig,
+        tools: Option<&[serde_json::Value]>,
+    ) -> Result<(String, Metrics), InferenceError> {
+        let mut body = sampling_body(turns, max_tokens, cfg, false);
+        apply_options(
+            &mut body,
+            &RequestOptions {
+                thinking: Some(false),
+                tools: tools.map(<[serde_json::Value]>::to_vec),
+                ..RequestOptions::default()
+            },
+        );
+        if body.get("tools").is_some() {
+            body["tool_choice"] = "none".into();
+        }
+        self.complete(body, cfg).await
+    }
+
     async fn complete(
         &self,
         body: serde_json::Value,
@@ -2136,6 +2273,12 @@ impl LlamaServerManager {
         }
     }
 
+    /// Why the model server is not running, when it ended by itself (not
+    /// when it was stopped or never started).
+    pub fn stop_report(&self) -> Option<String> {
+        self.running.as_ref().and_then(RunningSidecar::stop_report)
+    }
+
     pub fn base_url(&self) -> Option<String> {
         self.running.as_ref().map(|r| r.base_url.clone())
     }
@@ -2163,6 +2306,35 @@ pub struct InferenceStatus {
     pub context_size: u32,
     pub binary_found: bool,
     pub last_error: Option<String>,
+    /// Set when the model server ended by itself: how, and its last error.
+    #[serde(default)]
+    pub stopped: Option<String>,
+}
+
+#[cfg(test)]
+mod exit_tests {
+    use super::describe_exit;
+    use std::process::ExitStatus;
+
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_exit_code_is_named_in_plain_words() {
+        use std::os::windows::process::ExitStatusExt;
+        let crash = describe_exit(ExitStatus::from_raw(0xC000_0005));
+        assert!(crash.contains("0xC0000005") && crash.contains("crashed"), "{crash}");
+        assert!(describe_exit(ExitStatus::from_raw(1)).contains("Task Manager"));
+        assert!(describe_exit(ExitStatus::from_raw(0xC000_013A)).contains("Ctrl+C"));
+        assert_eq!(describe_exit(ExitStatus::from_raw(0)), "it exited normally (code 0)");
+        assert_eq!(describe_exit(ExitStatus::from_raw(7)), "exit code 7");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_signal_is_named_in_plain_words() {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(describe_exit(ExitStatus::from_raw(9)), "it was killed (signal 9)");
+        assert_eq!(describe_exit(ExitStatus::from_raw(1 << 8)), "exit code 1");
+    }
 }
 
 #[cfg(test)]
@@ -2675,7 +2847,7 @@ mod tests {
         use tokio::io::AsyncWriteExt;
         let (reader, mut writer) = tokio::io::duplex(1024);
         let tail = Arc::new(Mutex::new(Vec::new()));
-        let task = drain_worker_log(reader, tail.clone());
+        let task = drain_worker_log(reader, tail.clone(), None);
         let data = vec![b'x'; 128 * 1024];
         tokio::time::timeout(Duration::from_secs(2), writer.write_all(&data))
             .await

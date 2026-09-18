@@ -1659,6 +1659,172 @@ Updated continuously so it survives context compaction. Read this after `docs/HA
     - Green after all three: 497 backend tests, 110 frontend tests, `tsc` clean, both builds rebuilt so the
       running app picks them up.
 
+68. **2026-09-18 ~09:25 Diagnosis: the 26B run at 200K that ended in "start Companion again" (owner: "something
+    broke while the agent was running not sure what it was"). Fixes proposed, not built.**
+    - **What the records show** (a copy of the history, Windows' event logs, the desktop app's log): the run started
+      08:37:57 and made 40 model requests. At 08:52:34 the 41st reply broke off mid-stream ("error decoding
+      response body": the connection closed while the reply was arriving). The run recorded "the model request
+      failed ... retry when the model is ready" at 08:52:35, the last thing ever written. No crash report for the
+      model server or the backend, no GPU driver reset, no low-memory event (63 GB RAM, 36 GB free with the model
+      loaded). The laptop slept at 08:53:44 and was restarted from the Start menu at 08:55:37.
+    - **The request did not break the model server.** The last three recorded requests were replayed against the
+      same model and the owner's settings (200K, hybrid placement, q8_0 cache, n-gram drafting), in the order
+      38, 39, 40, 39, 40, 39, 40: all seven finished cleanly, the server healthy after each.
+    - **The desktop app updated itself during the run**: it quit for an update at 08:45:41, and its package
+      was installed at 08:46:46 and again at 08:52:28, six seconds before the reply broke off. A console window
+      opened at 08:26:32 was declared hung and closed at 08:46:46. Whether the run script lived in a window the
+      desktop app started is not recorded anywhere; if it did, the update's shutdown of the app's processes
+      explains a model server stopped without a crash. Asked the owner.
+    - **Why the cause cannot be pinned down: nothing was kept.** The backend logs to its console and to memory;
+      the model server's output is an 8 KB tail in memory, used only when a load fails. A restart erased both.
+    - **Every step from 31 on re-read about 34K tokens.** A fixed cap of 60 turns (`TRANSCRIPT_TURNS`) dropped
+      the oldest turn after the task on every step once reached, so the prompt changed at token 2,298 each time
+      and the cache never matched past it (2,298 cached on requests 31-40 in the run and in every replay).
+      Measured cost: 34K tokens at ~1,184 tok/s = ~29 s of each ~44 s step; with the cache, a step reads its
+      2-3K new tokens in 2-3 s. The cap's own comment says prefix caching makes a long transcript nearly free;
+      the cap is what stopped it.
+    - **`--cache-reuse 256` is on for every model but is a no-op here.** The pinned runtime turns it off when
+      the cache cannot be shifted: a sliding-window cache can shift only when allocated at full size
+      (`--swa-full`, not used), and it is also off when an image projector is loaded. It says so only in its own
+      log. Moved text can only be reused by shifting, so neither cache reuse nor the planned M8 checkpoints would
+      have saved these steps; not changing the start of the prompt does.
+    - **Two messages misled.** The run said "retry when the model is ready" without checking whether the model
+      server was still running. The UI shows "The local runtime isn't responding ... start Companion again with its
+      start script" after one failed status check - which a sleep/resume blip can cause - and says the same when
+      only the model server is down.
+    - **Proposed (owner to choose):** (1) remove the 60-turn cap; when the window really fills, compact or prune
+      in one large step so the cache survives many steps; (2) keep the backend's log and the model server's output
+      on disk, rotated, under the data folder; (3) after a broken reply, check whether the model server is still
+      running: retry the step once if it is, say it stopped (exit code, its last lines) if not; (4) show the
+      runtime notice only after two failed checks, and tell "the model server stopped" apart from "Companion is
+      not answering"; (5) on shutdown, stop running tasks first with an honest reason, and handle the window
+      being closed and Windows shutting down, not only Ctrl+C.
+
+69. **2026-09-18 ~10:00 The five fixes from decision 68, built and checked live (owner: "apply all fixes";
+    and on the cap: "why is there a 60 turn cap? I literally asked you to remove it").**
+    - **Why the cap was still there.** It dates from the project's first commits (2026-09-12/13). When the owner
+      asked for the turn limit to go (decision 63), the step ceiling was removed; this second count - how many
+      turns stay in the prompt, not how many steps a run may take - was missed. It should have gone then.
+    - **(1) No turn count, and one large cut.** `TRANSCRIPT_TURNS` is gone: the transcript is bounded by size
+      only. When it no longer fits, `prune_transcript` cuts back to three quarters of the budget in one go
+      instead of to just under it, so the steps after a cut extend a prompt the cache still holds. The dead
+      `max_iterations: 30` in `agent.rs` (only a test stub read it) is gone too. Tests: 200 steps in a large
+      window drop nothing; a full window is cut once and the next three steps leave the earlier prompt as it was.
+      **Measured live** (small model, 36 one-file steps, 105 turns at the end, nothing pruned): every agent
+      request from 30 to 67 took 90%+ of its prompt from the cache (request 31: 4,915 of 5,010). The owner's
+      run at the same point: 2,298 of 31,342.
+    - **(2) Logs on disk** (`logfile.rs`): `logs/companion.log` (every record the backend logs) and
+      `logs/model-server.log` (the model server's output a line at a time with the time it arrived, plus
+      Companion's notes: the command line it was started with, ready, stopped by Companion, ended by itself and
+      how) in the data folder. 4 MB a file, two older files kept, rotated by renaming - the rename takes the
+      place of the oldest file, which is how a capped log works, not a user file being deleted.
+    - **(3) A model server that ends while answering is named.** The in-place retries already repeated a
+      broken reply while the model server was alive (up to 3, 1/2/4 s). What was missing: when it is not
+      alive, the run said "the model request failed ... retry when the model is ready". Now: "Stopped: the
+      model server stopped while answering (exit code 1: an error it reported, or it was ended from outside:
+      Task Manager and taskkill end a program with code 1). ... load the model again ... Its output is in
+      <data>/logs/model-server.log." Exit codes are put in plain words (`describe_exit`). The same report is
+      in `InferenceStatus.stopped` and in the chat path's message. The owner's run itself shows the model
+      server had already exited at 08:52:34: the reply error was of the retryable kind, yet no retry was
+      recorded, and the retry only stops early when the process is gone.
+    - **(4) Two notices, told apart** (`services/runtimeHealth.ts`). "Companion isn't answering" appears only
+      after two failed status checks in a row; a failure is checked again after 3 s, so a real outage shows in
+      seconds and a blip is forgotten. "The model server stopped" (with how, and a Load it again button)
+      appears when the backend answers but its model server ended by itself.
+    - **(5) Closing records running tasks first** (`AppState::shut_down`, `shutdown.rs`, `main.rs`). Ctrl+C,
+      Ctrl+Break, the window closing, signing out and shutting down (Windows) or SIGTERM and SIGHUP (unix):
+      running tasks are cancelled and recorded with the reason ("Stopped: Companion was closed while this task
+      was running (its window was closed) ..."), then chat generation and the model server stop. For the
+      window closing, signing out and shutdown the process exits straight after: Windows ends it a few seconds
+      later regardless. tokio 1.53 holds its handler thread for those events, so the async side gets that time.
+    - **Checked live, each on a throwaway data folder, one model at a time, 2-minute breaks:**
+      A - kill the model server mid-reply: the run's message, the status's `stopped`, the log's "ended by
+      itself" line and the saved message all as above; the notice showed in the browser and Load it again
+      reloaded the model and cleared it. Stopping the backend showed "Companion isn't answering" within 8 s.
+      One simulated failed check: rechecked at +3 s, notice never shown in 34 s. B - the cache measurement
+      above. C - closing the backend's console mid-reply: exit 0 after 0.3 s, the task recorded with "(its
+      window was closed)", status interrupted, the model server stopped 8 ms after the record, nothing left
+      running; Ctrl+C: the same with "(Ctrl+C in its window)" and "exited cleanly".
+    - **A trap in checking this:** processes started from this session's shell inherit "ignore Ctrl+C", so
+      the first Ctrl+C check never reached the backend. A launcher must call
+      `SetConsoleCtrlHandler(NULL, FALSE)` before starting it; a PowerShell window does not have the flag.
+    - **Found while measuring, not built (owner to decide):** the completion check is sent without the tool
+      list. The template writes the tool definitions at the top of the prompt, so the check re-reads the whole
+      prompt, and the next step re-reads it again because the cache now holds the check's version. In the
+      owner's run: requests 35 and 36, 35,087 and 33,734 tokens from scratch, about 58 s on the 26B. Proposed:
+      send the check with the same tool list and `tool_choice: "none"`, measured before adopting.
+    - Green: backend 504 tests, frontend 114, `tsc` clean, both builds done, no warnings.
+
+70. **2026-09-18 ~11:05 The completion check and the compaction note carry the run's tool list (owner: "yes please
+    try that").** Both are host-side requests on the run's own transcript, and both were sent without the tool
+    list. The template writes the tool definitions at the top of the prompt, so neither matched any of the cached
+    prompt: every check and every compaction note re-read the whole transcript, and on the 26B (RAM prompt
+    cache off) so did the step after a check.
+    - **Built:** `SidecarClient::chat_turns_on_run_prompt` - the run's tool list, in the same order, with
+      `tool_choice: "none"`, used by `review_completion` and `compact_run_transcript`; the list's tokens are
+      counted in their budgets (`tool_list_tokens`). The pinned runtime renders the tools whatever `tool_choice`
+      says (`common_chat_params_init_gemma4` renders `inputs.tools`; "none" only drops the tool-call grammar and
+      parsing), so the prompt stays the run's. A tool call written out as text anyway is no verdict and cannot
+      pass as COMPLETE. Test: both requests carry the list switched off; without a list, none is sent.
+      Backend 505 tests.
+    - **Measured by replaying recorded requests** (fresh model load for each way; the step after a check rebuilt
+      as the current code sends it). Three verdicts per check per way at the run's temperature:
+
+      | model | request | today | with the list | notes |
+      |---|---|---|---|---|
+      | 26B (owner's NEON run, 35K) | check + next step | 35,087 + 33,862 read, ~56 s | 6,067 + 3,191, ~9 s | CONTINUE 6/6 |
+      | 26B (snake game) | check | 13,583 read, 11.1 s | 13,043, 10.9 s | an early earlier-finding; COMPLETE 6/6 |
+      | 27B (three checks) | check + next | 25-29K read, 35-39 s | 7-17K, 19-30 s | CONTINUE 18/18 |
+      | E4B (five checks) | check | 3-7K read | 1.1-2.0K | same verdicts 30/30 |
+      | 26B (three compaction notes, ~19K) | note | 15.2-16.8 s | 1.1-1.7 s | normal notes both ways |
+      | E4B (two compaction notes, 21-23K) | note | 4.1-4.6 s | 1.1 s | normal notes both ways |
+
+      Live, through the rebuilt app (small model, 12 files): the check went out with the run's 18 tools and
+      `tool_choice: "none"`, 3,532 of its 4,269 tokens came from the cache, verdict COMPLETE.
+    - **What still limits it: the check filters out earlier review turns** ("Completion review found remaining
+      work: ..."), because a checker once repeated a finding after it was fixed. That makes the check leave the
+      run's prompt at the first such turn, so after the host's first "before finishing, list the folder ..."
+      request most of the saving is lost (snake game: nothing saved; 27B: 19-30 s instead of 35-39). Measured a
+      third way - the check as a pure continuation of the run's prompt, earlier review turns left in, plus one
+      sentence ("Earlier completion reviews above may already be resolved: judge what the latest versions and the
+      tool evidence show now, not what those reviews said"): 26B NEON ~4 s (3,371 + 116 tokens), 27B 4.6-5.2 s,
+      snake 2.2 s, verdicts identical in every check that had earlier review turns (6 checks, 18/18). But on a
+      small-model check with NO earlier review turns the sentence made 2 of 3 replies empty (the model most
+      likely tried to call a tool to check the files). Proposed, not built: leave the turns in and add the
+      sentence only when there are earlier review turns; with none, the check is exactly what is built now.
+      Every case that proposal covers is already measured: 30/30 identical verdicts, no empty replies. Owner to
+      decide.
+    - **Why a change in the middle costs everything on these models:** Gemma 4 uses a sliding-window cache, and
+      the pinned runtime can only rewind it to a saved point. Points are saved at user turns (at least 8,192
+      tokens apart) and just before each prompt's end; with native tool calls a run has almost no user turns, so
+      a change mid-prompt rewinds to the start of the task (2,298 tokens in the owner's run - the number every
+      request after step 31 reused there).
+    - **Replay traps, each of which produced a wrong number first:** the model server's RAM prompt cache carries
+      one way's states into the next unless the model is reloaded between them; repeating a check three times
+      before the next step erased the save point that step needed ("too close to an earlier one"); and a recorded
+      next step from a run that still had the 60-turn cap dropped a turn of its own. The first 26B replay started
+      45 s after the previous test rather than 2 minutes: it measured token counts, which heat does not change.
+
+71. **2026-09-18 ~11:10 The completion check keeps earlier review turns (owner: "yes go ahead").** The check is now
+    the run's own transcript, turn for turn, plus its instruction; earlier "Completion review found remaining
+    work" and "could not confirm" turns stay in. When any are in view the instruction adds "Earlier completion
+    reviews above may already be resolved: judge what the latest versions and the tool evidence show now, not what
+    those reviews said." - only then, because with none in view the sentence pointed at nothing and a small model
+    answered with an empty reply 2 times in 3 (decision 70). Every case this covers was measured in decision 70:
+    30 of 30 verdicts the same as before, no empty replies; 26B NEON check and next step ~56 s -> ~4 s, 27B checks
+    35-39 s -> ~5 s, snake-game check 11 s -> 2 s.
+    - Test rewritten (`the_completion_check_is_the_run_prompt_and_is_told_earlier_reviews_may_be_resolved`): the
+      check's messages are the transcript turn for turn, the sentence is there with reviews in view and absent
+      without. Backend 505 tests.
+    - **Live** (small model; the task ran a command, so the host asked for a look at the folder before finishing):
+      the check at step 7 had that review in view, carried the run's 17 tools with `tool_choice: "none"`, included
+      the sentence, and took 2,853 of its 3,254 tokens from the cache - it read only its own 401-token instruction.
+      Verdict COMPLETE.
+    - Seen on the way, not caused by this work: right after a successful tool result the small model sometimes
+      ends its turn at once (one token, nothing visible). Runs from 2026-09-17 already show it (3 of 30 steps, 5 of
+      50, 7 of 72); in the repetitive 36-file run it was 31 of 68. The host's existing "Your previous response was
+      empty" nudge recovers every time, for one short request that is read entirely from the cache.
+
     - *Times in entries 62-67 were corrected afterwards against the files' own timestamps
       (`agent_progress.rs` 06:55, `api.rs` 07:16, `project_check.rs` 07:38, `cdp.rs` 08:00): the clock
       readings written at the time ran several hours ahead of the machine's.*

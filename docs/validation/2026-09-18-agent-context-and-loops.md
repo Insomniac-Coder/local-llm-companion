@@ -152,3 +152,53 @@ The owner's "NEON OBSERVATORY" prompt, run start to finish on the E4B (32K) and 
 
 Neither model's app compiled at the end: the E4B's JSX and the 26B's type-only imports are the models' own
 limits. The difference is that the host now says so, keeps what was done, and can carry on.
+
+## After the 200K run (decisions 68-69)
+
+The owner's 26B run at 200K stopped at request 41 with the model server gone. Replaying its last three
+recorded requests against the same model and settings, in the order 38, 39, 40, 39, 40, 39, 40, all seven
+finished cleanly: prompts of 34-38K tokens read at 1,155-1,207 tokens/s, 1,616-1,683 tokens generated, the
+server healthy after each. The request did not break the model server.
+
+What the run did show is the 60-turn cap's cost. From request 31 the prompt changed at token 2,298 on every
+step, so each step re-read ~34K tokens: ~29 s of a ~44 s step. With the cap removed, a small model's run of
+36 one-file steps (105 turns at the end, nothing pruned) took 90%+ of every later prompt from the cache:
+
+| request | prompt tokens | from the cache |
+|---|---|---|
+| owner's run, 31 | 31,342 | 2,298 (7%) |
+| owner's request 40, replayed | 38,290 | 2,298 (6%) |
+| after the fix, 31 | 5,010 | 4,915 (98%) |
+| after the fix, 67 | 7,670 | 7,638 (99.6%) |
+
+One request still started from nothing: the completion check, sent without the tool list, whose definitions
+the template writes at the top of the prompt. It re-read everything, and the next step re-read it again
+(owner's run: requests 35 and 36, 35,087 and 33,734 tokens). Decision 70 sends it, and the compaction note, with
+the run's tool list and `tool_choice: "none"`.
+
+## The completion check and the compaction note on the cached prompt (decision 70)
+
+Recorded requests replayed three ways, a fresh model load for each way, three verdicts each at the run's
+temperature. "old" is what was sent before decision 70; "list" is what is built; "cont" is the check as a pure
+continuation of the run's prompt (earlier review turns left in, plus one sentence about them), measured as a
+proposal. Tokens read from scratch, and prompt-reading time:
+
+| check | old | list | cont | verdicts, all ways |
+|---|---|---|---|---|
+| 26B, owner's NEON run (check + next step) | 68,949, ~56 s | 9,258, ~9 s | 3,487, ~4 s | CONTINUE 9/9 |
+| 26B, snake game (check) | 13,583, 11.1 s | 13,043, 10.9 s | 1,887, 2.0 s | COMPLETE 9/9 |
+| 27B, check 18 (+ next) | 25,873, 34.5 s | 11,697, 18.8 s | 2,634, 4.6 s | CONTINUE 9/9 |
+| 27B, check 21 (+ next) | 29,361, 39.2 s | 18,623, 30.3 s | 2,755, 5.2 s | CONTINUE 9/9 |
+| 27B, check 29 | 27,122, 35.0 s | 17,414, 24.7 s | 2,900, 5.0 s | CONTINUE 9/9 |
+| E4B, five checks | 3,032-6,890 | 1,070-1,966 | 1,097-1,866 | identical, except one "cont" check: 2 of 3 empty |
+
+The 27B's model server keeps a RAM prompt cache, so its step after an "old" check restored the earlier prompt
+from RAM and cost almost nothing; the 26B's does not, and re-read everything. The one "cont" failure was a
+small-model check with no earlier review turns: the added sentence pointed at nothing, and the model most likely
+tried to call a tool. Compaction notes, old against list: 26B 15.2-16.8 s against 1.1-1.7 s (three notes of
+~19K), E4B 4.1-4.6 s against 1.1 s (two of 21-23K); the notes read normally both ways. Live through the app: a
+check sent with 18 tools and `tool_choice: "none"` took 3,532 of 4,269 tokens from the cache.
+
+Adopted in decision 71: "cont", with the sentence only when earlier review turns are in view (with none, the
+check is exactly "list"). Live, a check with the host's "before finishing" review in view took 2,853 of its
+3,254 tokens from the cache and read only its own instruction; verdict COMPLETE.

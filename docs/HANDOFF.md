@@ -82,6 +82,19 @@ code.
 
 ## Uncommitted work (written; compile/test status noted)
 
+**2026-09-18 (decisions 68-71), uncommitted, backend 505 tests / frontend 114 tests green.** A 26B run at
+200K ended with the model server gone and the UI saying "start Companion again". Decision 68 has the
+diagnosis (the request itself replays cleanly; the cause could not be pinned because no log survived the
+restart); decision 69 the five fixes, each checked live: no turn cap and one large cut when the window fills
+(`prune_transcript`), logs on disk (`logfile.rs`), a model server that ends by itself named with its exit
+status (`describe_exit`, `InferenceStatus.stopped`), two separate notices with a two-check rule
+(`services/runtimeHealth.ts`), and closing records running tasks before the model server stops
+(`AppState::shut_down`, `shutdown.rs`). Decision 70: the completion check and the compaction note now carry
+the run's tool list with `tool_choice: "none"` and are read on top of the cached prompt (measured on three
+models; `chat_turns_on_run_prompt`). Decision 71: the check keeps earlier review turns, so it is the run's
+own prompt plus its instruction, and is told they may be resolved when any are in view. Decisions 61-67 are
+committed (6528e89).
+
 **2026-09-18 (night decisions 61-62), uncommitted, backend 480 tests / frontend 109 tests green.** Why
 big-model coding runs got stuck, and the seven fixes for it. Read decision 61 (the diagnosis, with the
 numbers from the owner's own runs) and 62 (what was built) before touching the agent loop. In short: the

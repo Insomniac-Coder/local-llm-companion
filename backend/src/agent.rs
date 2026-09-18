@@ -1,5 +1,6 @@
 //! Coding agent loop (§28–§30, §45, §82): plan -> tool -> observe -> repeat.
-//! Bounded by max_iterations (30) and per-tool retries (3). Cancellable (§46).
+//! No step ceiling: loop and failure detection end a run (agent_progress.rs).
+//! Per-tool retries (3). Cancellable (§46).
 
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -287,14 +288,12 @@ impl AgentEvent {
 }
 
 pub struct AgentLimits {
-    pub max_iterations: u32,
     pub max_retries_per_tool: u32,
 }
 
 impl Default for AgentLimits {
     fn default() -> Self {
         Self {
-            max_iterations: 30,
             max_retries_per_tool: 3,
         }
     }
@@ -321,7 +320,6 @@ impl CancelToken {
 /// Deterministic skeleton of the loop; Stage 10 plugs the LLM planner in.
 pub fn run_stub_plan(
     task: &str,
-    limits: &AgentLimits,
     cancel: &CancelToken,
     mut on_event: impl FnMut(AgentEvent),
 ) -> AgentState {
@@ -348,14 +346,6 @@ pub fn run_stub_plan(
                 i as u32,
             ));
             return AgentState::Cancelled;
-        }
-        if i as u32 >= limits.max_iterations {
-            on_event(AgentEvent::new(
-                AgentState::Failed,
-                "Iteration budget exhausted.".into(),
-                i as u32,
-            ));
-            return AgentState::Failed;
         }
         on_event(AgentEvent::new(
             AgentState::ExecutingTool,
@@ -431,7 +421,7 @@ mod tests {
     fn completes_stub_plan() {
         let cancel = CancelToken::new();
         let mut states = vec![];
-        let end = run_stub_plan("fix build", &AgentLimits::default(), &cancel, |e| {
+        let end = run_stub_plan("fix build", &cancel, |e| {
             states.push(e.state)
         });
         assert_eq!(end, AgentState::Completed);
@@ -442,18 +432,7 @@ mod tests {
     fn cancellation_stops_loop() {
         let cancel = CancelToken::new();
         cancel.cancel();
-        let end = run_stub_plan("x", &AgentLimits::default(), &cancel, |_| {});
+        let end = run_stub_plan("x", &cancel, |_| {});
         assert_eq!(end, AgentState::Cancelled);
-    }
-
-    #[test]
-    fn iteration_budget_enforced() {
-        let cancel = CancelToken::new();
-        let limits = AgentLimits {
-            max_iterations: 2,
-            max_retries_per_tool: 3,
-        };
-        let end = run_stub_plan("long task", &limits, &cancel, |_| {});
-        assert_eq!(end, AgentState::Failed);
     }
 }

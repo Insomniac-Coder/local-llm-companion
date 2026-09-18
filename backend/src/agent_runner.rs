@@ -15,9 +15,6 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
 
-/// Soft cap on transcript turns; the size-aware pruning below is the real
-/// bound. Prefix caching makes a long unchanged transcript nearly free.
-const TRANSCRIPT_TURNS: usize = 60;
 const TOOL_OUTPUT_CHARS: usize = 16_000;
 /// In-place retries of one model request after a transient server failure
 /// (1 s, 2 s, 4 s).
@@ -1828,6 +1825,7 @@ async fn compact_run_transcript(
     inspected: &[String],
     still_required: &[String],
     room: u32,
+    tools: Option<&[serde_json::Value]>,
 ) -> CompactionOutcome {
     let tokens_before = estimated_tokens(transcript);
     let unchanged = CompactionOutcome {
@@ -1861,10 +1859,10 @@ async fn compact_run_transcript(
 
     let mut request = transcript.clone();
     request.push(ChatTurn::text("user", COMPACTION_INSTRUCTION));
-    let input = estimated_tokens(&request);
+    let input = estimated_tokens(&request).saturating_add(tool_list_tokens(tools));
     let max_tokens = note_tokens.min(cfg.n_ctx.saturating_sub(input.saturating_add(256)));
     let note = if max_tokens >= 96 {
-        match client.chat_turns_without_reasoning(&request, max_tokens, cfg).await {
+        match client.chat_turns_on_run_prompt(&request, max_tokens, cfg, tools).await {
             // A small model may still emit an action: keep only its prose.
             Ok((text, metrics)) => {
                 complete_note(&visible_progress(&text), metrics.finish_reason.as_deref())
@@ -2044,6 +2042,19 @@ fn repair_tool_pairs(transcript: &mut Vec<ChatTurn>, task_turn_index: &mut usize
     removed
 }
 
+/// Keeps the transcript inside the window by size, never by count: a run
+/// may have any number of turns while they fit (owner, 2026-09-18: a fixed
+/// cap of 60 turns dropped one turn after the task on every step once
+/// reached, so the prompt changed at the same early point each time and the
+/// model server read ~34K tokens again on every step - ~29 s of each ~44 s
+/// step, with 39K of a 200K window in use).
+///
+/// Once the transcript does not fit, it is cut back to three quarters of the
+/// budget in one go rather than to just under it. Every release or removal
+/// changes the prompt from that turn on and the model server reads all of it
+/// again; trimming a little on every step would re-read the whole window on
+/// every step, while one larger cut leaves room for the next several steps to
+/// extend a prompt the cache still holds.
 fn prune_transcript(
     transcript: &mut Vec<ChatTurn>,
     task_turn_index: &mut usize,
@@ -2054,25 +2065,18 @@ fn prune_transcript(
     let estimate = |turns: &[ChatTurn]| {
         crate::agent::AgentContextUsage::for_turns(turns, n_ctx, 0, 0).estimated_tokens
     };
-    let mut pruned = release_tool_results(transcript, *task_turn_index, n_ctx, budget);
-    while estimate(transcript) > budget && *task_turn_index > 1 {
+    if estimate(transcript) <= budget {
+        return 0;
+    }
+    let target = budget / 4 * 3;
+    let mut pruned = release_tool_results(transcript, *task_turn_index, n_ctx, target);
+    while estimate(transcript) > target && *task_turn_index > 1 {
         transcript.remove(1);
         *task_turn_index -= 1;
         pruned += 1;
     }
-    while estimate(transcript) > budget && transcript.len() > *task_turn_index + 3 {
+    while estimate(transcript) > target && transcript.len() > *task_turn_index + 3 {
         transcript.remove(*task_turn_index + 1);
-        pruned += 1;
-    }
-    while transcript.len() > TRANSCRIPT_TURNS + 2 {
-        if *task_turn_index > 1 {
-            transcript.remove(1);
-            *task_turn_index -= 1;
-        } else if transcript.len() > *task_turn_index + 3 {
-            transcript.remove(*task_turn_index + 1);
-        } else {
-            break;
-        }
         pruned += 1;
     }
     pruned
@@ -2530,6 +2534,20 @@ impl AgentRegistry {
         self.runs.get(id).cloned()
     }
 
+    /// Runs that have not reached a final state.
+    pub fn unfinished(&self) -> Vec<Arc<LiveRun>> {
+        self.runs
+            .values()
+            .filter(|run| {
+                !matches!(
+                    run.state(),
+                    AgentState::Completed | AgentState::Failed | AgentState::Cancelled
+                )
+            })
+            .cloned()
+            .collect()
+    }
+
     pub fn summaries(&self) -> Vec<RunSummary> {
         self.order
             .iter()
@@ -2868,7 +2886,7 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
         if run.cancel.is_cancelled() {
             run.emit(AgentEvent::new(
                 S::Cancelled,
-                "Cancelled by user.".into(),
+                cancelled_message(),
                 it,
             ));
             return S::Cancelled;
@@ -2922,6 +2940,11 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
                         "The latest completion check found remaining work: {last_review_reason}"
                     ));
                 }
+                // The tool list the run's own requests carry, so the note
+                // is read on top of the cached prompt (native tools, and no
+                // structured fallback, as for the step itself).
+                let run_tools = (native_tools && !response_policy.structured_fallback)
+                    .then_some(native_definitions.as_slice());
                 let outcome = compact_run_transcript(
                     &client,
                     &cfg,
@@ -2932,6 +2955,7 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
                     &inspected,
                     &still_required,
                     room,
+                    run_tools,
                 )
                 .await;
                 // Also after a compaction that was not worth applying: the
@@ -2977,7 +3001,7 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
                     ));
                 }
                 if run.cancel.is_cancelled() {
-                    run.emit(AgentEvent::new(S::Cancelled, "Cancelled by user.".into(), it));
+                    run.emit(AgentEvent::new(S::Cancelled, cancelled_message(), it));
                     return S::Cancelled;
                 }
             }
@@ -2989,9 +3013,14 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
         // Pruning and compaction remove whole turns: never leave a call
         // without its result or a result without its call.
         pruned_turns += repair_tool_pairs(&mut transcript, &mut task_turn_index);
-        if !state.llama.write().await.is_running() {
-            run.emit(AgentEvent::activity("error", S::Failed,
-                "The model runtime stopped. Completed actions and existing file changes were kept. Load a model before continuing.".into(), it));
+        let stopped = {
+            let mut llama = state.llama.write().await;
+            (!llama.is_running()).then(|| llama.stop_report())
+        };
+        if let Some(report) = stopped {
+            let message = model_server_stopped_message(report.as_deref(), "between steps");
+            persist_final(&state, &run, &message).await;
+            run.emit(AgentEvent::activity("error", S::Failed, message, it));
             return S::Failed;
         }
         if !progress_guard.begin_attempt() {
@@ -3123,7 +3152,7 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
             }
             Err(e) => {
                 if run.cancel.is_cancelled() {
-                    run.emit(AgentEvent::new(S::Cancelled, "Cancelled by user.".into(), it));
+                    run.emit(AgentEvent::new(S::Cancelled, cancelled_message(), it));
                     return S::Cancelled;
                 }
                 // Model-server failures never enter the transcript: the model
@@ -3160,6 +3189,22 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
                     persist_final(&state, &run, &message).await;
                     run.emit(AgentEvent::activity("error", S::Failed, message, it));
                     return S::Failed;
+                }
+                // A broken reply the in-place retries could not repeat
+                // because the model server's process is gone: say that, how it
+                // ended and where its output is, not "retry when the model is
+                // ready" (owner's 200K run, 2026-09-18).
+                if e.sidecar().is_some_and(|failure| failure.is_transient()) {
+                    let ended = {
+                        let mut llama = state.llama.write().await;
+                        (!llama.is_running()).then(|| llama.stop_report())
+                    };
+                    if let Some(report) = ended {
+                        let message = model_server_stopped_message(report.as_deref(), "while answering");
+                        persist_final(&state, &run, &message).await;
+                        run.emit(AgentEvent::activity("error", S::Failed, message, it));
+                        return S::Failed;
+                    }
                 }
                 let message = format!(
                     "Stopped: the model request failed ({e}). Existing files and completed actions were kept; retry when the model is ready."
@@ -3460,7 +3505,15 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
             let review = if verification.needs_evidence() {
                 CompletionReview::Continue(verification.remaining())
             } else {
-                review_completion(&client, &cfg, &transcript, &objective, &tool_evidence).await
+                review_completion(
+                    &client,
+                    &cfg,
+                    &transcript,
+                    &objective,
+                    &tool_evidence,
+                    use_native.then_some(native_definitions.as_slice()),
+                )
+                .await
             };
 
             match review {
@@ -4052,12 +4105,15 @@ enum CompletionReview {
 /// candidate answer) plus one instruction turn, so the cached KV prefix serves
 /// everything but the instruction. A separate prompt would evict the
 /// transcript from the single slot and force a full re-prefill next iteration.
+/// That includes the run's tool list (`tools`): the template writes it at the
+/// top of the prompt, and a check sent without it matched none of the cache.
 async fn review_completion(
     client: &SidecarClient,
     cfg: &crate::inference::InferenceConfig,
     transcript: &[ChatTurn],
     task: &str,
     evidence: &[String],
+    tools: Option<&[serde_json::Value]>,
 ) -> CompletionReview {
     // The check rides on the transcript, so its evidence gets only the room
     // the window has left: twenty 400-character lines on top of a 2K-token
@@ -4065,6 +4121,7 @@ async fn review_completion(
     let spare_tokens = cfg
         .n_ctx
         .saturating_sub(estimated_tokens(transcript))
+        .saturating_sub(tool_list_tokens(tools))
         .saturating_sub(220 + 256 + 400);
     let evidence_chars = (spare_tokens as usize * 3).min(8_000);
     let evidence = if evidence.is_empty() {
@@ -4077,27 +4134,44 @@ async fn review_completion(
         }
         text
     };
-    // The check must judge the work, not repeat its earlier verdicts: with
-    // them in view it quoted the same missing item after it was fixed.
-    let transcript: Vec<ChatTurn> = transcript
-        .iter()
-        .filter(|turn| {
-            !(turn.role == "user"
-                && (turn.content.starts_with(REVIEW_FINDING_PREFIX)
-                    || turn.content.starts_with(REVIEW_UNAVAILABLE_PREFIX)))
-        })
-        .cloned()
-        .collect();
-    let transcript = transcript.as_slice();
+    // The check is the run's own transcript, earlier reviews included (owner,
+    // 2026-09-18). They used to be taken out, because with them in view a
+    // checker quoted a missing item again after it was fixed; but taking them
+    // out made the check leave the cached prompt at the first one, and after
+    // the host's first "before finishing" request the check and the step
+    // after it were read again from there (a 35K check and its next step on
+    // the 26B: ~9 s with them out, ~4 s with them in; same verdicts in every
+    // measured check). When any are in view the check is told they may be
+    // resolved - and only then: with none in view the same sentence pointed at
+    // nothing, and a small model answered with nothing 2 times in 3.
+    let earlier_reviews = transcript.iter().any(|turn| {
+        turn.role == "user"
+            && (turn.content.starts_with(REVIEW_FINDING_PREFIX)
+                || turn.content.starts_with(REVIEW_UNAVAILABLE_PREFIX))
+    });
+    let reviews_note = if earlier_reviews {
+        " Earlier completion reviews above may already be resolved: judge what the latest versions and the tool evidence show now, not what those reviews said."
+    } else {
+        ""
+    };
     let instruction = format!(
-        "Stop and act as a strict completion checker for your own work above. When a file was written or edited more than once, judge only its latest version. Compare the original task with your candidate final answer and the recorded tool evidence. Do not assume files exist unless the evidence shows them. For change requests, require all requested deliverables plus a post-change inspection, test, build, or other relevant validation. Check every explicit requirement of the task (for example each feature, section, style, interaction or animation it names) against what the written content actually contains: a placeholder, a stub or a single alert does not implement a requirement. The agent can create folders and files, edit files and run commands in this workspace, so a claim that it cannot is not an honest explanation. If the task is fully complete or genuinely impossible for a specific stated reason, reply exactly COMPLETE. Otherwise reply CONTINUE: followed by one concise description of the missing work. Reply with that decision only.\n\nOriginal task:\n{task}\n\nTool evidence:\n{evidence}"
+        "Stop and act as a strict completion checker for your own work above. When a file was written or edited more than once, judge only its latest version.{reviews_note} Compare the original task with your candidate final answer and the recorded tool evidence. Do not assume files exist unless the evidence shows them. For change requests, require all requested deliverables plus a post-change inspection, test, build, or other relevant validation. Check every explicit requirement of the task (for example each feature, section, style, interaction or animation it names) against what the written content actually contains: a placeholder, a stub or a single alert does not implement a requirement. The agent can create folders and files, edit files and run commands in this workspace, so a claim that it cannot is not an honest explanation. If the task is fully complete or genuinely impossible for a specific stated reason, reply exactly COMPLETE. Otherwise reply CONTINUE: followed by one concise description of the missing work. Reply with that decision only.\n\nOriginal task:\n{task}\n\nTool evidence:\n{evidence}"
     );
     let mut turns = transcript.to_vec();
     turns.push(ChatTurn::text("user", instruction));
-    match client.chat_turns_without_reasoning(&turns, 220, cfg).await {
+    match client.chat_turns_on_run_prompt(&turns, 220, cfg, tools).await {
         Ok((answer, _)) => parse_completion_review(&answer),
         Err(error) => CompletionReview::Unavailable(error.to_string()),
     }
+}
+
+/// What a tool list adds to a prompt, estimated as the run estimates it for
+/// its own requests.
+fn tool_list_tokens(tools: Option<&[serde_json::Value]>) -> u32 {
+    tools
+        .filter(|tools| !tools.is_empty())
+        .map(|tools| estimated_tokens(&[ChatTurn::text("system", serde_json::Value::from(tools.to_vec()).to_string())]))
+        .unwrap_or(0)
 }
 
 fn parse_completion_review(answer: &str) -> CompletionReview {
@@ -5005,6 +5079,25 @@ async fn audit_tool(state: &crate::api::AppState, run: &LiveRun, call: &ToolCall
     });
 }
 
+/// A cancelled run's last word: the user's doing, or Companion closing.
+fn cancelled_message() -> String {
+    crate::shutdown::reason()
+        .map(crate::shutdown::task_message)
+        .unwrap_or_else(|| "Cancelled by user.".into())
+}
+
+/// A run's last word when the model server's process is gone: how it ended,
+/// where its full output is, and what to do next.
+fn model_server_stopped_message(report: Option<&str>, when: &str) -> String {
+    let how = report.map(|report| format!(" ({report})")).unwrap_or_default();
+    let output = crate::logfile::model_server()
+        .map(|log| format!(" Its output is in {}.", log.path().display()))
+        .unwrap_or_default();
+    format!(
+        "Stopped: the model server stopped {when}{how}. Existing files and completed actions were kept; load the model again and send a message in this chat to continue.{output}"
+    )
+}
+
 async fn persist_final(state: &crate::api::AppState, run: &LiveRun, content: &str) {
     if run.spec.conversation_id.trim().is_empty() {
         return;
@@ -5464,6 +5557,72 @@ CONTENT>>>
         );
         assert_eq!(policy.output_budget(8192, 1000), 6936);
         assert_eq!(policy.output_budget(65536, 1000), 8192);
+    }
+
+    #[test]
+    fn a_stopped_model_server_is_named_as_the_reason_with_how_it_ended() {
+        let message = model_server_stopped_message(Some("exit code 1: an error it reported"), "while answering");
+        assert!(message.starts_with("Stopped: the model server stopped while answering (exit code 1"), "{message}");
+        assert!(message.contains("load the model again"), "{message}");
+        assert!(!message.contains("retry when the model is ready"), "{message}");
+        let unknown = model_server_stopped_message(None, "between steps");
+        assert!(unknown.starts_with("Stopped: the model server stopped between steps."), "{unknown}");
+    }
+
+    #[test]
+    fn a_long_run_keeps_every_turn_while_they_fit() {
+        // 200 steps of short work in a large window: nothing is dropped, so
+        // the prompt only ever grows at its end and the cache keeps all of it.
+        let mut transcript = vec![
+            ChatTurn::text("system", "instructions"),
+            ChatTurn::text("user", "Task: build the site"),
+        ];
+        for step in 0..200 {
+            transcript.push(ChatTurn::text("assistant", format!("```tool\n{{\"name\":\"read_file\",\"args\":{{\"path\":\"f{step}\"}}}}\n```")));
+            transcript.push(ChatTurn::text("user", format!("Result of read_file:\nline {step}")));
+        }
+        let before = transcript.len();
+        let mut task_index = 1;
+        assert_eq!(prune_transcript(&mut transcript, &mut task_index, 200_000, 8192), 0);
+        assert_eq!(transcript.len(), before, "no turn is dropped for being old");
+    }
+
+    #[test]
+    fn a_full_window_is_cut_once_with_room_for_the_next_steps() {
+        let step = |n: usize| {
+            [
+                ChatTurn::text("assistant", format!("```tool\n{{\"name\":\"read_file\",\"args\":{{\"path\":\"f{n}\"}}}}\n```")),
+                ChatTurn::text("user", format!("Result of read_file:\n{}", "x".repeat(1200))),
+            ]
+        };
+        let mut transcript = vec![
+            ChatTurn::text("system", "instructions"),
+            ChatTurn::text("user", "Task: build the site"),
+        ];
+        let mut n = 0;
+        let mut task_index = 1;
+        let (n_ctx, reserve) = (16_384, 2048);
+        let budget = n_ctx - reserve - 512;
+        let estimate = |turns: &[ChatTurn]| crate::agent::AgentContextUsage::for_turns(turns, n_ctx, 0, 0).estimated_tokens;
+        while estimate(&transcript) <= budget {
+            transcript.extend(step(n));
+            n += 1;
+        }
+        // Over the budget: one cut, well below it.
+        assert!(prune_transcript(&mut transcript, &mut task_index, n_ctx, reserve) > 0);
+        assert!(estimate(&transcript) <= budget / 4 * 3, "{} of {budget}", estimate(&transcript));
+        // The next steps extend the same prompt: nothing before them changes.
+        for _ in 0..3 {
+            let settled = transcript.clone();
+            transcript.extend(step(n));
+            n += 1;
+            assert_eq!(prune_transcript(&mut transcript, &mut task_index, n_ctx, reserve), 0);
+            assert_eq!(
+                serde_json::to_value(&transcript[..settled.len()]).unwrap(),
+                serde_json::to_value(&settled).unwrap(),
+                "an appended step leaves the earlier prompt as it was"
+            );
+        }
     }
 
     #[test]
@@ -6975,7 +7134,7 @@ CONTENT>>>
         let required = vec!["Still required before finishing: Before finishing, list \".\" (the workspace root) with list_directory to see what your commands left there.".to_string()];
         let inspected = vec!["read site/index.html (120 lines)".to_string(), "listed .".to_string()];
         let room = history_room(8192, pruning_reserve(8192, 8192));
-        let outcome = compact_run_transcript(&client, &cfg, &mut transcript, &mut task_index, &original_task, &work_log, &inspected, &required, room).await;
+        let outcome = compact_run_transcript(&client, &cfg, &mut transcript, &mut task_index, &original_task, &work_log, &inspected, &required, room, None).await;
         let bodies = bodies.lock().unwrap().clone();
         server.abort();
 
@@ -7011,13 +7170,43 @@ CONTENT>>>
         push_write(&mut transcript, "extra.css", 3000);
         let (url, _, server) = note_sidecar("Site created and listed.").await;
         let client = SidecarClient::new(url).unwrap();
-        compact_run_transcript(&client, &cfg, &mut transcript, &mut task_index, &original_task, &work_log, &inspected, &[], room).await;
+        compact_run_transcript(&client, &cfg, &mut transcript, &mut task_index, &original_task, &work_log, &inspected, &[], room, None).await;
         server.abort();
         assert_eq!(transcript[1].content.matches("Context compacted between steps").count(), 1);
     }
 
     #[tokio::test]
-    async fn the_completion_check_judges_the_work_without_its_earlier_verdicts() {
+    async fn the_check_and_the_compaction_note_carry_the_runs_tool_list_switched_off() {
+        let tools = vec![
+            serde_json::json!({"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}),
+            serde_json::json!({"type": "function", "function": {"name": "write_file", "parameters": {"type": "object"}}}),
+        ];
+        let cfg = crate::inference::InferenceConfig { n_ctx: 8192, ..Default::default() };
+        let (url, bodies, server) = note_sidecar("COMPLETE").await;
+        let client = SidecarClient::new(url).unwrap();
+        let transcript = site_transcript(300);
+        let review = review_completion(&client, &cfg, &transcript, "create a website", &[], Some(&tools)).await;
+        assert!(matches!(review, CompletionReview::Complete));
+        let (mut compacted, mut task_index) = (site_transcript(300), 1);
+        compact_run_transcript(&client, &cfg, &mut compacted, &mut task_index, "create a website", &[], &[], &[], 4000, Some(&tools)).await;
+        let without = review_completion(&client, &cfg, &transcript, "create a website", &[], None).await;
+        server.abort();
+        assert!(matches!(without, CompletionReview::Complete));
+        let bodies = bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 3, "the check, the note and the check without tools");
+        for body in &bodies[..2] {
+            // The same list, in the same order, as the run's own requests:
+            // the template writes it at the top of the prompt.
+            assert_eq!(body["tools"], serde_json::Value::from(tools.clone()));
+            assert_eq!(body["tool_choice"], "none", "the model may not call a tool here");
+            assert_eq!(body["parallel_tool_calls"], false);
+            assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+        }
+        assert!(bodies[2].get("tools").is_none() && bodies[2].get("tool_choice").is_none());
+    }
+
+    #[tokio::test]
+    async fn the_completion_check_is_the_run_prompt_and_is_told_earlier_reviews_may_be_resolved() {
         let (url, bodies, server) = note_sidecar("COMPLETE").await;
         let client = SidecarClient::new(url).unwrap();
         let cfg = crate::inference::InferenceConfig { n_ctx: 8192, ..Default::default() };
@@ -7026,17 +7215,29 @@ CONTENT>>>
         transcript.push(ChatTurn::text("assistant", "```tool\n{\"name\":\"write_file\",\"args\":{\"path\":\"site/index.html\",\"content\":\"<p class='hype'>Unleash it</p>\"}}\n```"));
         transcript.push(ChatTurn::text("user", format!("{REVIEW_UNAVAILABLE_PREFIX} (timeout). Inspect the workspace.")));
         let evidence: Vec<String> = (0..40).map(|i| format!("- FILE CHANGE (not verification): write_file [site/page{i}.html] => wrote {} bytes", "9".repeat(300))).collect();
-        let review = review_completion(&client, &cfg, &transcript, "create a website", &evidence).await;
+        let review = review_completion(&client, &cfg, &transcript, "create a website", &evidence, None).await;
+        // The same run before any review.
+        let first = site_transcript(300);
+        let fresh = review_completion(&client, &cfg, &first, "create a website", &evidence, None).await;
         server.abort();
-        assert!(matches!(review, CompletionReview::Complete));
+        assert!(matches!(review, CompletionReview::Complete) && matches!(fresh, CompletionReview::Complete));
         let bodies = bodies.lock().unwrap().clone();
+        // Turn for turn the run's own transcript, then the instruction: the
+        // cached prompt serves everything before the instruction.
         let messages = bodies[0]["messages"].as_array().unwrap();
-        let contents: Vec<&str> = messages.iter().filter_map(|m| m["content"].as_str()).collect();
-        assert!(!contents.iter().any(|c| c.starts_with(REVIEW_FINDING_PREFIX)), "earlier verdict leaked into the check");
-        assert!(!contents.iter().any(|c| c.starts_with(REVIEW_UNAVAILABLE_PREFIX)));
-        let instruction = contents.last().unwrap();
+        assert_eq!(messages.len(), transcript.len() + 1);
+        for (sent, turn) in messages.iter().zip(&transcript) {
+            assert_eq!(sent["content"].as_str(), Some(turn.content.as_str()));
+        }
+        let instruction = messages.last().unwrap()["content"].as_str().unwrap();
         assert!(instruction.contains("judge only its latest version"));
+        assert!(instruction.contains("Earlier completion reviews above may already be resolved"), "{instruction}");
         assert!(instruction.contains("earlier actions omitted to fit the context window"), "evidence must be sized to the window");
+        // With no earlier review in view the sentence is left out: it pointed
+        // at nothing, and a small model answered with nothing.
+        let first_instruction = bodies[1]["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap().to_string();
+        assert!(first_instruction.contains("judge only its latest version"));
+        assert!(!first_instruction.contains("Earlier completion reviews"), "{first_instruction}");
     }
 
     #[tokio::test]
@@ -7051,7 +7252,7 @@ CONTENT>>>
         let work_log = vec!["wrote 900 bytes (1 lines) to site/index.html (verified on disk)".to_string()];
         let inspected: Vec<String> = Vec::new();
         let room = history_room(4096, pruning_reserve(4096, 8192));
-        let outcome = compact_run_transcript(&client, &cfg, &mut transcript, &mut task_index, &original_task, &work_log, &inspected, &[], room).await;
+        let outcome = compact_run_transcript(&client, &cfg, &mut transcript, &mut task_index, &original_task, &work_log, &inspected, &[], room, None).await;
         server.abort();
         assert!(!outcome.model_note);
         // On the incident's 4K window the instructions are close to half the

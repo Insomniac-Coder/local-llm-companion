@@ -30,6 +30,7 @@ import { applyAgentContext } from './services/contextUsage';
 import { currentActivitySnapshot, parseActivityStart, visibleWorkActivity } from './services/workElapsed';
 import { groupActivity, groupSessionsByProject, lastSessionKey, projectGroupOpen, projectPick, projectRemoval, type ProjectGroup } from './services/projectSessions';
 import { availablePermissionModes, codeSessionsReadOnly, firstLoadNotice, READ_ONLY_MODE_REASON } from './services/tooling';
+import { initialHealth, modelStoppedDetail, nextHealth, RECHECK_MS, shouldRecheck, type RuntimeHealth } from './services/runtimeHealth';
 import { APPROVE_PLAN_MESSAGE, autoTitle, matchesShortcut, nextPermissionMode, PERMISSION_MODE_SETTLE_MS, PERMISSION_MODES, PermissionModeSaver, selectAvailableModel, shouldStartAgent, updateMessage, WORKBENCH_DESTINATIONS } from './services/workbench';
 import { Button, Dialog, IconButton, Kbd, Lamp, Notice, PopDivider, PopItem, PopLabel, Popover, Toggle } from './ui/primitives';
 import { Icon, type IconName } from './ui/Icon';
@@ -139,6 +140,11 @@ export default function App() {
   const [mobileNav, setMobileNav] = useState(false);
   const [showLatest, setShowLatest] = useState(false);
   const [backendUp, setBackendUp] = useState<boolean | null>(null);
+  // Failed status checks in a row: one alone (a laptop waking up) is not "the
+  // runtime is down" (services/runtimeHealth).
+  const runtimeHealth = useRef<RuntimeHealth>(initialHealth);
+  // The stopped-model notice the person closed stays closed for that stop.
+  const [dismissedStop, setDismissedStop] = useState<string | null>(null);
   const [rightOpen, setRightOpen] = useState(false);
   const [rightTab, setRightTab] = useState(mode === 'code' ? 'activity' : 'context');
   const [pinnedIds, setPinnedIds] = useState<string[]>(() => {
@@ -414,10 +420,26 @@ export default function App() {
     refreshSessions();
     getRecovery().then(setRecovery).catch(() => setRecovery(null));
     const t = setInterval(refreshDownloads, 2000);
-    const modelRefresh = setInterval(() => { if (!document.hidden) { void refreshModels(); inferenceStatus().then((state) => { setInf(same<InferenceStatus | null>(state)); setBackendUp(true); }).catch(() => setBackendUp(false)); } }, 10000);
+    // Every status check's outcome goes through runtimeHealth: a failure is
+    // checked again within seconds, and only two in a row say the backend is
+    // not answering.
+    let recheck: number | null = null;
+    function noteHealth(answered: boolean) {
+      runtimeHealth.current = nextHealth(runtimeHealth.current, answered);
+      setBackendUp(runtimeHealth.current.up);
+      if (shouldRecheck(runtimeHealth.current) && recheck === null) {
+        recheck = window.setTimeout(() => { recheck = null; checkRuntime(); }, RECHECK_MS);
+      }
+    }
+    function checkRuntime() {
+      inferenceStatus()
+        .then((state) => { setInf(same<InferenceStatus | null>(state)); noteHealth(true); })
+        .catch(() => noteHealth(false));
+    }
+    const modelRefresh = setInterval(() => { if (!document.hidden) { void refreshModels(); checkRuntime(); } }, 10000);
     // Session activity drives the live lamps in the list; keep it fresh but cheap.
     const sessionRefresh = setInterval(() => { if (!document.hidden) void refreshSessions(); }, 6000);
-    systemInfo().then((v) => { setSys(v); setBackendUp(true); }).catch(() => { setSys(null); setBackendUp(false); });
+    systemInfo().then((v) => { setSys(v); noteHealth(true); }).catch(() => { setSys(null); noteHealth(false); });
     inferenceStatus().then(setInf).catch(() => setInf(null));
     getPermissionMode().then((result) => {
       modeSaver.current.reset(result.mode);
@@ -425,7 +447,7 @@ export default function App() {
       localStorage.setItem('companion.permissionMode', result.mode);
     }).catch(() => notify('warning', 'Could not read the saved approval policy. Reconnect to the local runtime before changing it.'))
       .finally(() => setPermissionModeBusy(false));
-    return () => { clearInterval(t); clearInterval(modelRefresh); clearInterval(sessionRefresh); };
+    return () => { clearInterval(t); clearInterval(modelRefresh); clearInterval(sessionRefresh); if (recheck !== null) clearTimeout(recheck); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -1731,8 +1753,19 @@ export default function App() {
         </header>
 
         {backendUp === false && (
-          <Notice tone="error" className="global-notice" title="The local runtime isn’t responding">
-            Close this window and start Companion again with its start script: <StartScripts />. Your conversations are safe on disk.
+          <Notice tone="error" className="global-notice" title="Companion isn’t answering">
+            Two checks in a row got no answer. If its window was closed or the computer restarted, start it again with <StartScripts />, then reload this page. Your conversations are safe on disk.
+          </Notice>
+        )}
+        {backendUp === true && inf?.stopped && inf.stopped !== dismissedStop && !loadingModel && (
+          <Notice
+            tone="error"
+            className="global-notice"
+            title="The model server stopped"
+            onDismiss={() => setDismissedStop(inf.stopped ?? null)}
+            actions={modelId ? <Button size="sm" variant="primary" icon="power" onClick={() => void guardedSwitch('load', modelId, false)}>Load it again</Button> : undefined}
+          >
+            {modelStoppedDetail(inf.stopped)} Companion itself is still running and your conversations are safe. The model server’s output is in logs/model-server.log in Companion’s data folder.
           </Notice>
         )}
 

@@ -228,6 +228,42 @@ pub(crate) fn request_recorder(
 }
 
 impl AppState {
+    /// Companion is closing. Running tasks stop first and are recorded with
+    /// the reason; chat generation and the model server stop after. Stopping
+    /// the model server first made a task in flight record "the model
+    /// request failed ... retry when the model is ready" (owner, 2026-09-18).
+    pub async fn shut_down(&self, reason: &str) {
+        crate::shutdown::begin(reason);
+        let unfinished = self.agents.read().await.unfinished();
+        for run in &unfinished {
+            run.cancel.cancel();
+        }
+        // Each loop records its own ending when it sees the cancellation.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        for run in &unfinished {
+            let handle = run.handle.lock().ok().and_then(|mut handle| handle.take());
+            if let Some(handle) = handle {
+                let _ = tokio::time::timeout_at(deadline, handle).await;
+            }
+        }
+        // Written here as well: the journal writes on its own task, and the
+        // process may end before it gets there.
+        let message = crate::shutdown::task_message(reason);
+        {
+            let st = self.storage.lock().await;
+            for run in &unfinished {
+                if run.spec.conversation_id.is_empty() {
+                    continue;
+                }
+                let _ = st.update_message_content(&run.spec.conversation_id, &run.id, &message);
+                let _ = st.finish_task_context(&run.spec.conversation_id, &run.id, "interrupted");
+            }
+        }
+        let _ = self.generations.write().await.cancel_current(&self.storage).await;
+        self.llama.write().await.stop().await;
+        self.inference.write().await.unload();
+    }
+
     pub fn new_stub() -> Self {
         Self::new_with_storage(
             Storage::open_in_memory().expect("in-memory sqlite"),
@@ -769,7 +805,9 @@ async fn inference_status(State(s): State<AppState>) -> Json<InferenceStatus> {
         };
         ("stub".to_string(), m, inf.context_size())
     };
+    let stopped = if running { None } else { llama.stop_report() };
     Json(InferenceStatus {
+        stopped,
         runtime_notice: llama
             .running
             .as_ref()
@@ -3433,7 +3471,14 @@ async fn chat_sse(
             s.models.write().await.unload_all();
         }
         let full = if marked_loaded {
-            "The model runtime stopped unexpectedly. Reload the model and send your message again; your message was saved.".to_string()
+            let how = s
+                .llama
+                .read()
+                .await
+                .stop_report()
+                .map(|report| format!(" ({report})"))
+                .unwrap_or_default();
+            format!("The model server stopped unexpectedly{how}. Load the model again and send your message again; your message was saved.")
         } else {
             stub_reply(&s, &req.message).await
         };

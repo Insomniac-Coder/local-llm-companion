@@ -96,6 +96,8 @@ export interface InferenceStatus {
   context_size: number;
   binary_found: boolean;
   last_error: string | null;
+  /** Set when the model server ended by itself: how it ended, and its last error. */
+  stopped?: string | null;
 }
 
 export async function inferenceStatus(): Promise<InferenceStatus> {

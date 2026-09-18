@@ -25,6 +25,7 @@ mod inference;
 mod inspection_context;
 mod llamaserver;
 mod logbuf;
+mod logfile;
 mod metrics;
 mod models;
 mod outline;
@@ -37,6 +38,7 @@ mod runtime_fit;
 mod runtime_selection;
 mod search;
 mod settings;
+mod shutdown;
 mod speed_rule;
 mod storage;
 mod stream_split;
@@ -46,7 +48,6 @@ mod tools;
 mod vision;
 mod workspace;
 
-use crate::inference::IInferenceEngine;
 use tower_http::services::{ServeDir, ServeFile};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -64,6 +65,13 @@ async fn main() {
                 .with_ansi(false)
                 .with_writer(logbuf::global().clone()),
         )
+        // And a third on disk (logs/companion.log in the data folder): the
+        // console and the memory tail are both gone after a restart.
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(|| logfile::AppFileWriter),
+        )
         .init();
 
     let cfg = config::AppConfig::from_env();
@@ -71,6 +79,7 @@ async fn main() {
         tracing::error!("cannot create data dir {}: {e}", cfg.data_dir.display());
         std::process::exit(1);
     }
+    logfile::init(&cfg.data_dir.join("logs"));
     tracing::info!(data = %cfg.data_dir.display(), models = %cfg.models_dir.display(), "resolved application storage");
 
     let storage = match storage::Storage::open_persistent(&cfg.db_path()) {
@@ -195,32 +204,137 @@ async fn main() {
     tracing::info!("local companion exited cleanly");
 }
 
-async fn shutdown_signal(state: api::AppState) {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut terminate = signal(SignalKind::terminate()).expect("install SIGTERM handler");
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => {
-                if let Err(error) = result { tracing::warn!(%error, "Ctrl+C handler failed"); }
-            }
-            _ = terminate.recv() => tracing::info!("termination signal received"),
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        if let Err(error) = tokio::signal::ctrl_c().await {
-            tracing::warn!(%error, "Ctrl+C handler failed");
+/// Why the process is being asked to stop.
+#[derive(Debug, Clone, Copy)]
+enum StopRequest {
+    CtrlC,
+    WindowClosed,
+    SigningOut,
+    SystemShutdown,
+    Terminate,
+    TerminalClosed,
+}
+
+impl StopRequest {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::CtrlC => "Ctrl+C in its window",
+            Self::WindowClosed => "its window was closed",
+            Self::SigningOut => "Windows was signing out",
+            Self::SystemShutdown => "Windows was shutting down or restarting",
+            Self::Terminate => "it was asked to stop",
+            Self::TerminalClosed => "its terminal was closed",
         }
     }
 
-    tracing::info!("stopping active generation and llama sidecar…");
-    let _ = state
-        .generations
-        .write()
-        .await
-        .cancel_current(&state.storage)
-        .await;
-    state.llama.write().await.stop().await;
-    state.inference.write().await.unload();
+    /// The system ends the process a few seconds after these whether or not
+    /// it has finished; what matters is recorded by then.
+    fn ends_the_process(self) -> bool {
+        matches!(
+            self,
+            Self::WindowClosed | Self::SigningOut | Self::SystemShutdown | Self::TerminalClosed
+        )
+    }
+}
+
+async fn shutdown_signal(state: api::AppState) {
+    let request = stop_requested().await;
+    let reason = request.reason();
+    tracing::info!("stopping ({reason}): recording running tasks, then stopping the model server");
+    state.shut_down(reason).await;
+    if request.ends_the_process() {
+        // Open connections would only hold the exit until the system ends
+        // the process anyway.
+        tracing::info!("local companion exited ({reason})");
+        std::process::exit(0);
+    }
+}
+
+/// Waits for Ctrl+C, and for the window closing, signing out or shutting
+/// down (Windows) or SIGTERM and SIGHUP (unix). Only Ctrl+C used to be
+/// heard: closing the window ended the process with nothing recorded.
+async fn stop_requested() -> StopRequest {
+    let ctrl_c = async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::warn!(%error, "cannot listen for Ctrl+C");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let listen = |kind: SignalKind, what: &'static str| async move {
+            match signal(kind) {
+                Ok(mut listener) => {
+                    listener.recv().await;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "cannot listen for {what}");
+                    std::future::pending::<()>().await;
+                }
+            }
+        };
+        tokio::select! {
+            _ = ctrl_c => StopRequest::CtrlC,
+            _ = listen(SignalKind::terminate(), "SIGTERM") => StopRequest::Terminate,
+            _ = listen(SignalKind::hangup(), "SIGHUP") => StopRequest::TerminalClosed,
+        }
+    }
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows;
+        // tokio holds the process open after these until the system's own
+        // grace period ends, so the async side has a few seconds to act.
+        let window_closed = async {
+            match windows::ctrl_close() {
+                Ok(mut listener) => {
+                    listener.recv().await;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "cannot listen for the window closing");
+                    std::future::pending::<()>().await;
+                }
+            }
+        };
+        let signing_out = async {
+            match windows::ctrl_logoff() {
+                Ok(mut listener) => {
+                    listener.recv().await;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "cannot listen for signing out");
+                    std::future::pending::<()>().await;
+                }
+            }
+        };
+        let shutting_down = async {
+            match windows::ctrl_shutdown() {
+                Ok(mut listener) => {
+                    listener.recv().await;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "cannot listen for shutdown");
+                    std::future::pending::<()>().await;
+                }
+            }
+        };
+        let ctrl_break = async {
+            match windows::ctrl_break() {
+                Ok(mut listener) => {
+                    listener.recv().await;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "cannot listen for Ctrl+Break");
+                    std::future::pending::<()>().await;
+                }
+            }
+        };
+        tokio::select! {
+            _ = ctrl_c => StopRequest::CtrlC,
+            _ = ctrl_break => StopRequest::CtrlC,
+            _ = window_closed => StopRequest::WindowClosed,
+            _ = signing_out => StopRequest::SigningOut,
+            _ = shutting_down => StopRequest::SystemShutdown,
+        }
+    }
 }

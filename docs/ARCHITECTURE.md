@@ -349,6 +349,20 @@ Source of truth: `Local_LLM_PC_Companion_Design.md` (§§1–107).
   when it fits under 70% of the room. Applied only when it frees a tenth of
   the room; repeated only after a sixth of the room of growth. Pruning
   (`pruning_reserve` = a quarter of the window) is the safety net behind it.
+  Pruning goes by size only - a run may have any number of turns while they
+  fit (a fixed 60-turn cap, removed 2026-09-18, changed the prompt at the same
+  early point on every step once reached and made the model server re-read
+  the whole window each time). When it must cut, it cuts back to three
+  quarters of the budget in one go, so the following steps extend a prompt
+  the cache still holds.
+- The completion check and the compaction note are sent on the run's own
+  transcript with the run's tool list and `tool_choice: "none"`
+  (`chat_turns_on_run_prompt`): the template writes the tool definitions at the
+  top of the prompt, and without them neither request matched any of the cache
+  (a 35K check and the step after it: ~56 s on the 26B, ~4 s now). The check
+  is the run's transcript turn for turn: earlier review turns stay in, and
+  when any are in view the instruction says they may already be resolved
+  (decisions 70-71).
   Compaction is decided before anything is released: releasing old results is
   free and a note costs a model call, so the free step used to run first and
   dropped usage back under the threshold every time, which meant no run ever
@@ -409,6 +423,25 @@ Source of truth: `Local_LLM_PC_Companion_Design.md` (§§1–107).
   reply, the runtime snapshot (window, cache types, template shape, policy)
   and the tail of the application log (`logbuf::LogTail`, 2,000 lines), so a
   failure on one machine can be read on another.
+- Logs on disk (`logfile.rs`), in `logs/` under the data folder, so a restart
+  does not erase them: `companion.log` (every record the backend logs) and
+  `model-server.log` (the model server's output a line at a time with its
+  arrival time, and Companion's own notes: the command line it was started
+  with, ready, stopped by Companion, ended by itself with the exit status in
+  plain words). 4 MB a file, two older files kept, rotated by renaming.
+- A model server that ends by itself is named wherever it matters: in the
+  run's last message (how it ended, where its output is, load it again), in
+  `InferenceStatus.stopped`, and in the UI's "The model server stopped" notice
+  with a Load it again button. "Companion isn't answering" needs two failed
+  status checks in a row (`services/runtimeHealth.ts`; a failure is checked
+  again after 3 s).
+- Closing (`AppState::shut_down`): on Ctrl+C / Ctrl+Break, the window
+  closing, signing out or shutting down (Windows), or SIGTERM / SIGHUP (unix),
+  running tasks are cancelled and recorded with the reason first, then chat
+  generation and the model server stop. Stopping the model server first had
+  made a task in flight blame the model. Tasks left running by a hard kill are
+  still marked interrupted on the next start
+  (`storage::recover_interrupted_activity`).
 - Storage: indexes on every conversation/workspace-keyed table, one query for
   all journals of a conversation, `busy_timeout`.
 - Routing (`request_router`, Code sessions only; Chat never routes): the

@@ -347,6 +347,9 @@ cd ../frontend && npm test && npm run build
   when it came from the downloader.
 - **No models listed**: models must be `.gguf` files (not archives) inside `models/`; press Scan.
 - **Port 5173 or 3877 in use**: stop the previous instance with Ctrl+C in its terminal.
+- **Something stopped and you want to know why**: the `logs` folder inside the data folder
+  (`backend/data/logs` by default, or `COMPANION_DATA_DIR/logs`) keeps `companion.log` and
+  `model-server.log`. They survive restarts; the model server's file shows how it ended.
 - **PowerShell blocks scripts**: follow your organisation's execution policy; do not disable security
   policies globally to run the launcher.
 
