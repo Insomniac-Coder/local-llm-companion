@@ -1,0 +1,728 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>The Next Word Is Ours</title>
+<meta name="description" content="A proposal to the AI Council: host open-weight language models inside the company, connect them to our documents, and control how they are used.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400..800&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap">
+<link rel="stylesheet" href="styles.css">
+<script>
+  // Pick the layout before first paint: slides on a real desktop/tablet window, normal scrolling on phones.
+  document.documentElement.className = (innerWidth >= 900 && innerHeight >= 520) ? 'deck' : 'flow';
+</script>
+</head>
+<body>
+
+<div class="viewport" id="viewport">
+<main class="track" id="track">
+
+<!-- ================================================================ 1 · TITLE -->
+<section class="slide" id="top" data-label="Welcome">
+  <div class="frame"><div class="pad hero">
+    <div class="hero-text">
+      <p class="eyebrow rv">A proposal to the AI Council · September 2026</p>
+      <h1 class="hero-title" data-gen>The next word should be ours.</h1>
+      <p class="lede rv" style="--d:3">Every answer an AI gives is written one word at a time, each word picked by a machine. Today that machine belongs to someone else. We propose running our own: connected to our documents, on our hardware, under our rules.</p>
+      <p class="hint rv" style="--d:4"><span class="kbd">Scroll</span> or press <span class="kbd">←</span> <span class="kbd">→</span> to move between slides · about 20 minutes</p>
+    </div>
+    <figure class="gen-demo card rv" style="--d:2" id="genDemo" aria-label="Animated example of a language model choosing each next word">
+      <div class="gen-head">
+        <span class="caption">Live example · a model writing</span>
+        <button class="btn btn-small" id="genPause" type="button" aria-pressed="false">Pause</button>
+      </div>
+      <p class="gen-text" id="genText"><span class="gen-prompt">The safest place for our company's knowledge is</span><span class="gen-out"></span><span class="gen-caret" aria-hidden="true"></span></p>
+      <div class="bars" id="genBars" aria-hidden="true"></div>
+      <figcaption class="caption">The bars are the model's guesses for the next word and how likely it thinks each one is. It picks one, adds it, and guesses again. Probabilities are illustrative.</figcaption>
+    </figure>
+  </div></div>
+</section>
+
+<!-- ================================================================ 2 · AGENDA -->
+<section class="slide" id="agenda" data-label="What this covers">
+  <div class="frame"><div class="pad">
+    <header class="s-head">
+      <p class="eyebrow rv">The journey</p>
+      <h2 data-gen>What this proposal covers</h2>
+    </header>
+    <div class="agenda">
+      <div class="ag-part rv" style="--d:1">
+        <p class="ag-num">Part one</p>
+        <h3>Understand the machine</h3>
+        <ol>
+          <li><a href="#what"><span>01</span>What is an LLM?</a></li>
+          <li><a href="#learn"><span>02</span>How do LLMs learn?</a></li>
+          <li><a href="#work"><span>03</span>How do LLMs work?</a></li>
+          <li><a href="#terms"><span>04</span>The vocabulary</a></li>
+        </ol>
+      </div>
+      <div class="ag-part rv" style="--d:2">
+        <p class="ag-num">Part two</p>
+        <h3>Rent it, or run it</h3>
+        <ol>
+          <li><a href="#compare"><span>05</span>Local versus subscription</a></li>
+          <li><a href="#benefits"><span>06</span>Why host our own, and what it costs</a></li>
+        </ol>
+      </div>
+      <div class="ag-part rv" style="--d:3">
+        <p class="ag-num">Part three</p>
+        <h3>Decide how we do it</h3>
+        <ol>
+          <li><a href="#myths"><span>07</span>Myths and misconceptions</a></li>
+          <li><a href="#evidence"><span>08</span>What it means for us</a></li>
+          <li><a href="#paths"><span>09</span>Four ways to do it</a></li>
+          <li><a href="#harness"><span>10</span>Our harness, our control</a></li>
+          <li><a href="#plan"><span>11</span>The plan</a></li>
+        </ol>
+      </div>
+    </div>
+    <p class="caption rv" style="--d:4">Click any line to jump there. On slides with a technical deep-dive, an <b>Engineer's note</b> button appears at the bottom.</p>
+  </div></div>
+</section>
+
+<!-- ================================================================ 3 · PART ONE -->
+<section class="slide dark" id="part1" data-label="Part one">
+  <div class="frame"><div class="pad part">
+    <div>
+      <p class="part-num rv">Part one</p>
+      <h2 class="part-title" data-gen>Understand the machine</h2>
+      <p class="part-sum rv" style="--d:3">What a language model is, how it learns, how it produces an answer, and the vocabulary you will hear in every AI conversation.</p>
+    </div>
+    <ol class="part-list rv" style="--d:4"><li>What is an LLM?</li><li>How do LLMs learn?</li><li>How do LLMs work?</li><li>The vocabulary</li></ol>
+  </div></div>
+</section>
+
+<!-- ================================================================ 4 · WHAT -->
+<section class="slide" id="what" data-label="01 · What is an LLM">
+  <div class="frame"><div class="pad">
+    <header class="s-head">
+      <p class="eyebrow rv"><span class="ch">01</span> What is an LLM</p>
+      <h2 data-gen>A machine that has read more than any person ever could</h2>
+      <p class="lede rv" style="--d:2">A large language model (LLM) is a program trained on an enormous amount of text: books, websites, manuals, code. From all that reading it learned one skill extremely well. Given some text, it predicts what comes next. Ask it a question, and it predicts, word by word, what a good answer looks like.</p>
+    </header>
+    <div class="facts">
+      <div class="fact card rv" style="--d:3"><p class="fact-word">Large</p><p>Billions of adjustable numbers, called <b>parameters</b>, tuned during training. They hold everything the model learned.</p></div>
+      <div class="fact card rv" style="--d:4"><p class="fact-word">Language</p><p>It reads and writes text: English, Hindi, code, tables. Newer models also read images and audio.</p></div>
+      <div class="fact card rv" style="--d:5"><p class="fact-word">Model</p><p>A mathematical approximation of patterns in language. Not a database of facts, which is why it can sound right and still be wrong.</p></div>
+    </div>
+  </div></div>
+</section>
+
+<!-- ================================================================ 5 · SCALE -->
+<section class="slide" id="scale" data-label="01 · What is an LLM">
+  <div class="frame"><div class="pad">
+    <header class="s-head">
+      <p class="eyebrow rv"><span class="ch">01</span> What is an LLM</p>
+      <h2 data-gen>How large is “large”?</h2>
+      <p class="sub rv" style="--d:2">Drag the slider. Each dot is 250 million parameters.</p>
+    </header>
+    <div class="scale card rv" style="--d:3">
+      <div class="scale-body">
+        <div class="scale-canvas-wrap"><canvas id="scaleCanvas" aria-hidden="true"></canvas></div>
+        <div class="scale-info" aria-live="polite">
+          <p class="scale-name" id="scaleName">Small open model</p>
+          <p class="scale-params"><span id="scaleParams">8</span><span class="unit">billion parameters</span></p>
+          <dl class="kv">
+            <div><dt>Memory needed</dt><dd id="scaleMem">about 5 GB</dd></div>
+            <div><dt>Runs on</dt><dd id="scaleRuns">a normal laptop</dd></div>
+          </dl>
+          <p class="scale-note" id="scaleNote"></p>
+        </div>
+      </div>
+      <div class="scale-control">
+        <label class="visually-hidden" for="scaleRange">Model size</label>
+        <input class="range" id="scaleRange" type="range" min="0" max="6" step="1" value="1">
+        <ol class="scale-ticks" aria-hidden="true"><li>GPT-2</li><li>8B</li><li>32B</li><li>70B</li><li>GPT-3</li><li>671B</li><li>Frontier</li></ol>
+      </div>
+    </div>
+    <details class="eng-note"><summary>Engineer's note</summary><p>Memory for the weights is roughly parameters × bits per parameter ÷ 8. At 16-bit an 8B model needs 16 GB; at 4-bit quantization about 4.5–5 GB. Add memory for the conversation itself (the KV cache), which grows with the context length. Mixture-of-experts models such as DeepSeek-V3 (671B total, 37B active per token) must still hold all weights in memory, but only compute with the active ones, so they run at the speed of a much smaller model.</p></details>
+  </div></div>
+</section>
+
+<!-- ================================================================ 6 · LEARN -->
+<section class="slide" id="learn" data-label="02 · How LLMs learn">
+  <div class="frame"><div class="pad">
+    <header class="s-head">
+      <p class="eyebrow rv"><span class="ch">02</span> How LLMs learn</p>
+      <h2 data-gen>It learns by guessing the next word, trillions of times</h2>
+      <p class="sub rv" style="--d:2">Nobody programs the knowledge in. The model starts as random numbers and improves by guessing, checking against real text, and adjusting itself after every mistake.</p>
+    </header>
+    <ol class="stages">
+      <li class="stage rv" style="--d:3">
+        <p class="stage-n">Stage 1</p>
+        <h3>Pre-training: read everything</h3>
+        <p>It reads a huge slice of the internet, books and code. For every sentence it guesses the next word, compares with the real one, and nudges its numbers so the right word becomes more likely.</p>
+        <p class="stage-stat"><b>15 trillion+</b> tokens read by Meta's Llama 3 models. The largest used about 31 million GPU-hours of computing.</p>
+      </li>
+      <li class="stage rv" style="--d:4">
+        <p class="stage-n">Stage 2</p>
+        <h3>Instruction tuning: learn to be an assistant</h3>
+        <p>It then studies many thousands of example conversations, written or checked by people: a question, followed by a good answer. It learns to follow instructions.</p>
+        <p class="stage-result">Result: it answers questions instead of just continuing text.</p>
+      </li>
+      <li class="stage rv" style="--d:5">
+        <p class="stage-n">Stage 3</p>
+        <h3>Preference tuning: learn what people prefer</h3>
+        <p>People, and increasingly other models, compare pairs of answers and pick the better one. The model is nudged towards helpful, honest, safe answers. Reasoning models are also rewarded for correct maths and code.</p>
+        <p class="stage-result">Result: the polished assistant you know from ChatGPT or Claude.</p>
+      </li>
+    </ol>
+    <details class="eng-note"><summary>Engineer's note</summary><p>Pre-training minimises cross-entropy loss on next-token prediction with gradient descent over mini-batches of millions of tokens across thousands of GPUs. Stage 2 is supervised fine-tuning (SFT); stage 3 is RLHF or a direct method such as DPO. Reasoning models add reinforcement learning with verifiable rewards (unit tests, exact answers). Meta reports about 30.8 million H100 GPU-hours for Llama 3.1 405B.</p></details>
+  </div></div>
+</section>
+
+<!-- ================================================================ 7 · TRAIN -->
+<section class="slide" id="train" data-label="02 · How LLMs learn">
+  <div class="frame"><div class="pad">
+    <header class="s-head">
+      <p class="eyebrow rv"><span class="ch">02</span> How LLMs learn</p>
+      <h2 data-gen>Train a tiny model yourself</h2>
+      <p class="sub rv" style="--d:2">This model knows five words and starts out guessing at random. Each training step shows it the right answer and nudges it closer.</p>
+    </header>
+    <div class="trainer card rv" style="--d:3">
+      <div class="trainer-main">
+        <p class="trainer-prompt">The capital of France is <span class="blank">____</span></p>
+        <div class="bars" id="trainBars"></div>
+        <div class="btn-row">
+          <button class="btn btn-primary" id="train1" type="button">Train 1 step</button>
+          <button class="btn" id="train20" type="button">Train 20 steps</button>
+          <button class="btn btn-ghost" id="trainReset" type="button">Start over</button>
+        </div>
+        <p class="trainer-msg" id="trainMsg" aria-live="polite">Step 0. It has no idea yet.</p>
+      </div>
+      <div class="loss">
+        <p class="caption">How wrong it is (the “loss”) after each step</p>
+        <svg id="lossChart" viewBox="0 0 420 260" role="img" aria-label="Loss falling as the model trains"></svg>
+      </div>
+    </div>
+    <details class="eng-note"><summary>Engineer's note</summary><p>The toy does real gradient descent on five scores (logits). With softmax probabilities p, the gradient of the loss −log p(Paris) is (p − 1) for “Paris” and p for every other word; each step subtracts the learning rate (0.6) times that gradient. A real model does the same for every position of every sentence, over a vocabulary of 100,000+ tokens and billions of parameters.</p></details>
+  </div></div>
+</section>
+
+<!-- ================================================================ 8 · FROZEN -->
+<section class="slide dark" id="frozen" data-label="02 · How LLMs learn">
+  <div class="frame"><div class="pad statement">
+    <p class="eyebrow rv">The part most people miss</p>
+    <h2 class="statement-title" data-gen>After training, the model is frozen.</h2>
+    <div class="three">
+      <p class="rv" style="--d:3">It does <b>not</b> learn from your conversations.</p>
+      <p class="rv" style="--d:4">Its knowledge <b>stops</b> at a cut-off date.</p>
+      <p class="rv" style="--d:5">It has <b>never seen</b> our contracts, code or policies.</p>
+    </div>
+    <p class="statement-foot rv" style="--d:6">The fix: hand it the right documents at the moment a question is asked. That is called <b>RAG</b>, and it is the heart of this proposal.</p>
+  </div></div>
+</section>
+
+<!-- ================================================================ 9 · WORK -->
+<section class="slide" id="work" data-label="03 · How LLMs work">
+  <div class="frame"><div class="pad">
+    <header class="s-head">
+      <p class="eyebrow rv"><span class="ch">03</span> How LLMs work</p>
+      <h2 data-gen>What happens in the second after you press Enter</h2>
+      <p class="sub rv" style="--d:2">Using a trained model is called <b>inference</b>. Six steps, and the last one loops back for every word of the answer. Click a step, or let it play.</p>
+    </header>
+    <div class="stepper rv" style="--d:3">
+      <ol class="steps" id="steps">
+        <li><button type="button" class="step is-on" data-step="1"><span class="step-n">1</span><span class="step-t">Your text is cut into tokens</span><span class="step-d">Models see <b>tokens</b>: common words, or pieces of rarer ones. Each has an ID number in the model's vocabulary.</span></button></li>
+        <li><button type="button" class="step" data-step="2"><span class="step-n">2</span><span class="step-t">Each token becomes a list of numbers</span><span class="step-d">Thousands of numbers that describe its meaning, called an <b>embedding</b>. Similar words get similar numbers.</span></button></li>
+        <li><button type="button" class="step" data-step="3"><span class="step-n">3</span><span class="step-t">Words look at each other</span><span class="step-d">In dozens of layers, every word checks every other word for context. This is <b>attention</b>. Try both sentences.</span></button></li>
+        <li><button type="button" class="step" data-step="4"><span class="step-n">4</span><span class="step-t">A score for every possible next token</span><span class="step-d">The last layer gives every token in the vocabulary a probability. Most get almost zero; a handful stand out.</span></button></li>
+        <li><button type="button" class="step" data-step="5"><span class="step-n">5</span><span class="step-t">One token is picked</span><span class="step-d">Usually one of the most likely, with a controlled amount of randomness called <b>temperature</b>.</span></button></li>
+        <li><button type="button" class="step" data-step="6"><span class="step-n">6</span><span class="step-t">Add it, and run it all again</span><span class="step-d">The token joins the text and everything repeats. Speed is measured in <b>tokens per second</b>: people read about 5; a good local setup writes 30 to 100+.</span></button></li>
+      </ol>
+      <div class="stage-panel card" aria-live="polite">
+        <div class="frame-v is-on" data-frame="1">
+          <p class="fv-label">Your text</p>
+          <p class="fv-text">Summarise this contract for me</p>
+          <p class="fv-arrow">↓ cut into tokens</p>
+          <div class="tok-row"><span class="tk-chip hl1">Summ</span><span class="tk-chip hl2">arise</span><span class="tk-chip hl3"> this</span><span class="tk-chip hl4"> contract</span><span class="tk-chip hl5"> for</span><span class="tk-chip hl1"> me</span></div>
+          <p class="tok-ids">Token IDs → 9,412 · 1,152 · 420 · 5,172 · 369 · 757 <span>(illustrative)</span></p>
+        </div>
+        <div class="frame-v" data-frame="2">
+          <p class="fv-label">Tokens become numbers</p>
+          <div class="emb" id="embRows"></div>
+          <p class="caption">* “agreement” is not in the prompt. It is shown because its numbers come out almost the same as “contract”.</p>
+        </div>
+        <div class="frame-v" data-frame="3">
+          <p class="fv-label">Words look at each other</p>
+          <div class="seg" role="group" aria-label="Choose a sentence" id="attnSeg">
+            <button type="button" class="seg-btn is-on" data-sent="0">I deposited cash at the bank</button>
+            <button type="button" class="seg-btn" data-sent="1">We had a picnic by the river bank</button>
+          </div>
+          <div class="attn-stage" id="attnStage">
+            <svg class="attn-svg" id="attnSvg"></svg>
+            <div class="attn-words" id="attnWords"></div>
+          </div>
+          <p class="attn-meaning" id="attnMeaning"></p>
+        </div>
+        <div class="frame-v" data-frame="4">
+          <p class="fv-label">A score for every possible next token</p>
+          <p class="fv-text small">Summarise this contract for me → <b>?</b></p>
+          <div class="bars">
+            <div class="bar-row chosen"><span class="bar-label">"This"</span><span class="bar-track"><span class="bar-fill" style="--w:.38"></span></span><span class="bar-val">38%</span></div>
+            <div class="bar-row"><span class="bar-label">"Here"</span><span class="bar-track"><span class="bar-fill" style="--w:.27"></span></span><span class="bar-val">27%</span></div>
+            <div class="bar-row"><span class="bar-label">"The"</span><span class="bar-track"><span class="bar-fill" style="--w:.14"></span></span><span class="bar-val">14%</span></div>
+            <div class="bar-row"><span class="bar-label">"Sure"</span><span class="bar-track"><span class="bar-fill" style="--w:.11"></span></span><span class="bar-val">11%</span></div>
+            <div class="bar-row"><span class="bar-label">"Summary"</span><span class="bar-track"><span class="bar-fill" style="--w:.04"></span></span><span class="bar-val">4%</span></div>
+          </div>
+          <p class="caption">…and about 150,000 other tokens, each with a tiny chance.</p>
+        </div>
+        <div class="frame-v" data-frame="5">
+          <p class="fv-label">One token is picked</p>
+          <div class="pick"><span class="tk-chip dim">"Here"</span><span class="tk-chip dim">"The"</span><span class="tk-chip picked">"This"</span><span class="tk-chip dim">"Sure"</span></div>
+          <p class="caption">Low temperature almost always takes the top word. Higher temperature sometimes takes a less likely one, which sounds more natural, until it drifts into nonsense.</p>
+        </div>
+        <div class="frame-v" data-frame="6">
+          <p class="fv-label">Add it, and repeat</p>
+          <p class="fv-text loop-text" id="loopText"></p>
+          <p class="caption">A 500-word answer means about 650 trips through the whole model. That is why answers stream in word by word.</p>
+        </div>
+      </div>
+    </div>
+    <details class="eng-note"><summary>Engineer's note</summary><p>This is the transformer. Inference has two phases: <b>prefill</b> processes the whole prompt in parallel (compute-bound, thousands of tokens per second on a GPU) and <b>decode</b> generates one token per forward pass (memory-bandwidth-bound: every step reads all active weights). Keys and values of earlier tokens are kept in a <b>KV cache</b> so they are not recomputed. A useful ceiling for decode speed is memory bandwidth ÷ bytes of active weights, which is why quantization and mixture-of-experts models speed up generation.</p></details>
+  </div></div>
+</section>
+
+<!-- ================================================================ 10 · TEMPERATURE -->
+<section class="slide" id="temp" data-label="03 · How LLMs work">
+  <div class="frame"><div class="pad">
+    <header class="s-head">
+      <p class="eyebrow rv"><span class="ch">03</span> How LLMs work</p>
+      <h2 data-gen>Play with temperature</h2>
+      <p class="sub rv" style="--d:2">The prompt is <span class="q">“Our new product keeps your data ____”</span>. Low temperature picks the safe word; high temperature takes risks.</p>
+    </header>
+    <div class="temp card rv" style="--d:3">
+      <div class="temp-left">
+        <div class="temp-control">
+          <label for="tempRange">Temperature <output id="tempVal">0.7</output></label>
+          <input class="range" id="tempRange" type="range" min="0.1" max="2" step="0.1" value="0.7">
+          <div class="temp-scale caption" aria-hidden="true"><span>Predictable</span><span>Creative</span><span>Chaotic</span></div>
+        </div>
+        <div class="bars" id="tempBars"></div>
+      </div>
+      <div class="temp-right">
+        <button class="btn btn-primary" id="tempSample" type="button">Generate 12 answers</button>
+        <div class="sample-chips" id="tempSamples" aria-live="polite"></div>
+        <p class="temp-hint" id="tempHint">For facts and code we keep it low. For brainstorming, higher.</p>
+      </div>
+    </div>
+    <div class="callout rv" style="--d:4">
+      <p class="callout-title">Why this matters for us</p>
+      <p>The model never looks anything up. When it lacks a fact it still produces the most plausible-sounding words. That is a <b>hallucination</b>. The fix is not a bigger model; it is giving the model the right source documents and making it cite them.</p>
+    </div>
+  </div></div>
+</section>
+
+<!-- ================================================================ 11 · TOKENS -->
+<section class="slide" id="terms" data-label="04 · The vocabulary">
+  <div class="frame"><div class="pad">
+    <header class="s-head">
+      <p class="eyebrow rv"><span class="ch">04</span> The vocabulary</p>
+      <h2 data-gen>Start with the most important word: token</h2>
+      <p class="sub rv" style="--d:2">Models read and write in tokens: common words, or pieces of rarer ones. Usage limits and prices are counted in them. Type anything to see it split. Every headline in this deck is split the same way: hover one.</p>
+    </header>
+    <div class="tokenizer card rv" style="--d:3">
+      <label class="visually-hidden" for="tokIn">Text to split into tokens</label>
+      <textarea id="tokIn" rows="2" spellcheck="false">Our quarterly revenue grew 12% after the onboarding redesign, and support tickets dropped by 1,850.</textarea>
+      <div class="tok-out" id="tokOut" aria-hidden="true"></div>
+      <dl class="tok-stats" id="tokStats"></dl>
+      <p class="caption">An approximation for illustration. Every model family learns its own set of tokens from data. Rule of thumb for English: 100 tokens ≈ 75 words.</p>
+    </div>
+  </div></div>
+</section>
+
+<!-- ================================================================ 12 · GLOSSARY -->
+<section class="slide" id="glossary" data-label="04 · The vocabulary">
+  <div class="frame"><div class="pad">
+    <header class="s-head">
+      <p class="eyebrow rv"><span class="ch">04</span> The vocabulary</p>
+      <h2 data-gen>Thirty words you will hear in every AI meeting</h2>
+    </header>
+    <div class="gl rv" style="--d:2">
+      <div class="gl-left">
+        <div class="gl-controls">
+          <div class="gl-filters" role="group" aria-label="Filter terms">
+            <button type="button" class="chip is-on" data-cat="all">All</button>
+            <button type="button" class="chip" data-cat="basics">Basics</button>
+            <button type="button" class="chip" data-cat="build">Building with AI</button>
+            <button type="button" class="chip" data-cat="run">Running a model</button>
+            <button type="button" class="chip" data-cat="risk">Risks and safety</button>
+          </div>
+          <label class="gl-search"><span class="visually-hidden">Search terms</span><input id="glSearch" type="search" placeholder="Search, e.g. RAG" autocomplete="off"></label>
+        </div>
+        <div class="gl-terms" id="glTerms" role="listbox" aria-label="Terms"></div>
+        <p class="caption"><span class="dot-key"></span> key terms for this proposal</p>
+      </div>
+      <article class="gl-detail card" id="glDetail" aria-live="polite"></article>
+    </div>
+  </div></div>
+</section>
+
+<!-- ================================================================ 13 · PART TWO -->
+<section class="slide dark" id="part2" data-label="Part two">
+  <div class="frame"><div class="pad part">
+    <div>
+      <p class="part-num rv">Part two</p>
+      <h2 class="part-title" data-gen>Rent it, or run it</h2>
+      <p class="part-sum rv" style="--d:3">The difference between subscription AI like ChatGPT and Claude, and a model we host ourselves. What we gain, and what it costs.</p>
+    </div>
+    <ol class="part-list rv" style="--d:4"><li>Local versus subscription</li><li>Why host our own</li><li>What it would cost</li></ol>
+  </div></div>
+</section>
+
+<!-- ================================================================ 14 · COMPARE -->
+<section class="slide" id="compare" data-label="05 · Local versus subscription">
+  <div class="frame"><div class="pad">
+    <header class="s-head">
+      <p class="eyebrow rv"><span class="ch">05</span> Local versus subscription</p>
+      <h2 data-gen>Two ways to get an AI: rent a seat, or own the engine</h2>
+      <p class="sub rv" style="--d:2">ChatGPT, Claude, Gemini and Copilot run in the vendor's data centre, and we pay per person or per token. A locally hosted model runs on servers we control, and the model file is ours to keep.</p>
+    </header>
+    <div class="route-block card rv" style="--d:3">
+      <div class="route-top">
+        <div class="seg seg-lg" role="group" aria-label="Choose where the AI runs">
+          <button type="button" class="seg-btn is-on" data-route="cloud">Subscription AI</button>
+          <button type="button" class="seg-btn" data-route="local">Our own AI</button>
+        </div>
+        <p class="route-title" id="routeTitle">Follow one question from a colleague's laptop</p>
+      </div>
+      <div class="route-wrap"><div class="route-line" id="routeLine"></div><ol class="route" id="route"></ol><span class="packet" id="packet"></span></div>
+      <ul class="route-notes" id="routeNotes"></ul>
+    </div>
+    <details class="eng-note"><summary>Engineer's note</summary><p>“Local” does not have to mean a server room. The same software runs on GPU instances in our own cloud account, in a region we choose, with no third-party model provider in the path. Business and enterprise subscription plans usually promise not to train on customer data and offer retention controls, but prompts and documents are still processed and stored on the vendor's infrastructure under their policies, and subject to the legal processes of their jurisdiction.</p></details>
+  </div></div>
+</section>
+
+<!-- ================================================================ 15 · TABLE -->
+<section class="slide" id="table" data-label="05 · Local versus subscription">
+  <div class="frame"><div class="pad">
+    <header class="s-head">
+      <p class="eyebrow rv"><span class="ch">05</span> Local versus subscription</p>
+      <h2 data-gen>Side by side</h2>
+    </header>
+    <div class="table-wrap card rv" style="--d:2">
+      <table class="cmp">
+        <caption class="visually-hidden">Subscription AI compared with locally hosted AI</caption>
+        <thead><tr><th scope="col"></th><th scope="col">Subscription AI</th><th scope="col" class="ours">Our own AI</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Where the model runs</th><td>The vendor's data centres</td><td>Our servers, on-site or in our own cloud account</td></tr>
+          <tr><th scope="row">Where our data goes</th><td>To the vendor, stored under their retention rules</td><td>Stays inside our network, under our rules</td></tr>
+          <tr><th scope="row">Who changes the model</th><td>The vendor, on their schedule; models get retired</td><td>We do. A version stays until we switch</td></tr>
+          <tr><th scope="row">How we pay</th><td>Per person per month, or per token; grows with use</td><td>Hardware up front, then running costs; flat as use grows</td></tr>
+          <tr><th scope="row">Top-end quality</th><td>The strongest models available today</td><td>Strong and improving fast; behind on the hardest tasks</td></tr>
+          <tr><th scope="row">Connection to our systems</th><td>Through vendor connectors, our data flowing to them</td><td>Directly, inside our network, with our access rights</td></tr>
+          <tr><th scope="row">Customisation</th><td>What the vendor chooses to offer</td><td>Anything: model, fine-tuning, tools, workflows</td></tr>
+          <tr><th scope="row">Limits and outages</th><td>Vendor rate limits, caps and outages</td><td>Only our hardware; works without the internet</td></tr>
+          <tr><th scope="row">Getting started</th><td>Minutes</td><td>A few weeks for a pilot, and an owner in IT</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="fair rv" style="--d:3"><b>A fair comparison:</b> the best subscription models still lead on the hardest problems. For everyday work (drafting, summarising, answering from our documents, help with code) open-weight models are more than good enough, and only they keep sensitive data in the building.</p>
+  </div></div>
+</section>
+
+<!-- ================================================================ 16 · BENEFITS -->
+<section class="slide" id="benefits" data-label="06 · Why host our own">
+  <div class="frame"><div class="pad">
+    <header class="s-head">
+      <p class="eyebrow rv"><span class="ch">06</span> Why host our own</p>
+      <h2 data-gen>What changes when the engine is ours</h2>
+    </header>
+    <div class="benefits">
+      <article class="benefit card rv" style="--d:1"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="10.5" width="14" height="10" rx="1.5"/><path d="M8 10.5V7.5a4 4 0 0 1 8 0v3"/><path d="M12 14.5v2.5"/></svg><h3>Our data never leaves</h3><p>Contracts, source code, customer and employee records stay on our network. Compliance becomes something we control and can prove.</p></article>
+      <article class="benefit card rv" style="--d:2"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 17h18"/><path d="M3 12h18" opacity=".45"/><path d="M6 7l4 3 4-4 4 3"/></svg><h3>Cost that does not grow with use</h3><p>No per-person or per-token bill rising with adoption. Once the hardware is paid for, the thousandth question costs little more than electricity.</p></article>
+      <article class="benefit card rv" style="--d:3"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7h10l-3-3"/><path d="M17 17H7l3 3"/></svg><h3>No lock-in</h3><p>Open-weight models are interchangeable. When a better one appears we switch in an afternoon; documents, tools and workflows stay as they are.</p></article>
+      <article class="benefit card rv" style="--d:4"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="6" r="2.5"/><path d="M12 8.5V21"/><path d="M5 14a7 7 0 0 0 14 0"/></svg><h3>Stable results</h3><p>A model we host does not change underneath us. Vendors update and retire models on their own schedule, which can quietly change our results.</p></article>
+      <article class="benefit card rv" style="--d:5"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4v16M12 4v16M19 4v16"/><circle cx="5" cy="14" r="2"/><circle cx="12" cy="8" r="2"/><circle cx="19" cy="16" r="2"/></svg><h3>Built around how we work</h3><p>Connect it to internal systems, teach it our formats and tone, and build workflows no vendor would ever offer.</p></article>
+      <article class="benefit card rv" style="--d:6"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v8"/><path d="M7.5 6.5a7 7 0 1 0 9 0"/></svg><h3>Always available</h3><p>No vendor outages, no rate limits at month end, no surprise usage caps. It even works when the internet is down.</p></article>
+      <article class="benefit card rv" style="--d:7"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h9l3 3v15H6z"/><path d="M9 10h6M9 14h6M9 18h4"/></svg><h3>A complete audit trail</h3><p>Every question, document used and answer can be logged, kept or deleted according to our own retention policy.</p></article>
+      <article class="benefit card rv" style="--d:8"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 9l10-5 10 5-10 5z"/><path d="M6 11v5c3 2.5 9 2.5 12 0v-5"/></svg><h3>Skills stay in-house</h3><p>Our team learns to build with AI, not just buy it. That know-how compounds, whichever models lead next year.</p></article>
+    </div>
+  </div></div>
+</section>
+
+<!-- ================================================================ 17 · COST -->
+<section class="slide" id="cost" data-label="06 · What it would cost">
+  <div class="frame"><div class="pad">
+    <header class="s-head">
+      <p class="eyebrow rv"><span class="ch">06</span> Why host our own</p>
+      <h2 data-gen>What would it cost?</h2>
+      <p class="sub rv" style="--d:2">Example figures in rupees, with US dollars in brackets (at <span data-rate>₹95.96</span> = $1). Move the sliders to match real quotes.</p>
+    </header>
+    <div class="calc card rv" style="--d:3">
+      <div class="calc-inputs">
+        <div class="field"><label for="cSeats">People using AI <output id="cSeatsOut"></output></label><input class="range" id="cSeats" type="range" min="10" max="1000" step="10" value="150"></div>
+        <div class="field"><label for="cPrice">Subscription, per person per month <output id="cPriceOut"></output></label><input class="range" id="cPrice" type="range" min="500" max="10000" step="100" value="2900"></div>
+        <div class="field"><label for="cHw">Our hardware, one-time <output id="cHwOut"></output></label><input class="range" id="cHw" type="range" min="500000" max="15000000" step="100000" value="3000000"></div>
+        <div class="field"><label for="cRun">Our running cost per month <output id="cRunOut"></output></label><input class="range" id="cRun" type="range" min="0" max="1000000" step="25000" value="125000"><p class="caption">Power, maintenance and a share of an engineer's time.</p></div>
+      </div>
+      <div class="calc-stats" aria-live="polite">
+        <div><p class="caption">Subscriptions, 3 years</p><p class="calc-num" id="cCloud3"></p></div>
+        <div><p class="caption">Our own AI, 3 years</p><p class="calc-num ours" id="cLocal3"></p></div>
+        <div><p class="caption">Pays for itself</p><p class="calc-num" id="cBreak"></p></div>
+        <div><p class="caption">Difference over 3 years</p><p class="calc-num" id="cSave"></p></div>
+      </div>
+      <div class="calc-out">
+        <svg class="calc-chart" id="calcChart" viewBox="0 0 760 300" role="img" aria-label="Cumulative cost over 36 months for subscriptions and for our own AI"></svg>
+        <div class="legend caption"><span class="key-line key-cloud"></span>Subscriptions <span class="key-line key-local"></span>Our own AI</div>
+      </div>
+    </div>
+    <p class="caption rv" style="--d:4">Running costs only. A subscription seat and a self-hosted model are not identical products: subscriptions include the vendor's strongest models; self-hosting includes privacy, control and unlimited use.</p>
+    <details class="eng-note"><summary>Engineer's note</summary><p>For a pilot-sized deployment, one server with one or two 48–96 GB data-centre GPUs can serve a 30B-class model (or a mixture-of-experts model such as gpt-oss-120b, which OpenAI states fits a single 80 GB GPU) to dozens of concurrent users with a batching inference server like vLLM. Total cost of ownership should include power and cooling, a support contract, and roughly a quarter to half of one engineer's time once running. Conversions use <span data-rate>₹95.96</span> per US dollar; change <code>INR_PER_USD</code> in app.js if the rate moves.</p></details>
+  </div></div>
+</section>
+
+<!-- ================================================================ 18 · PART THREE -->
+<section class="slide dark" id="part3" data-label="Part three">
+  <div class="frame"><div class="pad part">
+    <div>
+      <p class="part-num rv">Part three</p>
+      <h2 class="part-title" data-gen>Decide how we do it</h2>
+      <p class="part-sum rv" style="--d:3">Clearing up the myths, where it would help us, the four possible routes, and why our own harness with RAG gives us control.</p>
+    </div>
+    <ol class="part-list rv" style="--d:4"><li>Myths and misconceptions</li><li>What it means for us</li><li>Four ways to do it</li><li>Our harness, our control</li><li>The plan</li></ol>
+  </div></div>
+</section>
+
+<!-- ================================================================ 19 · MYTHS 1-5 -->
+<section class="slide" id="myths" data-label="07 · Myths">
+  <div class="frame"><div class="pad">
+    <header class="s-head s-head-row">
+      <div>
+        <p class="eyebrow rv"><span class="ch">07</span> Myths and misconceptions</p>
+        <h2 data-gen>Ten things people get wrong about AI</h2>
+      </div>
+      <p class="myth-count rv" style="--d:2"><span class="myth-num">0</span> of 10 checked · tap a card</p>
+    </header>
+    <div class="myth-grid" data-myths="0"></div>
+  </div></div>
+</section>
+
+<!-- ================================================================ 20 · MYTHS 6-10 -->
+<section class="slide" id="myths2" data-label="07 · Myths">
+  <div class="frame"><div class="pad">
+    <header class="s-head s-head-row">
+      <div>
+        <p class="eyebrow rv"><span class="ch">07</span> Myths, continued</p>
+        <h2 data-gen>…and five more</h2>
+      </div>
+      <p class="myth-count rv" style="--d:2"><span class="myth-num">0</span> of 10 checked · tap a card</p>
+    </header>
+    <div class="myth-grid" data-myths="5"></div>
+  </div></div>
+</section>
+
+<!-- ================================================================ 21 · EVIDENCE -->
+<section class="slide" id="evidence" data-label="08 · What it means for us">
+  <div class="frame"><div class="pad">
+    <header class="s-head">
+      <p class="eyebrow rv"><span class="ch">08</span> What it means for us</p>
+      <h2 data-gen>AI assistants already make teams measurably faster</h2>
+    </header>
+    <div class="evidence">
+      <div class="ev rv" style="--d:2">
+        <p class="ev-num"><span data-count="14">14</span>%</p>
+        <p>more customer issues resolved per hour by support agents given an AI assistant, and <b>34%</b> more for newer agents.</p>
+        <p class="caption">Brynjolfsson, Li and Raymond, “Generative AI at Work”, NBER, 2023 (5,179 agents)</p>
+      </div>
+      <div class="ev rv" style="--d:3">
+        <p class="ev-num"><span data-count="55">55</span>%</p>
+        <p>faster completion of a programming task by developers using an AI pair programmer, in a controlled experiment.</p>
+        <p class="caption">Peng et al., “The Impact of AI on Developer Productivity”, 2023</p>
+      </div>
+    </div>
+    <p class="lede rv" style="--d:4">The strongest case for our own AI is work on our own documents and data, which is exactly the work we cannot safely send to a subscription service.</p>
+  </div></div>
+</section>
+
+<!-- ================================================================ 22 · DEPARTMENTS -->
+<section class="slide" id="value" data-label="08 · What it means for us">
+  <div class="frame"><div class="pad">
+    <header class="s-head">
+      <p class="eyebrow rv"><span class="ch">08</span> What it means for us</p>
+      <h2 data-gen>Where our own AI would earn its keep</h2>
+    </header>
+    <div class="dept rv" style="--d:2">
+      <div class="dept-tabs" role="tablist" aria-label="Departments" id="deptTabs"></div>
+      <div class="dept-panel card" id="deptPanel" role="tabpanel">
+        <div class="dept-uses">
+          <p class="caption">What it would do</p>
+          <ul id="deptUses"></ul>
+          <p class="dept-keep" id="deptKeep"></p>
+        </div>
+        <div class="chat">
+          <p class="caption">Example exchange</p>
+          <div class="bubble bubble-q" id="chatQ"></div>
+          <div class="bubble bubble-a" aria-live="polite"><span id="chatA"></span><span class="gen-caret" id="chatCaret" aria-hidden="true"></span></div>
+          <div class="sources" id="chatSrc"></div>
+        </div>
+      </div>
+      <p class="caption">Examples are illustrative; document names are placeholders for our real systems.</p>
+    </div>
+  </div></div>
+</section>
+
+<!-- ================================================================ 23 · PATHS -->
+<section class="slide" id="paths" data-label="09 · Four ways to do it">
+  <div class="frame"><div class="pad">
+    <header class="s-head">
+      <p class="eyebrow rv"><span class="ch">09</span> Four ways to do it</p>
+      <h2 data-gen>Four routes to our own AI</h2>
+    </header>
+    <div class="paths rv" style="--d:3">
+      <div class="path-cards" role="tablist" aria-label="Routes" id="pathCards">
+        <button type="button" role="tab" class="path-card" data-path="0"><span class="path-letter">A</span><span class="path-name">Open-weight model, as it is</span><span class="path-short">Download, host, chat</span></button>
+        <button type="button" role="tab" class="path-card is-on" data-path="1"><span class="path-letter">B</span><span class="path-name">Open-weight model + RAG</span><span class="path-short">Answers from our documents</span><span class="badge">Recommended</span></button>
+        <button type="button" role="tab" class="path-card" data-path="2"><span class="path-letter">C</span><span class="path-name">Fine-tune an open-weight model</span><span class="path-short">Retrain it on our examples</span></button>
+        <button type="button" role="tab" class="path-card" data-path="3"><span class="path-letter">D</span><span class="path-name">Train our own from scratch</span><span class="path-short">Build a new model</span></button>
+      </div>
+      <div class="path-detail card" id="pathDetail" role="tabpanel">
+        <div class="path-text">
+          <h3 id="pathTitle"></h3>
+          <p id="pathDesc"></p>
+          <dl class="kv kv-grid">
+            <div><dt>Time to first results</dt><dd id="pathTime"></dd></div>
+            <div><dt>Good for</dt><dd id="pathGood"></dd></div>
+            <div><dt>Watch out for</dt><dd id="pathWatch"></dd></div>
+          </dl>
+        </div>
+        <div class="meters" id="pathMeters"></div>
+      </div>
+      <div class="reco-line">
+        <p class="callout-title">Our recommendation</p>
+        <ol class="reco-flow">
+          <li><b>Now</b> B: open-weight model + RAG, inside our own harness</li>
+          <li><b>Later, if tests show a need</b> add C for specific tasks</li>
+          <li><b>Not needed</b> <s>D: training from scratch</s></li>
+        </ol>
+      </div>
+    </div>
+    <details class="eng-note"><summary>Engineer's note</summary><p>A RAG pipeline: connectors pull documents from their sources; documents are split into passages and embedded; passages go into a vector index alongside keyword search (hybrid search usually beats either alone); a reranker orders the candidates; the top passages go into the prompt with instructions to cite them. Access-control lists are applied at retrieval time, so people only get answers from documents they may open. Fine-tuning today is mostly LoRA or QLoRA: a small adapter trained on one GPU in hours, useful for format, tone and narrow classification, poor at adding facts reliably.</p></details>
+  </div></div>
+</section>
+
+<!-- ================================================================ 25 · HARNESS -->
+<section class="slide" id="harness" data-label="10 · Our harness, our control">
+  <div class="frame"><div class="pad">
+    <div class="harness-intro">
+      <div class="hi-text">
+        <p class="eyebrow rv"><span class="ch">10</span> Our harness, our control</p>
+        <h2 data-gen>The model is the engine. The harness is the rest of the car.</h2>
+        <p class="lede rv" style="--d:2">A <b>harness</b> is the software around the model. It receives the question, finds the right documents, checks who is asking, decides which tools the model may use, applies our rules and keeps a record. ChatGPT and Claude are harnesses around their vendors' models. If we build our own, every one of those decisions is ours.</p>
+      </div>
+      <svg class="rings-static rv" style="--d:3" id="ringsIntro" viewBox="0 0 360 360" aria-hidden="true"></svg>
+    </div>
+    <ul class="control-list">
+      <li class="rv" style="--d:4"><b>Which model runs</b>, and when to upgrade it, without rebuilding anything around it.</li>
+      <li class="rv" style="--d:5"><b>What it can read</b>: which systems are connected, and who may see what.</li>
+      <li class="rv" style="--d:6"><b>What it can do</b>: which tools it may use, and which actions need a person's approval.</li>
+      <li class="rv" style="--d:7"><b>What it remembers</b>: what is logged, for how long, and who can review it.</li>
+      <li class="rv" style="--d:8"><b>How it is measured</b>: our own test questions, run before every change.</li>
+      <li class="rv" style="--d:9"><b>What it costs</b>: our hardware, our budget, no per-question billing.</li>
+    </ul>
+    <details class="eng-note"><summary>Engineer's note</summary><p>Target architecture: an inference server (vLLM for many users, llama.cpp for small machines) behind an OpenAI-compatible API; an ingestion service with connectors, chunking, embeddings, hybrid search and a reranker; a policy layer that enforces single sign-on identity and document permissions at retrieval time; tools exposed through MCP servers with an allow-list and human approval for write actions; defences against prompt injection in retrieved content; an evaluation set of real questions run on every model or prompt change; and tracing of every request. Because the harness talks to models through one API, swapping the model is a configuration change.</p></details>
+  </div></div>
+</section>
+
+<!-- ================================================================ 26 · HARNESS BUILDER -->
+<section class="slide" id="builder" data-label="10 · Our harness, our control">
+  <div class="frame"><div class="pad">
+    <header class="s-head">
+      <p class="eyebrow rv"><span class="ch">10</span> Our harness, our control</p>
+      <h2 data-gen>Build the harness, one layer at a time</h2>
+      <p class="sub rv" style="--d:2">Sam from Sales asks two questions. Switch the layers on and watch the answer change.</p>
+    </header>
+    <div class="harness rv" style="--d:3">
+      <div class="h-controls">
+        <label class="switch"><input type="checkbox" id="hRag"><span class="switch-ui" aria-hidden="true"></span><span class="switch-text"><b>Our documents (RAG)</b><span>Finds the relevant policy before answering</span></span></label>
+        <label class="switch"><input type="checkbox" id="hTools"><span class="switch-ui" aria-hidden="true"></span><span class="switch-text"><b>Connected tools</b><span>Can look up live data in the HR system</span></span></label>
+        <label class="switch"><input type="checkbox" id="hPerm"><span class="switch-ui" aria-hidden="true"></span><span class="switch-text"><b>Access rights</b><span>Only uses what this person may see</span></span></label>
+        <label class="switch"><input type="checkbox" id="hGuard"><span class="switch-ui" aria-hidden="true"></span><span class="switch-text"><b>Rules</b><span>Answers only from sources, or says it does not know</span></span></label>
+        <label class="switch"><input type="checkbox" id="hAudit"><span class="switch-ui" aria-hidden="true"></span><span class="switch-text"><b>Audit log</b><span>Records who asked what, and what was used</span></span></label>
+        <div class="h-model"><label for="hModel">Model inside</label><select id="hModel"><option value="0">Qwen3 32B</option><option value="1">Llama 3.3 70B</option><option value="2">gpt-oss-120b</option></select></div>
+      </div>
+      <div class="h-chat card">
+        <div class="bubble bubble-q">How many leave days do I have left? And what does my manager earn?</div>
+        <div class="bubble bubble-a" id="hAnswer" aria-live="polite"></div>
+        <p class="h-meta caption" id="hMeta"></p>
+        <div class="h-log" id="hLog" hidden></div>
+        <p class="h-score" id="hScore"></p>
+      </div>
+    </div>
+  </div></div>
+</section>
+
+<!-- ================================================================ 27 · PROOF -->
+<section class="slide" id="proof" data-label="10 · Already running">
+  <div class="frame"><div class="pad">
+    <div class="proof">
+      <div class="proof-text">
+        <p class="eyebrow rv"><span class="ch">10</span> Already running</p>
+        <h2 data-gen>We have already built a harness like this</h2>
+        <p class="rv" style="--d:2">The <b>Local LLM PC Companion</b> is a working prototype, built in-house. It runs open-weight models entirely on a laptop: chat, questions about code, and an agent that reads and writes project files, runs commands and checks its own work. It has permission modes that decide what the agent may do without asking, automatic memory management for long tasks, and full logs on disk.</p>
+        <p class="muted rv" style="--d:3">A company deployment would run the same ideas on a shared server for many people at once.</p>
+      </div>
+      <div class="proof-stats">
+        <div class="stat card rv" style="--d:3"><p class="stat-num"><span data-count="91">91</span></p><p class="stat-unit">tokens per second</p><p>An 8-billion-parameter model on a 12 GB laptop graphics card. Many times faster than anyone reads.</p></div>
+        <div class="stat card rv" style="--d:4"><p class="stat-num"><span data-count="3">3</span> s</p><p class="stat-unit">to read 12 pages</p><p>The same laptop takes in an 8,100-token document in under three seconds.</p></div>
+        <div class="stat card rv" style="--d:5"><p class="stat-num"><span data-count="13">13</span></p><p class="stat-unit">tokens per second</p><p>With no graphics card at all, on the laptop's processor alone. Slower, but it works.</p></div>
+        <div class="stat card rv" style="--d:6"><p class="stat-num">0</p><p class="stat-unit">bytes sent out</p><p>Every model, prompt and answer stays on the machine unless web search is switched on.</p></div>
+      </div>
+    </div>
+    <p class="caption rv" style="--d:7">Measured on our own test laptop (RTX 5070 Ti Laptop GPU, 12 GB) with Qwen3 8B, September 2026.</p>
+  </div></div>
+</section>
+
+<!-- ================================================================ 28 · PLAN -->
+<section class="slide" id="plan" data-label="11 · The plan">
+  <div class="frame"><div class="pad">
+    <header class="s-head">
+      <p class="eyebrow rv"><span class="ch">11</span> The plan</p>
+      <h2 data-gen>Start small, measure honestly, then grow</h2>
+      <p class="sub rv" style="--d:2">Not a company-wide rollout. A pilot that answers one question with evidence: does our own AI, working from our own documents, save real time for real people?</p>
+    </header>
+    <ol class="timeline">
+      <li class="rv" style="--d:3"><p class="tl-when">Weeks 1–2</p><h3>Choose</h3><p>Pick one department and its documents. Agree what success looks like. Legal reviews the licence of the model we select.</p></li>
+      <li class="rv" style="--d:4"><p class="tl-when">Weeks 3–8</p><h3>Build the pilot</h3><p>One GPU server. An open-weight model with RAG over that department's documents, inside our harness with access rights and an audit log. Twenty to thirty pilot users.</p></li>
+      <li class="rv" style="--d:5"><p class="tl-when">Weeks 9–12</p><h3>Measure</h3><p>Accuracy on a set of real questions with known answers. Time saved, from the users themselves. Cost per user compared with subscriptions.</p></li>
+      <li class="rv" style="--d:6"><p class="tl-when">Next quarter</p><h3>Decide and grow</h3><p>If the numbers hold: more departments and data sources, connected tools, and fine-tuning only where tests show a clear gain.</p></li>
+    </ol>
+  </div></div>
+</section>
+
+<!-- ================================================================ 30 · END -->
+<section class="slide dark" id="end" data-label="Thank you">
+  <div class="frame"><div class="pad finale">
+    <h2 class="finale-line" data-gen>The next word should be ours.</h2>
+    <div class="finale-foot rv" style="--d:4">
+      <p class="part-sum">Questions, challenges and objections welcome.</p>
+      <a class="btn btn-primary" href="#top">Back to the start</a>
+    </div>
+    <p class="caption rv" style="--d:5">Prepared for the AI Council · September 2026 · Example figures are illustrative; public figures are cited where they appear; <span data-rate>₹95.96</span> = $1.</p>
+  </div></div>
+</section>
+
+</main>
+</div>
+
+<nav class="bar" id="bar" aria-label="Slide navigation">
+  <p class="bar-left"><span class="bar-brand">Local AI proposal</span><span class="bar-label" id="barLabel">Welcome</span></p>
+  <div class="bar-track" id="barTrack" aria-hidden="true"><div class="bar-fill" id="barFill"></div></div>
+  <div class="bar-right">
+    <button class="pill" id="engBtn" type="button" hidden aria-expanded="false" aria-controls="drawer">Engineer's note</button>
+    <button class="icon-btn" id="prevBtn" type="button" aria-label="Previous slide"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg></button>
+    <span class="bar-count" id="barCount">01 / 30</span>
+    <button class="icon-btn" id="nextBtn" type="button" aria-label="Next slide"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg></button>
+  </div>
+</nav>
+
+<aside class="drawer" id="drawer" hidden aria-label="Engineer's note">
+  <div class="drawer-head"><p class="callout-title">Engineer's note</p><button class="icon-btn" id="drawerClose" type="button" aria-label="Close the note"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div>
+  <div class="drawer-body" id="drawerBody"></div>
+</aside>
+
+<script src="app.js"></script>
+</body>
+</html>
