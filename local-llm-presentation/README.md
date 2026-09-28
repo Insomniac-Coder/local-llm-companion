@@ -15,3 +15,6 @@ Fonts come from Google Fonts when online and fall back to system fonts offline.
 - Prices are in rupees with US dollars in brackets, converted at `INR_PER_USD` (top of `app.js`, currently
   ₹95.96 = $1). Calculator defaults are the `cSeats`, `cPrice`, `cHw`, `cRun` sliders in `index.html`;
   department examples, glossary, myths and routes are the `DEPTS`, `TERMS`, `MYTHS`, `PATHS` lists in `app.js`.
+- The cost slide toggles between buying an on-premises server and renting an AWS GPU server in Mumbai
+  (ap-south-1). AWS on-demand hourly prices, from AWS's published price list of 25 September 2026, are in
+  `AWS_TYPES` in `app.js`; update them if AWS changes its prices.

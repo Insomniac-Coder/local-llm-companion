@@ -446,31 +446,45 @@
 <!-- ================================================================ 17 · COST -->
 <section class="slide" id="cost" data-label="06 · What it would cost">
   <div class="frame"><div class="pad">
-    <header class="s-head">
-      <p class="eyebrow rv"><span class="ch">06</span> Why host our own</p>
-      <h2 data-gen>What would it cost?</h2>
-      <p class="sub rv" style="--d:2">Example figures in rupees, with US dollars in brackets (at <span data-rate>₹95.96</span> = $1). Move the sliders to match real quotes.</p>
+    <header class="s-head s-head-row">
+      <div>
+        <p class="eyebrow rv"><span class="ch">06</span> Why host our own</p>
+        <h2 data-gen>What would it cost?</h2>
+        <p class="sub rv" style="--d:2">Example figures in rupees, US dollars in brackets (<span data-rate>₹95.96</span> = $1).</p>
+      </div>
+      <div class="seg seg-lg rv" style="--d:2" role="group" aria-label="Where our own AI runs" id="hostSeg">
+        <button type="button" class="seg-btn is-on" data-host="onprem" aria-pressed="true">On-premises server</button>
+        <button type="button" class="seg-btn" data-host="aws" aria-pressed="false">AWS cloud (Mumbai)</button>
+      </div>
     </header>
     <div class="calc card rv" style="--d:3">
       <div class="calc-inputs">
         <div class="field"><label for="cSeats">People using AI <output id="cSeatsOut"></output></label><input class="range" id="cSeats" type="range" min="10" max="1000" step="10" value="150"></div>
         <div class="field"><label for="cPrice">Subscription, per person per month <output id="cPriceOut"></output></label><input class="range" id="cPrice" type="range" min="500" max="10000" step="100" value="2900"></div>
-        <div class="field"><label for="cHw">Our hardware, one-time <output id="cHwOut"></output></label><input class="range" id="cHw" type="range" min="500000" max="15000000" step="100000" value="3000000"></div>
-        <div class="field"><label for="cRun">Our running cost per month <output id="cRunOut"></output></label><input class="range" id="cRun" type="range" min="0" max="1000000" step="25000" value="125000"><p class="caption">Power, maintenance and a share of an engineer's time.</p></div>
+        <div class="host-fields" data-host="onprem">
+          <div class="field"><label for="cHw">Our server, bought once <output id="cHwOut"></output></label><input class="range" id="cHw" type="range" min="500000" max="15000000" step="100000" value="3000000"><p class="caption">For example 2 × NVIDIA L40S GPUs, 96 GB in total.</p></div>
+          <div class="field"><label for="cRun">Running cost per month <output id="cRunOut"></output></label><input class="range" id="cRun" type="range" min="0" max="1000000" step="25000" value="125000"><p class="caption">Power, maintenance and a share of an engineer's time.</p></div>
+        </div>
+        <div class="host-fields" data-host="aws" hidden>
+          <div class="field"><label for="awsType">AWS server, rented <output id="awsRateOut"></output></label><select id="awsType"></select></div>
+          <div class="field"><label for="awsHours">Hours switched on per month <output id="awsHoursOut"></output></label><input class="range" id="awsHours" type="range" min="100" max="730" step="10" value="730"></div>
+          <div class="field"><label for="awsRun">Other costs per month <output id="awsRunOut"></output></label><input class="range" id="awsRun" type="range" min="0" max="500000" step="10000" value="80000"><p class="caption">A share of an engineer's time, storage and backups.</p></div>
+        </div>
       </div>
       <div class="calc-stats" aria-live="polite">
         <div><p class="caption">Subscriptions, 3 years</p><p class="calc-num" id="cCloud3"></p></div>
-        <div><p class="caption">Our own AI, 3 years</p><p class="calc-num ours" id="cLocal3"></p></div>
-        <div><p class="caption">Pays for itself</p><p class="calc-num" id="cBreak"></p></div>
+        <div><p class="caption" id="cLocalLabel">On-premises, 3 years</p><p class="calc-num ours" id="cLocal3"></p></div>
+        <div><p class="caption" id="cBreakLabel">Pays for itself</p><p class="calc-num" id="cBreak"></p></div>
         <div><p class="caption">Difference over 3 years</p><p class="calc-num" id="cSave"></p></div>
       </div>
       <div class="calc-out">
-        <svg class="calc-chart" id="calcChart" viewBox="0 0 760 300" role="img" aria-label="Cumulative cost over 36 months for subscriptions and for our own AI"></svg>
-        <div class="legend caption"><span class="key-line key-cloud"></span>Subscriptions <span class="key-line key-local"></span>Our own AI</div>
+        <svg class="calc-chart" id="calcChart" viewBox="0 0 620 300" role="img" aria-label="Cumulative cost over 36 months for subscriptions, an on-premises server and an AWS server"></svg>
+        <div class="legend caption" id="calcLegend"></div>
+        <p class="calc-compare" id="calcCompare"></p>
       </div>
     </div>
-    <p class="caption rv" style="--d:4">Running costs only. A subscription seat and a self-hosted model are not identical products: subscriptions include the vendor's strongest models; self-hosting includes privacy, control and unlimited use.</p>
-    <details class="eng-note"><summary>Engineer's note</summary><p>For a pilot-sized deployment, one server with one or two 48–96 GB data-centre GPUs can serve a 30B-class model (or a mixture-of-experts model such as gpt-oss-120b, which OpenAI states fits a single 80 GB GPU) to dozens of concurrent users with a batching inference server like vLLM. Total cost of ownership should include power and cooling, a support contract, and roughly a quarter to half of one engineer's time once running. Conversions use <span data-rate>₹95.96</span> per US dollar; change <code>INR_PER_USD</code> in app.js if the rate moves.</p></details>
+    <p class="caption rv" style="--d:4">Running costs only: subscriptions include the vendor's strongest models; hosting our own adds privacy, control and unlimited use.</p>
+    <details class="eng-note"><summary>Engineer's note</summary><p>AWS figures are on-demand Linux prices for the Mumbai region (ap-south-1) from AWS's published price list of 25 September 2026: g7e.2xlarge (1 × RTX PRO 6000 Blackwell, 96 GB) $5.49 an hour, g6e.2xlarge (1 × L40S, 48 GB) $2.69, p5.4xlarge (1 × H100, 80 GB) $8.26, g6e.12xlarge (4 × L40S, 192 GB) $12.60. The g7e.2xlarge is the default because it matches the on-premises example's 96 GB of GPU memory. Savings Plans or Reserved Instances (1 or 3 years) lower the hourly rate; storage and data transfer are billed separately and sit in "other costs". Switching the server off outside office hours (about 220 hours a month) is the biggest lever for the cloud option.</p><p>For the on-premises option, one server with one or two 48–96 GB data-centre GPUs can serve a 30B-class model to dozens of concurrent users with a batching inference server like vLLM. Total cost of ownership should include power and cooling, a support contract, and roughly a quarter to half of one engineer's time. Conversions use <span data-rate>₹95.96</span> per US dollar; change <code>INR_PER_USD</code> in app.js if the rate moves.</p></details>
   </div></div>
 </section>
 

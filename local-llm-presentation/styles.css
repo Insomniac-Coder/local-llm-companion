@@ -414,7 +414,7 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 
 /* 17 cost */
 .calc { display: grid; grid-template-columns: 430px 250px 1fr; gap: 40px; padding: 30px 34px; align-items: start; }
-.calc-inputs { display: grid; gap: 20px; }
+.calc-inputs { display: grid; gap: 16px; align-content: start; }
 .field { display: grid; gap: 2px; }
 .field label { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; font-size: 17px; font-weight: 500; }
 .field output { font: 600 16px/1.2 var(--mono); color: var(--ink); white-space: nowrap; text-align: right; }
@@ -425,7 +425,7 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .calc-num { font: 680 32px/1.1 var(--display); letter-spacing: -0.025em; font-variant-numeric: tabular-nums; margin-top: 4px; }
 .calc-num small { display: block; font: 400 15px/1.3 var(--mono); letter-spacing: 0; color: var(--muted); margin-top: 3px; }
 .calc-num.ours { color: var(--ours-ink); }
-.calc-out { display: grid; gap: 10px; }
+.calc-out { display: grid; gap: 10px; align-content: start; }
 .calc-chart { width: 100%; height: auto; }
 .line-cloud { fill: none; stroke: var(--muted); stroke-width: 2.5; stroke-dasharray: 7 6; }
 .line-local { fill: none; stroke: var(--ours); stroke-width: 3.5; }
@@ -437,6 +437,16 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .key-line:first-child { margin-left: 0; }
 .key-cloud { border-color: var(--muted); border-top-style: dashed; }
 .key-local { border-color: var(--ours); }
+.key-alt { border-color: var(--ink-2); opacity: 0.45; }
+.line-alt { fill: none; stroke: var(--ink-2); stroke-width: 2; opacity: 0.35; }
+.end-label { font: 600 12px var(--mono); }
+.end-label.sel { fill: var(--ours-ink); }
+.end-label.cloud { fill: var(--muted); }
+.end-label.alt { fill: var(--ink-2); opacity: 0.6; }
+.host-fields { display: grid; gap: 16px; }
+.field select { width: 100%; margin-top: 4px; padding: 8px 12px; border-radius: 10px; border: 1px solid var(--line-2); background: var(--paper); color: var(--ink); font: 500 15px/1.2 var(--mono); }
+.calc-compare { font-size: 15.5px; line-height: 1.45; color: var(--ink-2); }
+.calc-compare b { color: var(--ink); font-weight: 600; }
 
 /* 19–20 myths */
 .myth-count { font: 500 16px/1.3 var(--mono); color: var(--muted); white-space: nowrap; }
@@ -705,3 +715,6 @@ html[data-tone="dark"] .bar-fill { background: #34d399; }
   .myth.flipped .myth-back { visibility: visible; }
   .myth.flipped .myth-front { visibility: hidden; }
 }
+
+#hostSeg { display: inline-flex; flex: none; flex-wrap: nowrap; white-space: nowrap; }
+.flow #hostSeg { flex-wrap: wrap; white-space: normal; }

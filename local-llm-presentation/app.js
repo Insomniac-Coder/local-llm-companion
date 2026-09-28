@@ -851,29 +851,58 @@
   renderRoute();
   hooks.compare = () => { layoutRoute(); animateRoute(); };
 
-  /* ------------------------------------------------------------------ 17: cost calculator (rupees) */
-  const cIn = { seats: $('#cSeats'), price: $('#cPrice'), hw: $('#cHw'), run: $('#cRun') };
+  /* ------------------------------------------------------------------ 17: cost calculator (rupees): on-premises or AWS */
+  // AWS on-demand Linux prices, Mumbai (ap-south-1), from AWS's published price list of 25 September 2026.
+  const AWS_TYPES = [
+    { id: 'g7e.2xlarge', gpu: '1 × RTX PRO 6000, 96 GB', usd: 5.49303 },   // same GPU memory as the on-prem example
+    { id: 'g6e.2xlarge', gpu: '1 × L40S, 48 GB', usd: 2.69266 },
+    { id: 'p5.4xlarge', gpu: '1 × H100, 80 GB', usd: 8.256 },
+    { id: 'g6e.12xlarge', gpu: '4 × L40S, 192 GB', usd: 12.60131 },
+  ];
+  const cIn = { seats: $('#cSeats'), price: $('#cPrice'), hw: $('#cHw'), run: $('#cRun'), awsType: $('#awsType'), awsHours: $('#awsHours'), awsRun: $('#awsRun') };
+  cIn.awsType.replaceChildren(...AWS_TYPES.map((t, i) => { const o = el('option', null, `${t.id} · ${t.gpu}`); o.value = i; return o; }));
   const calcSvg = $('#calcChart');
+  let host = 'onprem';
   const moneyHtml = r => `${inr(r)} <small>(${usd(r)})</small>`;
   const niceStep = v => { const p = Math.pow(10, Math.floor(Math.log10(v))); const m = v / p; return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10) * p; };
   function renderCalc() {
     const seats = +cIn.seats.value, price = +cIn.price.value, hw = +cIn.hw.value, run = +cIn.run.value;
+    const type = AWS_TYPES[+cIn.awsType.value], hours = +cIn.awsHours.value, awsOther = +cIn.awsRun.value;
+    const hourInr = type.usd * INR_PER_USD;
     $('#cSeatsOut').textContent = fmt(seats) + ' people';
     $('#cPriceOut').innerHTML = moneyHtml(price);
     $('#cHwOut').innerHTML = moneyHtml(hw);
     $('#cRunOut').innerHTML = moneyHtml(run);
-    const cloudM = seats * price, M = 36;
-    const cloud36 = cloudM * M, local36 = hw + run * M;
+    $('#awsRateOut').innerHTML = `₹${fmt(hourInr)} an hour <small>($${type.usd.toFixed(2)})</small>`;
+    $('#awsHoursOut').innerHTML = `${hours} h <small>${hours >= 700 ? 'always on' : hours <= 260 ? 'office hours' : ''}</small>`;
+    $('#awsRunOut').innerHTML = moneyHtml(awsOther);
+
+    const M = 36;
+    const cloudM = seats * price;
+    const awsRent = hourInr * hours, awsM = awsRent + awsOther;
+    const cloud36 = cloudM * M, prem36 = hw + run * M, aws36 = awsM * M;
+    const aws = host === 'aws';
+    const ours36 = aws ? aws36 : prem36;
     const be = cloudM > run ? hw / (cloudM - run) : Infinity;
     $('#cCloud3').innerHTML = moneyHtml(cloud36);
-    $('#cLocal3').innerHTML = moneyHtml(local36);
-    $('#cBreak').innerHTML = be <= M ? `Month ${Math.max(1, Math.ceil(be))}` : be === Infinity ? 'Never, at these numbers' : 'After year 3';
-    $('#cSave').innerHTML = cloud36 >= local36
-      ? `${inr(cloud36 - local36)} saved <small>(${usd(cloud36 - local36)})</small>`
-      : `${inr(local36 - cloud36)} more <small>(${usd(local36 - cloud36)})</small>`;
+    $('#cLocalLabel').textContent = aws ? 'AWS server, 3 years' : 'On-premises, 3 years';
+    $('#cLocal3').innerHTML = moneyHtml(ours36);
+    if (aws) {
+      $('#cBreakLabel').textContent = 'Cheaper than subscriptions?';
+      $('#cBreak').innerHTML = awsM < cloudM ? 'Yes <small>(from month 1)</small>' : 'No <small>(at these settings)</small>';
+    } else {
+      $('#cBreakLabel').textContent = 'Pays for itself';
+      $('#cBreak').innerHTML = be <= M ? `Month ${Math.max(1, Math.ceil(be))}` : be === Infinity ? 'Never <small>(at these settings)</small>' : 'After year 3';
+    }
+    $('#cSave').innerHTML = cloud36 >= ours36
+      ? `${inr(cloud36 - ours36)} saved <small>(${usd(cloud36 - ours36)})</small>`
+      : `${inr(ours36 - cloud36)} more <small>(${usd(ours36 - cloud36)})</small>`;
+    $('#calcCompare').innerHTML = `Over 3 years at these settings: on-premises <b>${both(prem36)}</b>, AWS <b>${both(aws36)}</b>, of which AWS rent is ${both(awsRent)} a month.`;
+    $('#calcLegend').innerHTML =
+      `<span class="key-line key-cloud"></span>Subscriptions <span class="key-line ${aws ? 'key-alt' : 'key-local'}"></span>On-premises <span class="key-line ${aws ? 'key-local' : 'key-alt'}"></span>AWS`;
 
-    const W = 760, H = 380, l = 92, r = 16, t = 14, b = 34;
-    const top = Math.max(cloud36, local36) * 1.04;
+    const W = 620, H = 300, l = 90, r = 96, t = 14, b = 30;
+    const top = Math.max(cloud36, prem36, aws36) * 1.04;
     const step = niceStep(top / 4);
     const yMax = step * Math.ceil(top / step);
     const X = m => l + (m / M) * (W - l - r);
@@ -881,23 +910,39 @@
     let s = '';
     for (let v = 0; v <= yMax + 1; v += step) {
       s += `<line class="grid-line" x1="${l}" x2="${W - r}" y1="${Y(v)}" y2="${Y(v)}"/>`;
-      s += `<text class="svg-label" x="${l - 10}" y="${Y(v) + 4}" text-anchor="end">${v ? inr(v) : '₹0'}</text>`;
+      s += `<text class="svg-label" x="${l - 8}" y="${Y(v) + 4}" text-anchor="end">${v ? inr(v) : '₹0'}</text>`;
     }
     for (const m of [0, 12, 24, 36]) {
-      s += `<text class="svg-label" x="${X(m)}" y="${H - 10}" text-anchor="${m === 0 ? 'start' : m === 36 ? 'end' : 'middle'}">${m === 0 ? 'Today' : 'Year ' + m / 12}</text>`;
+      s += `<text class="svg-label" x="${X(m)}" y="${H - 8}" text-anchor="${m === 0 ? 'start' : m === 36 ? 'end' : 'middle'}">${m === 0 ? 'Today' : 'Year ' + m / 12}</text>`;
     }
-    if (be < M) s += `<polygon class="area-save" points="${X(be)},${Y(hw + run * be)} ${X(M)},${Y(cloud36)} ${X(M)},${Y(local36)}"/>`;
+    if (aws && awsM < cloudM) s += `<polygon class="area-save" points="${X(0)},${Y(0)} ${X(M)},${Y(cloud36)} ${X(M)},${Y(aws36)}"/>`;
+    if (!aws && be < M) s += `<polygon class="area-save" points="${X(be)},${Y(hw + run * be)} ${X(M)},${Y(cloud36)} ${X(M)},${Y(prem36)}"/>`;
+    const premLine = `<line class="${aws ? 'line-alt' : 'line-local'}" x1="${X(0)}" y1="${Y(hw)}" x2="${X(M)}" y2="${Y(prem36)}"/>`;
+    const awsLine = `<line class="${aws ? 'line-local' : 'line-alt'}" x1="${X(0)}" y1="${Y(0)}" x2="${X(M)}" y2="${Y(aws36)}"/>`;
     s += `<line class="line-cloud" x1="${X(0)}" y1="${Y(0)}" x2="${X(M)}" y2="${Y(cloud36)}"/>`;
-    s += `<line class="line-local" x1="${X(0)}" y1="${Y(hw)}" x2="${X(M)}" y2="${Y(local36)}"/>`;
-    if (be <= M) {
-      const bx = X(be), by = Y(hw + run * be), anchor = bx > W - 240 ? 'end' : 'start';
+    s += aws ? premLine + awsLine : awsLine + premLine;   // the selected option is drawn on top
+    if (!aws && be <= M) {
+      const bx = X(be), by = Y(hw + run * be), anchor = bx > W - r - 150 ? 'end' : 'start';
       s += `<circle class="be-dot" cx="${bx}" cy="${by}" r="6"/>`;
       s += `<text class="be-label" x="${bx + (anchor === 'start' ? 12 : -12)}" y="${by - 12}" text-anchor="${anchor}">Pays for itself · month ${Math.max(1, Math.ceil(be))}</text>`;
     }
-    calcSvg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+    // 3-year totals at the end of each line, nudged apart so they never overlap
+    const ends = [
+      { v: cloud36, cls: 'cloud' },
+      { v: prem36, cls: aws ? 'alt' : 'sel' },
+      { v: aws36, cls: aws ? 'sel' : 'alt' },
+    ].map(e => ({ ...e, y: Y(e.v) + 4 })).sort((p, q) => p.y - q.y);
+    for (let i = 1; i < ends.length; i++) ends[i].y = Math.max(ends[i].y, ends[i - 1].y + 15);
+    for (const e of ends) s += `<text class="end-label ${e.cls}" x="${W - r + 8}" y="${e.y}">${inr(e.v)}</text>`;
     calcSvg.innerHTML = s;
   }
   Object.values(cIn).forEach(i => i.addEventListener('input', renderCalc));
+  $$('#hostSeg .seg-btn').forEach(bt => bt.addEventListener('click', () => {
+    host = bt.dataset.host;
+    $$('#hostSeg .seg-btn').forEach(x => { x.classList.toggle('is-on', x === bt); x.setAttribute('aria-pressed', String(x === bt)); });
+    $$('.host-fields').forEach(f => { f.hidden = f.dataset.host !== host; });
+    renderCalc();
+  }));
   renderCalc();
 
   /* ------------------------------------------------------------------ 19–20: myths */
