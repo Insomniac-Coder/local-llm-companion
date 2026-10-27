@@ -753,13 +753,17 @@
   /* ------------------------------------------------------------------ 11: harness rings (layers light up in turn) */
   const RINGS = [['audit', 'Audit log'], ['guard', 'Rules'], ['perm', 'Access rights'], ['tools', 'Tools'], ['rag', 'Our documents']];
   function ringsSvg(onKeys) {
-    const c = 180;
+    const c = 180, gap = 26, core = 40, capH = 8.5;
     let s = '';
     RINGS.forEach(([key, name], i) => {
-      const r = 174 - i * 26;
+      const r = 174 - i * gap;
       const on = onKeys.includes(key);
+      // each label curves along the band just inside its ring, centred between that ring and the next one in
+      const inner = i < RINGS.length - 1 ? r - gap : core;
+      const R = inner + (r - inner - capH) / 2;
       s += `<circle class="ring${on ? ' on' : ''}" cx="${c}" cy="${c}" r="${r}"/>`;
-      s += `<text class="ring-label${on ? ' on' : ''}" x="${c}" y="${c - r + 18}" text-anchor="middle">${name}</text>`;
+      s += `<path id="ring-arc-${key}" fill="none" d="M ${c - R} ${c} A ${R} ${R} 0 0 1 ${c + R} ${c}"/>`;
+      s += `<text class="ring-label${on ? ' on' : ''}"><textPath href="#ring-arc-${key}" startOffset="50%" text-anchor="middle">${name}</textPath></text>`;
     });
     s += `<circle class="core" cx="${c}" cy="${c}" r="40"/>`;
     s += `<text class="core-text" x="${c}" y="${c - 2}" text-anchor="middle">The</text>`;
