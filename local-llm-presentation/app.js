@@ -87,8 +87,11 @@
     for (const node of nodes) {
       const frag = document.createDocumentFragment();
       for (const t of tokenize(node.nodeValue)) {
-        if (!t.trim()) { frag.append(t); continue; }
-        const s = el('span', 'tk', t);
+        // the space before a word stays outside its span, so a span never breaks across two lines
+        const lead = t.match(/^\s*/)[0];
+        if (lead) frag.append(lead);
+        if (lead === t) continue;
+        const s = el('span', 'tk', t.slice(lead.length));
         s.style.setProperty('--i', i);
         s.style.setProperty('--hl', HL[i++ % HL.length]);
         frag.append(s);
