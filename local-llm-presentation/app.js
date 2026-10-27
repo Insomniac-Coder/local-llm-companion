@@ -750,39 +750,37 @@
   selectDept(0, false);
   hooks.value = () => typeAnswer(DEPTS[deptIdx], true);
 
-  /* ------------------------------------------------------------------ 11: harness layers (light up in turn) */
-  const LAYERS = [['audit', 'Audit log'], ['guard', 'Rules'], ['perm', 'Access rights'], ['tools', 'Tools'], ['rag', 'Our documents']];
-  // Nested boxes, outermost first. Each layer's name sits in its own strip along the top of its box,
-  // so no word ever touches a line, whatever the font or screen size.
-  const LAYER_SIZE = 360, LAYER_SIDE = 16, LAYER_STRIP = 34;
-  const layerBox = i => {
-    const x = 2 + i * LAYER_SIDE, y = 2 + i * LAYER_STRIP;
-    return { x, y, w: LAYER_SIZE - 2 * x, h: LAYER_SIZE - 2 - y - i * LAYER_SIDE };
-  };
-  function layersSvg(onKeys) {
+  /* ------------------------------------------------------------------ 11: harness rings (layers light up in turn) */
+  const RINGS = [['audit', 'Audit log'], ['guard', 'Rules'], ['perm', 'Access rights'], ['tools', 'Tools'], ['rag', 'Our documents']];
+  function ringsSvg(onKeys) {
+    const c = 180, gap = 26, core = 40, capH = 8.5;
     let s = '';
-    LAYERS.forEach(([key, name], i) => {
-      const { x, y, w, h } = layerBox(i);
+    RINGS.forEach(([key, name], i) => {
+      const r = 174 - i * gap;
       const on = onKeys.includes(key);
-      s += `<rect class="layer${on ? ' on' : ''}" x="${x}" y="${y}" width="${w}" height="${h}" rx="${20 - i * 2}"/>`;
-      s += `<text class="layer-label${on ? ' on' : ''}" x="${LAYER_SIZE / 2}" y="${y + LAYER_STRIP / 2 + 4.5}" text-anchor="middle">${name}</text>`;
+      // each label curves along the band just inside its ring, centred between that ring and the next one in
+      const inner = i < RINGS.length - 1 ? r - gap : core;
+      const R = inner + (r - inner - capH) / 2;
+      s += `<circle class="ring${on ? ' on' : ''}" cx="${c}" cy="${c}" r="${r}"/>`;
+      s += `<path id="ring-arc-${key}" fill="none" d="M ${c - R} ${c} A ${R} ${R} 0 0 1 ${c + R} ${c}"/>`;
+      s += `<text class="ring-label${on ? ' on' : ''}"><textPath href="#ring-arc-${key}" startOffset="50%" text-anchor="middle">${name}</textPath></text>`;
     });
-    const { x, y, w, h } = layerBox(LAYERS.length);
-    s += `<rect class="core" x="${x}" y="${y}" width="${w}" height="${h}" rx="10"/>`;
-    s += `<text class="core-text" x="${LAYER_SIZE / 2}" y="${y + h / 2 + 6}" text-anchor="middle">The model</text>`;
+    s += `<circle class="core" cx="${c}" cy="${c}" r="40"/>`;
+    s += `<text class="core-text" x="${c}" y="${c - 2}" text-anchor="middle">The</text>`;
+    s += `<text class="core-text" x="${c}" y="${c + 15}" text-anchor="middle">model</text>`;
     return s;
   }
-  const layersIntro = $('#layersIntro');
-  layersIntro.innerHTML = layersSvg(LAYERS.map(l => l[0]));
+  const ringsIntro = $('#ringsIntro');
+  ringsIntro.innerHTML = ringsSvg(RINGS.map(r => r[0]));
   hooks.harness = async () => {
     if (reduced) return;
     const lit = [];
-    layersIntro.innerHTML = layersSvg(lit);
-    for (const [key] of [...LAYERS].reverse()) {
+    ringsIntro.innerHTML = ringsSvg(lit);
+    for (const [key] of [...RINGS].reverse()) {
       await sleep(420);
-      if (!isActive('harness')) { layersIntro.innerHTML = layersSvg(LAYERS.map(l => l[0])); return; }
+      if (!isActive('harness')) { ringsIntro.innerHTML = ringsSvg(RINGS.map(r => r[0])); return; }
       lit.push(key);
-      layersIntro.innerHTML = layersSvg(lit);
+      ringsIntro.innerHTML = ringsSvg(lit);
     }
   };
 
