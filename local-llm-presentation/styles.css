@@ -398,13 +398,13 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .hi-text { display: grid; gap: 18px; }
 .hi-text h2 { max-width: 20ch; }
 .hi-text .lede { font-size: 21px; }
-.rings-static { width: 360px; height: 360px; }
-.ring { fill: none; stroke: var(--line-2); stroke-width: 1.5; transition: stroke 0.4s, stroke-width 0.4s; }
-.ring.on { stroke: var(--ours); stroke-width: 3; }
-.ring-label { fill: var(--muted); font: 600 12px var(--mono); letter-spacing: 0.08em; text-transform: uppercase; transition: fill 0.4s; }
-.ring-label.on { fill: var(--ours-ink); }
+.layers-static { width: 360px; height: 360px; }
+.layer { fill: none; stroke: var(--line-2); stroke-width: 1.5; transition: stroke 0.4s, stroke-width 0.4s; }
+.layer.on { stroke: var(--ours); stroke-width: 2.5; }
+.layer-label { fill: var(--muted); font: 600 12.5px var(--mono); letter-spacing: 0.08em; text-transform: uppercase; transition: fill 0.4s; }
+.layer-label.on { fill: var(--ours-ink); }
 .core { fill: var(--ink); }
-.core-text { fill: var(--on-ink); font: 600 14px var(--sans); }
+.core-text { fill: var(--on-ink); font: 600 18px var(--sans); }
 .control-list { list-style: none; padding: 0; display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px 40px; }
 .callout { padding: 16px 22px; border-radius: 14px; background: var(--wash); }
 .callout p { font-size: 17px; line-height: 1.5; color: var(--ink-2); }
@@ -556,7 +556,7 @@ html[data-tone="dark"] .bar-fill { background: #34d399; }
 .flow .calc-num { font-size: 26px; }
 .flow .bar-row { grid-template-columns: 96px 1fr 44px; gap: 8px; font-size: 14px; }
 .flow .mrow { grid-template-columns: 140px 1fr; font-size: 15px; }
-.flow .rings-static { display: none; }
+.flow .layers-static { display: none; }
 .flow .s-head-row { flex-direction: column; align-items: flex-start; }
 .flow .gen-text { font-size: 24px; }
 .flow .hint { display: none; }
