@@ -375,7 +375,7 @@
     runGen();
   }
 
-  /* ------------------------------------------------------------------ 5: six steps of inference */
+  /* ------------------------------------------------------------------ 4: six steps of inference */
   const stepBtns = $$('#steps .step');
   const framesV = $$('.frame-v');
   let stepNow = 1, autoplay = true, autoTimer = 0;
@@ -477,7 +477,118 @@
   }
   loopText.textContent = LOOP.join('');
 
-  /* ------------------------------------------------------------------ 8: cost calculator (rupees): on-premises or AWS */
+  /* ------------------------------------------------------------------ 6: glossary */
+  const CATS = { basics: 'Basics', build: 'Building with AI', run: 'Running a model', risk: 'Risks and safety' };
+  const TERMS = [
+    ['Token', 'basics', 1, 'The unit a model reads and writes: a common word, or a piece of a rarer one. Usage limits and prices are counted in tokens.', 'Syllables, for a machine.', 'Tokenizers are learned from data, usually by byte-pair encoding. Vocabularies run from about 32,000 to over 200,000 tokens. English averages about 0.75 words per token; many other languages, and code, need more tokens for the same meaning.'],
+    ['Parameters', 'basics', 1, 'The billions of numbers inside a model that were adjusted during training. Together they hold everything it learned.', 'The strength of the connections in a brain.', 'Also called weights. An 8B model has 8 billion of them. Memory needed ≈ parameters × bytes per parameter: 2 bytes at 16-bit, about 0.5 at 4-bit.'],
+    ['Context window', 'basics', 1, 'How much text the model can consider at once: the instructions, the conversation so far and any documents supplied, measured in tokens.', 'A desk. Only what fits on the desk gets used.', 'Ranges from about 8,000 to over 1,000,000 tokens. Longer contexts need more memory (the KV cache), and models often miss facts buried in the middle of very long inputs, which is one reason RAG sends only the relevant passages.'],
+    ['Prompt and system prompt', 'basics', 0, 'The prompt is what a person sends. The system prompt is standing instructions set by whoever runs the tool: role, rules, tone and format.', 'The briefing a new employee gets on day one, then the day’s requests.', 'In a harness, the system prompt also describes the available tools and how to call them. It is one of the most important levers we control; with a subscription service most of it belongs to the vendor.'],
+    ['Inference', 'basics', 0, 'Using a trained model to produce an answer. It happens every time anyone asks a question.', 'Training is school. Inference is doing the job.', 'For a single user the cost is dominated by GPU memory and memory bandwidth rather than raw compute. Batching many users together is what makes a shared server efficient.'],
+    ['Temperature', 'basics', 0, 'A setting that controls how adventurous the model is when it picks each next word. Low is predictable, high is creative.', 'A careful accountant versus a brainstorming session.', 'Probabilities are computed as softmax(scores ÷ temperature). Related settings, top-p and top-k, cut unlikely tokens out entirely.'],
+    ['Knowledge cut-off', 'basics', 0, 'The date the training data ends. The model knows nothing after it unless the harness gives it documents or search results.', 'A well-read colleague who has been off-grid since that date.', 'Cut-offs are usually several months to a year before a model is released, and models are often unsure of their own cut-off.'],
+    ['Multimodal', 'basics', 0, 'A model that handles more than text: images, scanned documents, charts, audio, sometimes video.', 'A colleague who reads the attachment, not only the email.', 'Usually a vision encoder turns an image into features the language model can read. Several open-weight families (Gemma, Qwen-VL, Llama 4) are multimodal.'],
+    ['Reasoning model', 'basics', 0, 'A model trained to work through a problem step by step before answering. Slower, but much better at maths, code and planning.', 'Showing your working in an exam.', 'Examples: OpenAI’s o-series, DeepSeek-R1, Qwen3 in thinking mode. The thinking costs extra tokens, so answers take longer and use more compute.'],
+    ['RAG', 'build', 1, 'Retrieval-augmented generation. Before answering, the system searches our documents for the relevant passages and gives them to the model with the question, so it answers from them and can cite them.', 'An open-book exam instead of answering from memory.', 'Split documents into passages, embed them, store them in an index; at question time search (vector plus keyword), rerank, and put the best passages into the prompt. Updating knowledge means updating the index: no retraining.'],
+    ['Embeddings', 'build', 0, 'A way to turn a piece of text into a list of numbers that captures its meaning, so software can find passages that mean the same thing even when the words differ.', 'Map coordinates for meaning: similar ideas sit close together.', 'Made by a separate, small embedding model, typically 384 to 4,096 numbers per passage. Closeness is measured by the angle between two lists (cosine similarity).'],
+    ['Vector database', 'build', 0, 'A database that stores embeddings and quickly finds the ones closest to a question. It is the search engine behind RAG.', 'A library catalogue organised by topic instead of title.', 'Options include PostgreSQL with pgvector, Qdrant, Milvus and OpenSearch. Store each passage’s access rights next to it, so search only returns what the asker may see.'],
+    ['Fine-tuning', 'build', 1, 'Further training an existing model on our own examples, to change its behaviour, tone or output format.', 'On-the-job training for a graduate who already has a degree.', 'Good for style, format and narrow tasks such as sorting tickets. Poor at reliably adding facts, and whatever it learns is frozen on the day training ends. Needs hundreds to thousands of high-quality examples.'],
+    ['LoRA', 'build', 0, 'A cheap way to fine-tune. Instead of changing every parameter, a small add-on is trained: hours on one GPU instead of weeks on many.', 'Clip-on lenses instead of new glasses.', 'Low-Rank Adaptation trains small extra matrices, typically well under 1% of the model’s size. QLoRA does the same on a 4-bit model to save memory. Different adapters can be swapped in per task on one base model.'],
+    ['Harness', 'build', 1, 'All the software around a model that turns it into a useful tool: instructions, memory, access to documents and tools, permissions and logging.', 'The model is the engine; the harness is the rest of the car.', 'Examples: the ChatGPT app, Claude Code, and our own PC Companion. The harness decides what goes into the context window at every step, so it drives quality as much as the model does.'],
+    ['Agent', 'build', 0, 'A model inside a harness that works through a task in steps: search, read, calculate, write, check its own work, and repeat until done.', 'An assistant you give a goal, not a single instruction.', 'A loop of model call → tool call → result → model call. Agents need limits: approval for risky actions, detection of loops, and a clear definition of done.'],
+    ['Tool calling', 'build', 0, 'The model’s ability to ask the harness to run something, such as a search, a database query or a calculation, and then use the result.', 'Asking a colleague to check the system while you draft the reply.', 'Also called function calling. The model writes a structured request that matches a tool’s description; the harness checks it and runs it. The model itself never executes anything.'],
+    ['MCP', 'build', 0, 'Model Context Protocol: an open standard for connecting AI tools to data sources and apps, so a connector is built once and works with many models.', 'USB for AI: one plug shape for many devices.', 'Introduced by Anthropic in November 2024 and since adopted widely, including by OpenAI and Google. An MCP server exposes tools and data; the harness is the client.'],
+    ['Open-weight model', 'run', 1, 'A model whose trained parameters are published for anyone to download and run on their own hardware.', 'Getting the recipe, not just the meal.', 'Examples: Llama (Meta), Qwen (Alibaba), Gemma (Google), Mistral, DeepSeek, gpt-oss (OpenAI). Not the same as open source: training data and code are usually not released, and licences range from fully permissive (Apache 2.0) to custom terms with conditions.'],
+    ['Quantization', 'run', 0, 'Storing each parameter with fewer bits, for example 4 instead of 16, so the model needs about a quarter of the memory for a small loss in quality.', 'A high-quality MP3 of a studio recording.', 'Common formats: GGUF (llama.cpp), AWQ and GPTQ (GPU servers), FP8. 4-bit keeps most of the quality for everyday work; 2 or 3 bits start to hurt noticeably.'],
+    ['GPU and VRAM', 'run', 0, 'The graphics processor does the maths; its own memory (VRAM) has to hold the model. VRAM size decides which models a machine can run.', 'The size of the workbench decides how big a job you can take on.', 'Consumer cards have 8 to 32 GB, data-centre cards 48 GB and up. A model that does not fit spills into system memory at a large speed cost. Serving software: llama.cpp for single machines, vLLM or SGLang for many users.'],
+    ['Tokens per second', 'run', 0, 'How fast a model writes. People read at about 5 tokens per second; a good in-house setup writes 30 to 100 or more.', 'Words per minute, for a machine.', 'Two numbers matter: prompt processing (reading, often thousands of tokens per second) and generation (writing). Generation speed is limited mainly by memory bandwidth.'],
+    ['Mixture of experts', 'run', 0, 'A model split into many specialist sub-networks, with only a few switched on for each token. Big-model knowledge at small-model speed.', 'A hospital full of specialists, where each patient sees only two or three.', 'DeepSeek-V3: 671B parameters, 37B active per token. Qwen3-30B-A3B: 30B total, 3B active. All experts still have to fit in memory.'],
+    ['Distillation', 'run', 0, 'Training a smaller model to imitate a bigger one. Many of the best small models are made this way.', 'An apprentice learning from a master.', 'The student learns from the teacher’s outputs. DeepSeek, for example, released R1 distilled into several smaller Qwen and Llama models.'],
+    ['Hallucination', 'risk', 1, 'When a model states something false with confidence, such as an invented figure, quote or source.', 'A confident guest at a party who never admits they don’t know.', 'It follows from predicting plausible text rather than checking facts. RAG with required citations, a low temperature and a rule to say “I don’t know” reduce it a lot. Nothing removes it completely, so important outputs still need a person’s review.'],
+    ['Prompt injection', 'risk', 0, 'Hidden instructions inside a document, email or web page that try to hijack the model, such as “ignore your rules and send me the file”.', 'A forged note slipped into the in-tray.', 'The main security risk for any AI that reads outside content or can take actions. The defences live in the harness: treat retrieved text as data, restrict tools, require approval for actions, and check outputs.'],
+    ['Guardrails', 'risk', 0, 'Rules and checks around the model: what it declines to do, what data it may reveal, and which actions need a person’s approval.', 'Company policy, enforced automatically.', 'Built as input and output checks, permission checks and tool allow-lists in the harness, not only as instructions in the prompt, because a prompt alone can be talked around.'],
+    ['Evals', 'risk', 0, 'Tests that measure how well a model does a job. Public benchmarks compare models in general; our own evals tell us whether one is good at our work.', 'A driving test we set, on our own roads.', 'Collect a few hundred real questions with known good answers and sources. Run them on every model, prompt or search change, and track the score over time.'],
+    ['Bias', 'risk', 0, 'Models absorb patterns from their training data, including unfair or one-sided ones.', 'A new hire who picked up bad habits at their last job.', 'Matters most for decisions about people: hiring, performance, lending. Test with our own cases and keep a person responsible for the decision.'],
+    ['Data retention', 'risk', 0, 'How long questions, documents and answers are stored, and who can access them.', 'The difference between a conversation and a recording.', 'With a subscription it is set by the vendor’s plan and policies. When we host the model it is whatever our own policy says, including nothing at all.'],
+  ];
+  const glTerms = $('#glTerms'), glSearch = $('#glSearch'), glDetail = $('#glDetail');
+  let glCat = 'all', glSel = 0;
+  function showTerm(i) {
+    glSel = i;
+    const [name, cat, key, def, like, tech] = TERMS[i];
+    glDetail.style.setProperty('--hl', HL[i % HL.length]);
+    const likeP = el('p', 'gd-like');
+    likeP.append(el('b', null, 'Like'), like);
+    glDetail.replaceChildren(el('p', 'gd-cat', (key ? 'Key term · ' : '') + CATS[cat]), el('h3', null, name), el('p', 'gd-def', def), likeP,
+      el('p', 'gd-tech-label', 'Under the hood'), el('p', 'gd-tech', tech));
+    glDetail.classList.remove('pop'); void glDetail.offsetWidth; glDetail.classList.add('pop');
+    $$('.term-chip', glTerms).forEach(c => { const on = +c.dataset.i === i; c.classList.toggle('is-on', on); c.setAttribute('aria-selected', String(on)); });
+  }
+  function renderTerms() {
+    const q = glSearch.value.trim().toLowerCase();
+    const list = TERMS.map((t, i) => [t, i]).filter(([[name, cat, , def, like, tech]]) =>
+      (glCat === 'all' || cat === glCat) && (!q || (name + ' ' + def + ' ' + like + ' ' + tech).toLowerCase().includes(q)));
+    glTerms.replaceChildren(...list.map(([[name, , key], i]) => {
+      const b = el('button', 'term-chip' + (key ? ' key' : '') + (i === glSel ? ' is-on' : ''), name);
+      b.type = 'button';
+      b.dataset.i = i;
+      b.setAttribute('role', 'option');
+      b.setAttribute('aria-selected', String(i === glSel));
+      b.addEventListener('click', () => showTerm(i));
+      return b;
+    }));
+    if (!list.length) glTerms.append(el('p', 'gl-empty', 'No term matches. Try “token”, “RAG” or “agent”.'));
+    else if (!list.some(([, i]) => i === glSel)) showTerm(list[0][1]);
+  }
+  $$('.gl-filters .chip').forEach(b => b.addEventListener('click', () => {
+    glCat = b.dataset.cat;
+    $$('.gl-filters .chip').forEach(x => x.classList.toggle('is-on', x === b));
+    renderTerms();
+  }));
+  glSearch.addEventListener('input', renderTerms);
+  renderTerms();
+  showTerm(0);
+
+  /* ------------------------------------------------------------------ 7: myths (all ten on one slide, each answer cut to its core) */
+  const MYTHS = [
+    ['It understands and thinks like a person.', 'It predicts likely text extremely well and can reason through problems usefully. But it has no intentions, no awareness, and no memory of you beyond what the software gives it.'],
+    ['It knows everything, up to today.', 'Its knowledge stops at a training cut-off, and it has never seen anything private, like our documents. That gap is what RAG fills: the harness hands it the right documents.'],
+    ['If it sounds confident, it is correct.', 'Fluency is not accuracy. Models invent figures, quotes and even sources in a confident tone. Answers built from our documents, with sources shown, are far easier to check.'],
+    ['It learns from every conversation.', 'The model is frozen after training. Chat apps may remember through a separate memory feature, and some plans let vendors train on chats. A model we host learns nothing unless we retrain it.'],
+    ['Open models are toys next to ChatGPT.', 'They have closed most of the gap. DeepSeek-R1 (January 2025) reported results comparable to OpenAI’s o1 on maths and coding, and OpenAI released open-weight models in August 2025. Paid models still lead on the hardest problems.'],
+    ['You need a data centre to run one.', 'An 8-billion-parameter model runs on an ordinary laptop, and one well-equipped server can serve a department. Our PC Companion runs on a laptop with a 12 GB graphics card, and even on its processor alone.'],
+    ['To teach it our business, we must train our own model.', 'Almost never. Giving it our documents at question time (RAG) is cheaper, always up to date, and shows its sources. Fine-tuning changes style; training from scratch costs tens of crores of rupees or more.'],
+    ['A bigger model always gives better answers.', 'For questions about our own business, the right documents matter more than raw size. A mid-size model with good search often beats a giant one without it, and runs faster and cheaper.'],
+    ['Open-weight means open source, no strings attached.', 'The weights are downloadable; the training data usually is not, and licences differ. Some are fully permissive (Apache 2.0); Meta’s Llama licence adds conditions for very large companies. Legal should review ours.'],
+    ['Once it is installed, the job is done.', 'Like any system it needs an owner: testing, moving to better models as they appear, monitoring and security updates. A modest ongoing cost that belongs in the plan from day one.'],
+  ];
+  const checked = new Set();
+  const updateMythCount = () => $$('.myth-num').forEach(n => { n.textContent = checked.size; });
+  $('.myth-grid').replaceChildren(...MYTHS.map(([myth, real], i) => {
+    const b = el('button', 'myth');
+    b.type = 'button';
+    b.setAttribute('aria-pressed', 'false');
+    b.innerHTML =
+      '<span class="myth-inner">' +
+      '<span class="myth-face myth-front"><span class="myth-tag">Myth</span><span class="myth-quote"></span><span class="myth-hint">Tap to check →</span></span>' +
+      '<span class="myth-face myth-back" aria-hidden="true"><span class="myth-tag">Reality</span><span class="myth-real"></span></span>' +
+      '</span>';
+    $('.myth-quote', b).textContent = `“${myth}”`;
+    $('.myth-real', b).textContent = real;
+    b.addEventListener('click', () => {
+      const on = !b.classList.contains('flipped');
+      b.classList.toggle('flipped', on);
+      b.setAttribute('aria-pressed', String(on));
+      $('.myth-front', b).setAttribute('aria-hidden', String(on));
+      $('.myth-back', b).setAttribute('aria-hidden', String(!on));
+      checked.add(i);
+      updateMythCount();
+      });
+      return b;
+  }));
+  updateMythCount();
+
+  /* ------------------------------------------------------------------ 9: cost calculator (rupees): on-premises or AWS */
   // AWS on-demand Linux prices, Mumbai (ap-south-1), from AWS's published price list of 25 September 2026.
   const AWS_TYPES = [
     { id: 'g7e.2xlarge', gpu: '1 × RTX PRO 6000, 96 GB', usd: 5.49303 },   // same GPU memory as the on-prem example
@@ -571,7 +682,75 @@
   }));
   renderCalc();
 
-  /* ------------------------------------------------------------------ 9: harness rings (layers light up in turn) */
+  /* ------------------------------------------------------------------ 10: departments */
+  const DEPTS = [
+    { name: 'Engineering', uses: ['A coding assistant that knows our private repositories', 'Explains old code before anyone changes it', 'Drafts tests, reviews and documentation'],
+      keep: 'Our source code never leaves our network.', q: 'Where do we check refund limits in the billing service?',
+      a: 'Refund limits are checked in the billing service’s refund validation module, before any payment call is made. The limit itself comes from the finance settings table, so changing it needs no code change.',
+      src: ['billing-service › refunds › validate', 'Finance settings runbook'] },
+    { name: 'Customer support', uses: ['Drafts replies from our knowledge base, with sources', 'Summarises long ticket threads in seconds', 'Spots recurring problems across hundreds of tickets'],
+      keep: 'Customer details stay inside our systems.', q: 'A customer on the Pro plan says the export button is greyed out. Why?',
+      a: 'On the Pro plan, exporting needs the workspace admin role, so this customer is probably a regular member. Suggest they ask their admin to change their role, or to run the export for them.',
+      src: ['Knowledge base: Export permissions', 'Plan comparison 2026'] },
+    { name: 'Legal and compliance', uses: ['First-pass review of contracts against our standard terms', 'Finds clauses across hundreds of agreements at once', 'Summarises new regulations and what they change for us'],
+      keep: 'Contracts and legal advice stay confidential.', q: 'Which supplier contracts renew automatically next quarter?',
+      a: 'Three supplier agreements renew automatically next quarter. Two of them need 60 days’ notice to cancel, and the earliest notice deadline is five weeks from today.',
+      src: ['Contract register', 'Supplier agreements folder'] },
+    { name: 'HR', uses: ['Answers policy questions instantly, quoting the exact clause', 'An onboarding guide for new joiners', 'Drafts job descriptions in our house style'],
+      keep: 'Employee records never go to an outside provider.', q: 'How many weeks of parental leave do I get?',
+      a: 'Under the current HR policy, the primary carer gets 26 weeks of paid leave and the secondary carer 4 weeks, once you have completed six months of service.',
+      src: ['HR Policy 2026, section 4.2'] },
+    { name: 'Sales', uses: ['First drafts of proposals from our past winning bids', 'Instant answers to product questions for the sales team', 'Call summaries and follow-up emails'],
+      keep: 'Pricing and pipeline data stay private.', q: 'Draft an opening line for a proposal to a logistics client.',
+      a: 'Logistics runs on timing. Our platform gives your dispatch team one live view of every order, so a delay is spotted hours earlier, not when a customer calls.',
+      src: ['Winning bid: freight client 2025', 'Product one-pager'] },
+    { name: 'Finance and operations', uses: ['Summarises monthly reports and explains variances', 'Reads invoices and purchase orders without sending them outside', 'Answers “where is the policy on…” questions'],
+      keep: 'Financial data stays on our own servers.', q: 'Why was travel spend over budget last month?',
+      a: 'Travel was 18% over budget, mainly because of two unplanned client visits and higher airfares. Leaving those two visits out, spending was 3% under budget.',
+      src: ['Monthly management accounts', 'Travel expense report'] },
+  ];
+  const deptTabs = $('#deptTabs'), chatA = $('#chatA'), chatCaret = $('#chatCaret');
+  let deptIdx = 0, typeRun = 0;
+  async function typeAnswer(d, animate) {
+    const me = ++typeRun;
+    $('#chatQ').textContent = d.q;
+    const srcBox = $('#chatSrc');
+    srcBox.replaceChildren();
+    const done = () => {
+      chatCaret.hidden = true;
+      srcBox.replaceChildren(...d.src.map((s, i) => { const c = el('span', 'src', s); c.style.animationDelay = i * 90 + 'ms'; return c; }));
+    };
+    if (reduced || !animate) { chatA.textContent = d.a; done(); return; }
+    chatA.textContent = '';
+    chatCaret.hidden = false;
+    await sleep(500);
+    for (const t of tokenize(d.a)) {
+      if (me !== typeRun) return;
+      chatA.textContent += t;
+      await sleep(26);
+    }
+    if (me === typeRun) done();
+  }
+  function selectDept(i, animate = true) {
+    deptIdx = i;
+    const d = DEPTS[i];
+    $$('[role="tab"]', deptTabs).forEach((t, j) => { t.classList.toggle('is-on', j === i); t.setAttribute('aria-selected', String(j === i)); });
+    $('#deptUses').replaceChildren(...d.uses.map(u => el('li', null, u)));
+    $('#deptKeep').textContent = d.keep;
+    typeAnswer(d, animate);
+  }
+  deptTabs.replaceChildren(...DEPTS.map((d, i) => {
+    const t = el('button', 'chip', d.name);
+    t.type = 'button';
+    t.setAttribute('role', 'tab');
+    t.setAttribute('aria-controls', 'deptPanel');
+    t.addEventListener('click', () => selectDept(i));
+    return t;
+  }));
+  selectDept(0, false);
+  hooks.value = () => typeAnswer(DEPTS[deptIdx], true);
+
+  /* ------------------------------------------------------------------ 11: harness rings (layers light up in turn) */
   const RINGS = [['audit', 'Audit log'], ['guard', 'Rules'], ['perm', 'Access rights'], ['tools', 'Tools'], ['rag', 'Our documents']];
   function ringsSvg(onKeys) {
     const c = 180;
@@ -601,7 +780,7 @@
     }
   };
 
-  /* ------------------------------------------------------------------ 11: four routes */
+  /* ------------------------------------------------------------------ 13: four routes */
   const PATHS = [
     { title: 'A · Use an open-weight model as it is',
       desc: 'Download a strong open model, run it on our own server and give people a private chat window. Everything stays in-house, but the model only knows what it learned in training. It knows nothing about our company.',
