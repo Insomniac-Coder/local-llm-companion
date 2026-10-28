@@ -1,14 +1,15 @@
 # The Next Word Is Ours
 
-An interactive slide deck for the AI Council, proposing that we host open-weight language models in-house
-with our own harness and RAG. Fourteen slides, about fifteen minutes, in four parts: what an LLM is (what it is
+An interactive slide deck for the AI Council, proposing that we run our own private AI: open-weight language
+models with our own harness and RAG. Fourteen slides, about fifteen minutes, in four parts: what an LLM is (what it is
 and how large, how it learns, how it answers, why a frozen model needs RAG, the vocabulary, ten myths), why our
 own pays off (renting versus owning, what it costs, where it earns its keep), what we have built (the harness, the
 PC Companion prototype), and how we would do it (the four routes and our recommendation, the pilot plan).
 
 It is a condensed version of an earlier 28-slide deck that keeps nearly all of its information: reference
 material (glossary, myths, department examples, routes) sits behind clicks, and the deck says "our own" or
-"in-house" AI throughout, never "local".
+"private" AI throughout, never "local" or "in-house". It names no Chinese models; the PC Companion
+figures are for Gemma 3 12B.
 
 Open `index.html` in a maximised browser window. Double-clicking works: no build step, no dependencies.
 Fonts come from Google Fonts when online and fall back to system fonts offline.

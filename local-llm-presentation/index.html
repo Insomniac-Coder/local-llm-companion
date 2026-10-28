@@ -62,15 +62,15 @@
     <div class="ladder card rv" style="--d:6">
       <p class="caption">How large is “large”? Memory needed at 4-bit precision. <b class="ladder-key">Green</b>: sizes one of our servers can run.</p>
       <ol class="ladder-row">
-        <li class="ours"><p class="ld-size">8B</p><p class="ld-mem">≈5 GB · a laptop</p><p class="ld-note">Llama 3.1 8B, Qwen3 8B. Drafting, summaries, simple questions.</p></li>
-        <li class="ours"><p class="ld-size">32B</p><p class="ld-mem">≈20 GB · a workstation</p><p class="ld-note">Qwen3 32B. Strong at reasoning and code: the sweet spot for a team server.</p></li>
+        <li class="ours"><p class="ld-size">8–12B</p><p class="ld-mem">≈5–8 GB · a laptop</p><p class="ld-note">Llama 3.1 8B, Gemma 3 12B. Drafting, summaries, simple questions.</p></li>
+        <li class="ours"><p class="ld-size">27B</p><p class="ld-mem">≈17 GB · a workstation</p><p class="ld-note">Gemma 3 27B. Strong at reasoning and writing: the sweet spot for a team server.</p></li>
         <li class="ours"><p class="ld-size">70B</p><p class="ld-mem">≈40 GB · one server</p><p class="ld-note">Llama 3.3 70B, on 1–2 data-centre GPUs. Most business writing and analysis.</p></li>
-        <li><p class="ld-size">175B</p><p class="ld-mem">≈100 GB · multi-GPU server</p><p class="ld-note">GPT-3 (2020), behind the first ChatGPT. Today’s 32B open models beat it.</p></li>
-        <li><p class="ld-size">671B</p><p class="ld-mem">≈400 GB · multi-GPU server</p><p class="ld-note">DeepSeek-V3. A mixture of experts: only 37B work on each token, so it runs fast.</p></li>
+        <li><p class="ld-size">175B</p><p class="ld-mem">≈100 GB · multi-GPU server</p><p class="ld-note">GPT-3 (2020), behind the first ChatGPT. Today’s 27B open models beat it.</p></li>
+        <li><p class="ld-size">400B</p><p class="ld-mem">≈240 GB · multi-GPU server</p><p class="ld-note">Llama 4 Maverick. A mixture of experts: only 17B work on each token, so it runs fast.</p></li>
         <li><p class="ld-size">Frontier</p><p class="ld-mem">Vendor data centres only</p><p class="ld-note">GPT-5, Claude, Gemini. Sizes unpublished; estimates run to several trillion.</p></li>
       </ol>
     </div>
-    <details class="eng-note"><summary>Engineer's note</summary><p>Memory for the weights is roughly parameters × bits per parameter ÷ 8. At 16-bit an 8B model needs 16 GB; at 4-bit quantization about 4.5–5 GB, and a 70B model about 40 GB. Add memory for the conversation itself (the KV cache), which grows with the context length. Mixture-of-experts models such as DeepSeek-V3 (671B total, 37B active per token) must still hold all weights in memory, but only compute with the active ones, so they run at the speed of a much smaller model.</p></details>
+    <details class="eng-note"><summary>Engineer's note</summary><p>Memory for the weights is roughly parameters × bits per parameter ÷ 8. At 16-bit an 8B model needs 16 GB; at 4-bit quantization about 4.5–5 GB, and a 70B model about 40 GB. Add memory for the conversation itself (the KV cache), which grows with the context length. Mixture-of-experts models such as Llama 4 Maverick (400B total, 17B active per token) must still hold all weights in memory, but only compute with the active ones, so they run at the speed of a much smaller model.</p></details>
   </div></div>
 </section>
 
@@ -121,7 +121,7 @@
         <li><button type="button" class="step" data-step="3"><span class="step-n">3</span><span class="step-t">Words look at each other</span><span class="step-d">In dozens of layers, every word checks every other word for context. This is <b>attention</b>. Try both sentences.</span></button></li>
         <li><button type="button" class="step" data-step="4"><span class="step-n">4</span><span class="step-t">A score for every possible next token</span><span class="step-d">The last layer gives every token in the vocabulary a probability. Most get almost zero; a handful stand out.</span></button></li>
         <li><button type="button" class="step" data-step="5"><span class="step-n">5</span><span class="step-t">One token is picked</span><span class="step-d">Usually one of the most likely, with a controlled amount of randomness called <b>temperature</b>: low for facts and code, higher for brainstorming.</span></button></li>
-        <li><button type="button" class="step" data-step="6"><span class="step-n">6</span><span class="step-t">Add it, and run it all again</span><span class="step-d">The token joins the text and everything repeats. Speed is measured in <b>tokens per second</b>: people read about 5; a good in-house setup writes 30 to 100+.</span></button></li>
+        <li><button type="button" class="step" data-step="6"><span class="step-n">6</span><span class="step-t">Add it, and run it all again</span><span class="step-d">The token joins the text and everything repeats. Speed is measured in <b>tokens per second</b>: people read about 5; a good private setup writes 30 to 100+.</span></button></li>
       </ol>
       <div class="stage-panel card" aria-live="polite">
         <div class="frame-v is-on" data-frame="1">
@@ -381,17 +381,17 @@
       <div class="proof-text">
         <p class="eyebrow rv"><span class="ch">10</span> Already built</p>
         <h2 data-gen>We have already built a harness like this</h2>
-        <p class="rv" style="--d:2">The <b>PC Companion</b> is a working prototype, built in-house. It runs open-weight models entirely on our own hardware, down to a single laptop: chat, questions about code, and an agent that reads and writes project files, runs commands and checks its own work. Permission modes decide what the agent may do without asking, memory is managed automatically on long tasks, and every step is logged on disk.</p>
+        <p class="rv" style="--d:2">The <b>PC Companion</b> is a working prototype, built by our own team. It runs open-weight models entirely on our own hardware, down to a single laptop: chat, questions about code, and an agent that reads and writes project files, runs commands and checks its own work. Permission modes decide what the agent may do without asking, memory is managed automatically on long tasks, and every step is logged on disk.</p>
         <p class="muted rv" style="--d:3">A company deployment would run the same ideas on a shared server for many people at once.</p>
       </div>
       <div class="proof-stats">
-        <div class="stat card rv" style="--d:3"><p class="stat-num"><span data-count="91">91</span></p><p class="stat-unit">tokens per second</p><p>An 8-billion-parameter model on a 12 GB laptop graphics card. Many times faster than anyone reads.</p></div>
+        <div class="stat card rv" style="--d:3"><p class="stat-num"><span data-count="91">91</span></p><p class="stat-unit">tokens per second</p><p>A 12-billion-parameter model on a 12 GB laptop graphics card. Many times faster than anyone reads.</p></div>
         <div class="stat card rv" style="--d:4"><p class="stat-num"><span data-count="3">3</span> s</p><p class="stat-unit">to read 12 pages</p><p>The same laptop takes in an 8,100-token document in under three seconds.</p></div>
         <div class="stat card rv" style="--d:5"><p class="stat-num"><span data-count="13">13</span></p><p class="stat-unit">tokens per second</p><p>With no graphics card at all, on the laptop's processor alone. Slower, but it works.</p></div>
         <div class="stat card rv" style="--d:6"><p class="stat-num">0</p><p class="stat-unit">bytes sent out</p><p>Every model, prompt and answer stays on the machine unless web search is switched on.</p></div>
       </div>
     </div>
-    <p class="caption rv" style="--d:7">Measured on our own test laptop (RTX 5070 Ti Laptop GPU, 12 GB) with Qwen3 8B, September 2026.</p>
+    <p class="caption rv" style="--d:7">Measured on our own test laptop (RTX 5070 Ti Laptop GPU, 12 GB) with Gemma 3 12B, September 2026.</p>
   </div></div>
 </section>
 
@@ -461,7 +461,7 @@
 </div>
 
 <nav class="bar" id="bar" aria-label="Slide navigation">
-  <p class="bar-left"><span class="bar-brand">In-house AI proposal</span><span class="bar-label" id="barLabel">Welcome</span></p>
+  <p class="bar-left"><span class="bar-brand">Private AI proposal</span><span class="bar-label" id="barLabel">Welcome</span></p>
   <div class="bar-track" id="barTrack" aria-hidden="true"><div class="bar-fill" id="barFill"></div></div>
   <div class="bar-right">
     <button class="pill" id="engBtn" type="button" hidden aria-expanded="false" aria-controls="drawer">Engineer's note</button>
