@@ -981,6 +981,261 @@
 
   /* BUILD:observe START */
   /* ------------------------------------------------------------------ 17: LangSmith observability */
+  // Five recent runs, one for each kind of task on slide 15, traced the way LangSmith shows them (illustrative).
+  // The run picker says which agents each task used, the route line spells out the hops, every step carries its
+  // agent's colour, and supervisor steps say where they routed. The two-hop "staging feels slow" run streams in on
+  // arrival; its failed twin shows the metrics tool timing out after 10 s and a retry succeeding.
+  const OBS_TYPE = { chain: 'Chain', llm: 'LLM', tool: 'Tool', ret: 'Retriever' };
+  const OBS_AGENT = { sup: 'Supervisor', infra: 'Infra agent', rag: 'RAG agent', gen: 'General agent' };
+  const OBS_SHORT = { sup: 'Supervisor', infra: 'Infra', rag: 'RAG', gen: 'General' };
+  // the model the harness chose for an LLM step: a small fast one for routing and short replies, a larger one for
+  // tool use and grounded answers, Gemma for drafting (illustrative choices of open-weight models we can host)
+  const obsLlm = (model, temp, inTok, outTok) => ({ model, tok: inTok + outTok,
+    meta: `temperature <b>${temp}</b> · <b>${fmt(inTok)}</b> tokens in, <b>${fmt(outTok)}</b> out` });
+  const OBS_EMBED = 'MiniLM-L6-v2';
+  const OBS_PICK = 'messages: the request\nchoose one of: rag_agent · infra_agent · general_agent · FINISH';
+  const OBS_SLOW_REQ = 'Staging feels slow: check it and tell me what the runbook says';
+  const OBS_SLOW_ANSWER = 'CPU-bound: p95 2.4 s, CPU 92% on 2 replicas. Runbook: scale out above 85% CPU for 10 min; staging may scale without approval.';
+  const OBS_CHUNKS = {
+    slow: [['0.91', 'Scaling §2', 'Scale out above 85% CPU for 10 min'], ['0.84', 'Staging §1', 'Staging may scale without approval'],
+      ['0.77', 'Alerts §3', 'p95 over 2 s for 5 min pages on-call'], ['0.62', 'Postmortem', 'Slow checkout: an under-sized cache']],
+    vpn: [['0.89', 'Security §3.2', 'Contractor VPN: managed laptops only'], ['0.81', 'Security §3.4', 'Access ends on the contract end date'],
+      ['0.66', 'Onboarding §2', 'Managers request contractor access'], ['0.58', 'IT FAQ', 'Setting up the VPN client']],
+  };
+  const obsRoot = (req, answer, total, meta) => ({ name: 'supervisor graph', type: 'chain', depth: 0, t0: 0, t1: total, input: `"${req}"`, output: answer, meta });
+  const obsSup = (to, kind, t0, t1, tok, inTok) => ({ name: `supervisor → ${to.replace('_agent', '')}`, type: 'llm', agent: 'sup', depth: 1, t0, t1,
+    ...obsLlm('gpt-oss-20b', 0, inTok, tok - inTok),
+    input: to === 'finish' ? 'messages: the request + every agent result' : OBS_PICK,
+    output: to === 'finish' ? 'next: "FINISH"\nthe request is answered' : `type: ${kind}\nnext: "${to}"` });
+  function obsSlow(fail) {
+    const S = fail ? 10.02 : 0, t = x => x + S;     // everything after the metrics call shifts by the timeout
+    const spans = [
+      obsRoot(OBS_SLOW_REQ, OBS_SLOW_ANSWER, t(4.40), 'user <b>on-call engineer</b> · department <b>engineering</b> · thread <b>infra-0412</b>'),
+      obsSup('infra_agent', 'infrastructure task', 0, 0.42, 312, 280),
+      { name: 'infra_agent', type: 'chain', agent: 'infra', depth: 1, t0: 0.42, t1: t(2.10),
+        input: `"${OBS_SLOW_REQ}"`, output: 'p95 2.4 s, CPU 92%, 2 replicas: looks CPU-bound', meta: '2 model calls · 1 tool call · <b>950</b> tokens' },
+      { name: 'choose a tool', type: 'llm', agent: 'infra', depth: 2, t0: 0.44, t1: 0.98, ...obsLlm('gpt-oss-120b', 0, 372, 38),
+        input: 'system: You are the Infra agent. Use only the listed tools.\ntools: get_metrics, get_logs, restart_service (staging only)', output: 'call get_metrics(env="staging", service="checkout")' },
+      fail
+        ? { name: 'get_metrics', type: 'tool', agent: 'infra', depth: 2, t0: 1.00, t1: 11.00, err: true,
+            input: 'get_metrics(env="staging", service="checkout")', error: 'TimeoutError: the metrics API did not answer within 10 s',
+            diag: '<b>The slow step was the metrics API, not the model.</b> It timed out after 10 s; the automatic retry answered in 0.35 s. Fix or alert on the API before blaming the model.', meta: 'read-only · runs without approval · attempt <b>1 of 3</b>' }
+        : { name: 'get_metrics', type: 'tool', agent: 'infra', depth: 2, t0: 1.00, t1: 1.35,
+            input: 'get_metrics(env="staging", service="checkout")', output: '{ "p95_ms": 2400, "cpu": 0.92, "replicas": 2 }', meta: 'read-only · runs without approval (slide 16)' },
+      ...(fail ? [{ name: 'get_metrics · retry', type: 'tool', agent: 'infra', depth: 2, t0: 11.02, t1: 11.37,
+            input: 'get_metrics(env="staging", service="checkout")', output: '{ "p95_ms": 2400, "cpu": 0.92, "replicas": 2 }', meta: 'read-only · attempt <b>2 of 3</b> · succeeded' }] : []),
+      { name: 'read metrics', type: 'llm', agent: 'infra', depth: 2, t0: t(1.37), t1: t(2.08), ...obsLlm('gpt-oss-120b', 0.2, 486, 54),
+        input: 'tool result: { "p95_ms": 2400, "cpu": 0.92, "replicas": 2 }\nquestion: is staging healthy?', output: 'Staging checkout: p95 2.4 s, CPU 92% on 2 replicas. Looks CPU-bound.' },
+      obsSup('rag_agent', 'knowledge question (the runbook)', t(2.10), t(2.48), 290, 266),
+      { name: 'rag_agent', type: 'chain', agent: 'rag', depth: 1, t0: t(2.48), t1: t(4.16),
+        input: `"${OBS_SLOW_REQ}"`, output: 'Scale out: CPU is above 85% for over 10 minutes [Scaling §2]; staging may scale without approval [Staging §1].', meta: '1 search · 1 model call · <b>1,420</b> tokens' },
+      { name: 'chromadb.query', type: 'ret', agent: 'rag', depth: 2, t0: t(2.52), t1: t(2.56), chunks: 'slow',
+        input: 'query: "staging slow, high CPU: what does the runbook say?"\nwhere: { access: "engineering" } · k: 4', model: OBS_EMBED, meta: 'embedding <b>all-MiniLM-L6-v2</b> · collection <b>runbooks</b> · 4 of 1,812 chunks' },
+      { name: 'answer with sources', type: 'llm', agent: 'rag', depth: 2, t0: t(2.60), t1: t(4.12), ...obsLlm('gpt-oss-120b', 0.2, 1236, 184),
+        input: 'system: Answer only from the passages and cite them.\n+ 4 passages (980 tokens) + the question', output: 'Scale out: CPU has been above 85% for more than 10 minutes [Scaling §2], and staging can be scaled without approval [Staging §1].' },
+      obsSup('finish', '', t(4.16), t(4.37), 180, 150),
+    ];
+    return { spans, pick: fail ? 4 : spans.findIndex(s => s.chunks) };
+  }
+  function obsVpn() {
+    const req = 'What is our VPN policy for contractors?';
+    const answer = 'Managed laptops only; access ends with the contract [Security §3.2, §3.4].';
+    const spans = [
+      obsRoot(req, answer, 2.31, 'user <b>project manager</b> · department <b>delivery</b> · thread <b>delivery-0233</b>'),
+      obsSup('rag_agent', 'knowledge question', 0, 0.36, 296, 268),
+      { name: 'rag_agent', type: 'chain', agent: 'rag', depth: 1, t0: 0.36, t1: 2.08, input: `"${req}"`, output: answer, meta: '1 search · 1 model call · <b>1,180</b> tokens' },
+      { name: 'chromadb.query', type: 'ret', agent: 'rag', depth: 2, t0: 0.40, t1: 0.44, chunks: 'vpn',
+        input: 'query: "VPN policy for contractors"\nwhere: { access: "all staff" } · k: 4', model: OBS_EMBED, meta: 'embedding <b>all-MiniLM-L6-v2</b> · collection <b>policies</b> · 4 of 2,406 chunks' },
+      { name: 'answer with sources', type: 'llm', agent: 'rag', depth: 2, t0: 0.48, t1: 2.04, ...obsLlm('gpt-oss-120b', 0.2, 1032, 148),
+        input: 'system: Answer only from the passages and cite them.\n+ 4 passages (860 tokens) + the question', output: answer },
+      obsSup('finish', '', 2.08, 2.29, 170, 146),
+    ];
+    return { spans, pick: 3 };
+  }
+  function obsRestart() {
+    const req = 'Restart the billing service on staging';
+    const spans = [
+      obsRoot(req, 'Done: billing on staging restarted at 10:12 and is healthy again, with 2 of 2 replicas ready.', 3.02, 'user <b>developer</b> · department <b>engineering</b> · thread <b>infra-0409</b>'),
+      obsSup('infra_agent', 'infrastructure task', 0, 0.34, 288, 258),
+      { name: 'infra_agent', type: 'chain', agent: 'infra', depth: 1, t0: 0.34, t1: 2.78, input: `"${req}"`, output: 'Billing on staging restarted; 2 of 2 replicas ready.', meta: '2 model calls · 1 tool call · <b>638</b> tokens' },
+      { name: 'choose a tool', type: 'llm', agent: 'infra', depth: 2, t0: 0.36, t1: 0.86, ...obsLlm('gpt-oss-120b', 0, 364, 38),
+        input: 'system: You are the Infra agent. Use only the listed tools.\ntools: get_metrics, get_logs, restart_service (staging only)', output: 'call restart_service(env="staging", service="billing")' },
+      { name: 'restart_service', type: 'tool', agent: 'infra', depth: 2, t0: 0.88, t1: 2.32,
+        input: 'restart_service(env="staging", service="billing")', output: '{ "status": "restarted", "ready": "2/2" }', meta: 'staging change · runs, then notifies (slide 16)' },
+      { name: 'confirm', type: 'llm', agent: 'infra', depth: 2, t0: 2.34, t1: 2.76, ...obsLlm('gpt-oss-20b', 0.2, 204, 32),
+        input: 'tool result: { "status": "restarted", "ready": "2/2" }', output: 'Billing on staging restarted; 2 of 2 replicas ready.' },
+      obsSup('finish', '', 2.78, 2.98, 160, 136),
+    ];
+    return { spans, pick: 4 };
+  }
+  function obsFarewell() {
+    const req = 'Write a farewell note for Ravi from the team';
+    const note = 'Ravi, thank you for four brilliant years. We will miss your calm in every release week.';
+    const spans = [
+      obsRoot(req, note, 3.96, 'user <b>team lead</b> · department <b>engineering</b> · thread <b>team-0187</b>'),
+      obsSup('general_agent', 'anything else (drafting)', 0, 0.31, 276, 250),
+      { name: 'general_agent', type: 'chain', agent: 'gen', depth: 1, t0: 0.31, t1: 3.71, input: `"${req}"`, output: note, meta: '1 model call · no tools · <b>640</b> tokens' },
+      { name: 'draft the note', type: 'llm', agent: 'gen', depth: 2, t0: 0.33, t1: 3.69, ...obsLlm('gemma-3-27b', 0.7, 96, 544),
+        input: 'system: You are the General agent.\nuser: Write a farewell note for Ravi from the team', output: note },
+      obsSup('finish', '', 3.71, 3.92, 150, 124),
+    ];
+    return { spans, pick: 3 };
+  }
+  const OBS_RUNS = [
+    { key: 'vpn', label: 'VPN policy', tags: ['rag'], req: 'What is our VPN policy for contractors?', build: obsVpn },
+    { key: 'restart', label: 'Restart billing', tags: ['infra'], req: 'Restart the billing service on staging', build: obsRestart },
+    { key: 'farewell', label: 'Farewell note', tags: ['gen'], req: 'Write a farewell note for Ravi from the team', build: obsFarewell },
+    { key: 'slow', label: 'Staging slow', tags: ['infra', 'rag'], req: OBS_SLOW_REQ, build: () => obsSlow(false) },
+    { key: 'fail', label: 'Staging slow', tags: ['infra', 'rag'], fail: true, req: OBS_SLOW_REQ, build: () => obsSlow(true) },
+  ];
+  const obsApp = $('#observe .obs-app'), obsRows = $('#obsRows'), obsInsp = $('#obsInsp');
+  let obsRun = 0, obsKey = 'slow', obsData = null;
+  const obsTag = (agent, text) => el('span', `obs-atag a-${agent}`, text);
+  const obsSec = (label, ...kids) => { const d = el('div', 'obs-sec'); d.append(el('p', null, label), ...kids); return d; };
+  const obsCode = text => el('p', 'obs-code', text);
+  function obsSelect(i) {
+    $$('.obs-span', obsRows).forEach(b => { const on = +b.dataset.i === i; b.classList.toggle('is-on', on); b.setAttribute('aria-pressed', String(on)); });
+    const sp = obsData.spans[i];
+    if (!sp) return;
+    const head = el('div', 'obs-ih');
+    head.append(el('span', `obs-type t-${sp.type}`, OBS_TYPE[sp.type]), el('h3', null, sp.name));
+    if (sp.model) head.append(el('span', 'obs-mtag', sp.model));
+    const stats = el('p', 'obs-istats');
+    if (sp.agent) stats.append(obsTag(sp.agent, OBS_AGENT[sp.agent]));
+    stats.append(`${(sp.t1 - sp.t0).toFixed(2)} s · from ${sp.t0.toFixed(2)} s${sp.tok ? ` · ${fmt(sp.tok)} tokens` : ''}`);
+    const parts = [head, stats, obsSec('Input', obsCode(sp.input))];
+    if (sp.error) {
+      parts.push(obsSec('Error', el('p', 'obs-err', sp.error)));
+      const d = el('p', 'obs-diag'); d.innerHTML = sp.diag; parts.push(d);
+    } else if (sp.chunks) {
+      const ol = el('ol', 'obs-chunks');
+      for (const [score, src, text] of OBS_CHUNKS[sp.chunks]) { const li = el('li'); li.append(el('b', null, score), el('em', null, src), el('span', null, text)); ol.append(li); }
+      parts.push(obsSec('Output · 4 passages', ol));
+    } else {
+      parts.push(obsSec('Output', obsCode(sp.output)));
+    }
+    const meta = el('p', 'obs-meta'); meta.innerHTML = sp.meta; parts.push(meta);
+    obsInsp.replaceChildren(...parts);
+    obsInsp.classList.remove('pop'); void obsInsp.offsetWidth; obsInsp.classList.add('pop');
+  }
+  function obsRowEl(sp, i, growMs) {
+    const li = el('li');
+    const b = el('button', `obs-row obs-span t-${sp.type}${sp.err ? ' err' : ''}`);
+    b.type = 'button';
+    b.dataset.i = i;
+    b.setAttribute('aria-pressed', 'false');
+    b.setAttribute('aria-label', `${sp.name}${sp.agent ? ', ' + OBS_AGENT[sp.agent] : ''}${sp.model ? ', model ' + sp.model : ''}, ${OBS_TYPE[sp.type]}, ${(sp.t1 - sp.t0).toFixed(2)} seconds${sp.err ? ', failed' : ''}`);
+    const name = el('span', 'obs-name');
+    name.append(el('b', 'obs-stripe' + (sp.agent ? ' a-' + sp.agent : '')));
+    for (let d = 0; d < sp.depth; d++) name.append(el('i'));
+    name.append(el('span', 'obs-type', OBS_TYPE[sp.type]), el('span', 'obs-label', sp.name));
+    const track = el('span', 'obs-track'), bar = el('span', 'obs-bar');
+    bar.style.left = (sp.t0 / obsData.total * 100) + '%';
+    bar.style.setProperty('--w', Math.max(0.5, (sp.t1 - sp.t0) / obsData.total * 100) + '%');
+    bar.style.setProperty('--grow', Math.max(0.22, growMs / 1000).toFixed(2) + 's');
+    track.append(bar);
+    b.append(name, el('span', 'obs-model' + (sp.model ? '' : ' none'), sp.model || '–'), track, el('span', 'obs-num', (sp.t1 - sp.t0).toFixed(2) + ' s'), el('span', 'obs-num' + (sp.tok ? '' : ' none'), sp.tok ? fmt(sp.tok) : '–'));
+    b.addEventListener('click', () => obsSelect(i));
+    li.append(b);
+    return li;
+  }
+  function obsAxis() {
+    const T = obsData.total, step = T > 8 ? 5 : 1;
+    const ticks = [];
+    for (let s = 0; s <= T + 1e-9; s += step) ticks.push(s);
+    $('#obsAxis').replaceChildren(...ticks.map(s => {
+      const pct = s / T * 100, n = el('span', 'obs-tick', `${s} s`);
+      n.style.left = pct + '%';
+      n.style.transform = pct < 4 ? 'translate(0, -50%)' : pct > 92 ? 'translate(-100%, -50%)' : 'translate(-50%, -50%)';
+      return n;
+    }));
+    $('#obsGrid').replaceChildren(...ticks.map(s => { const i = el('i'); i.style.left = (s / T * 100) + '%'; return i; }));
+  }
+  // the route line: the agents at the top level of the run, in the order they ran
+  function obsRoute(run) {
+    $('#obsQ').textContent = `“${run.req}”`;
+    const hops = obsData.spans.filter(s => s.depth === 1).map(s => s.agent);
+    const items = [];
+    hops.forEach((a, k) => {
+      if (k) items.push(el('li', 'obs-arrow', '→'));
+      items.push(el('li', `a-${a}`, OBS_SHORT[a]));
+    });
+    $('#obsPath').replaceChildren(...items);
+  }
+  const obsTotals = (t, tok) => { $('#obsTime').textContent = t.toFixed(2) + ' s'; $('#obsTok').textContent = fmt(tok) + ' tokens'; };
+  async function obsStream(key) {
+    const me = ++obsRun;
+    const run = OBS_RUNS.find(r => r.key === key);
+    obsKey = key;
+    obsData = run.build();
+    obsData.total = obsData.spans[0].t1;
+    obsApp.classList.toggle('failed', !!run.fail);
+    $$('.obs-runchip', $('#obsRuns')).forEach(b => { const on = b.dataset.run === key; b.classList.toggle('is-on', on); b.setAttribute('aria-pressed', String(on)); });
+    obsAxis();
+    obsRoute(run);
+    obsRows.replaceChildren();
+    const { spans, total } = obsData;
+    const tokens = upTo => spans.reduce((a, s) => a + (s.tok && s.t1 <= upTo ? s.tok : 0), 0);
+    if (reduced || !isActive('observe')) {
+      obsRows.replaceChildren(...spans.map((s, i) => obsRowEl(s, i, 0)));
+      obsTotals(total, tokens(total));
+      obsSelect(obsData.pick);
+      return;
+    }
+    const STREAM = total > 8 ? 3600 : 2600;
+    obsApp.classList.add('streaming');
+    obsInsp.replaceChildren(el('p', 'obs-meta', 'Steps appear as the run executes. Click any step to inspect it.'));
+    const t0 = performance.now();
+    const tick = now => {
+      if (me !== obsRun) return;
+      const at = Math.min(total, (now - t0) / STREAM * total);
+      obsTotals(at, tokens(at));
+      if (at < total) requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+    for (let i = 0; i < spans.length; i++) {
+      const wait = t0 + spans[i].t0 / total * STREAM - performance.now();
+      if (wait > 0) await sleep(wait);
+      if (me !== obsRun || !isActive('observe')) { if (me === obsRun) obsApp.classList.remove('streaming'); return; }
+      obsRows.append(obsRowEl(spans[i], i, (spans[i].t1 - spans[i].t0) / total * STREAM));
+    }
+    await sleep(Math.max(0, t0 + STREAM - performance.now()) + 350);
+    if (me !== obsRun) return;
+    obsApp.classList.remove('streaming');
+    obsTotals(total, tokens(total));
+    obsSelect(obsData.pick);
+  }
+  $('#obsRuns').replaceChildren(...OBS_RUNS.map(r => {
+    const b = el('button', 'obs-runchip');
+    b.type = 'button';
+    b.dataset.run = r.key;
+    b.setAttribute('aria-pressed', 'false');
+    b.setAttribute('aria-label', `${r.req}: ${r.tags.map(a => OBS_AGENT[a]).join(' then ')}${r.fail ? ', failed' : ''}`);
+    b.append(el('span', null, r.label), ...r.tags.map(a => obsTag(a, OBS_SHORT[a])));
+    if (r.fail) b.append(el('span', 'obs-atag fail', 'failed'));
+    b.addEventListener('click', () => obsStream(r.key));
+    return b;
+  }));
+  // sparklines (illustrative), and the internal cost per request from the cost slide's on-premises settings
+  const OBS_SPARKS = {
+    p95: [5.2, 5.0, 5.4, 4.9, 4.7, 5.1, 4.8, 4.6, 4.9, 5.3, 4.8, 4.7, 4.9, 4.6, 4.8, 5.0, 4.7, 4.6, 4.8, 4.9, 4.7, 4.8, 4.6, 4.8],
+    tok: [2.9, 3.0, 3.1, 3.0, 3.2, 3.1, 3.0, 3.1, 3.2, 3.1, 3.0, 3.1, 3.1, 3.2, 3.0, 3.1, 3.1, 3.0, 3.2, 3.1, 3.1, 3.0, 3.1, 3.1],
+    err: [0.6, 0.7, 0.5, 0.6, 0.8, 0.7, 0.6, 2.9, 0.9, 0.7, 0.6, 0.8, 0.7, 0.6, 0.7, 0.8, 0.6, 0.7, 0.8, 0.7, 0.6, 0.8, 0.7, 0.8],
+  };
+  $$('#observe .obs-spark').forEach(svg => {
+    const v = OBS_SPARKS[svg.dataset.spark], lo = Math.min(...v), hi = Math.max(...v);
+    const pts = v.map((y, i) => [i / (v.length - 1) * 120, 23 - (y - lo) / (hi - lo || 1) * 20]);
+    svg.innerHTML = `<polyline points="${pts.map(p => p.map(n => n.toFixed(1)).join(',')).join(' ')}"/>`;
+  });
+  function obsCost() {
+    const hw = +($('#cHw')?.value || 3000000), run = +($('#cRun')?.value || 125000);
+    const perRequest = (hw / 36 + run) / 30 / 1284;     // monthly server cost spread over 1,284 requests a day
+    $('#obsCost').textContent = `≈ ${inr(perRequest)}`;
+  }
+  $('#obsReplay').addEventListener('click', () => obsStream(obsKey));
+  obsCost();
+  obsStream('slow');
+  hooks.observe = () => { obsCost(); obsStream(obsKey); };
   /* BUILD:observe END */
 
   /* ------------------------------------------------------------------ 19: four routes */
