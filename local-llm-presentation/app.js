@@ -2205,7 +2205,7 @@
   /* BUILD:hitl END */
 
   /* BUILD:observe START */
-  /* ------------------------------------------------------------------ 17: LangSmith observability */
+  /* ------------------------------------------------------------------ 15: LangSmith observability */
   // Five recent runs, one for each kind of task on slide 13, traced the way LangSmith shows them (illustrative).
   // The run picker says which agents each task used, the route line spells out the hops, every step carries its
   // agent's colour, and supervisor steps say where they routed. The two-hop "staging feels slow" run streams in on
@@ -2247,7 +2247,7 @@
             input: 'get_metrics(env="staging", service="checkout")', error: 'TimeoutError: the metrics API did not answer within 10 s',
             diag: '<b>The slow step was the metrics API, not the model.</b> It timed out after 10 s; the automatic retry answered in 0.35 s. Fix or alert on the API, not the model.', meta: 'read-only · runs without approval · attempt <b>1 of 3</b>' }
         : { name: 'get_metrics', type: 'tool', agent: 'infra', depth: 2, t0: 1.00, t1: 1.35,
-            input: 'get_metrics(env="staging", service="checkout")', output: '{ "p95_ms": 2400, "cpu": 0.92, "replicas": 2 }', meta: 'read-only · runs without approval (slide 14)' },
+            input: 'get_metrics(env="staging", service="checkout")', output: '{ "p95_ms": 2400, "cpu": 0.92, "replicas": 2 }', meta: 'read-only · runs without approval (see Human in the loop)' },
       ...(fail ? [{ name: 'get_metrics · retry', type: 'tool', agent: 'infra', depth: 2, t0: 11.02, t1: 11.37,
             input: 'get_metrics(env="staging", service="checkout")', output: '{ "p95_ms": 2400, "cpu": 0.92, "replicas": 2 }', meta: 'read-only · attempt <b>2 of 3</b> · succeeded' }] : []),
       { name: 'read metrics', type: 'llm', agent: 'infra', depth: 2, t0: t(1.37), t1: t(2.08), ...obsLlm('gpt-oss-120b', 0.2, 486, 54),
@@ -2289,10 +2289,10 @@
       // the run stops at interrupt() and resumes with the admin's decision; the minutes in between are not latency
       { name: 'admin approval', type: 'human', agent: 'infra', depth: 2, t0: 0.88, t1: 0.92,
         input: 'interrupt({ "action": "restart_service", "env": "staging", "service": "billing" })', output: '{ "decision": "approve", "by": "admin" }',
-        meta: 'paused at checkpoint <b>3</b> · an <b>admin</b> approved 46 s later · the wait is left out of the timings (slide 14)' },
+        meta: 'paused at checkpoint <b>3</b> · an <b>admin</b> approved 46 s later · the wait is left out of the timings (see Human in the loop)' },
       { name: 'restart_service', type: 'tool', agent: 'infra', depth: 2, t0: 0.94, t1: 2.38,
         input: 'restart_service(env="staging", service="billing")', output: '{ "status": "restarted", "ready": "2/2" }', meta: 'staging change · ran after an admin approved' },
-      { name: 'confirm', type: 'llm', agent: 'infra', depth: 2, t0: 2.40, t1: 2.82, ...obsLlm('gpt-oss-20b', 0.2, 204, 32),
+      { name: 'confirm', type: 'llm', agent: 'infra', depth: 2, t0: 2.40, t1: 2.82, ...obsLlm('gpt-oss-120b', 0.2, 204, 32),
         input: 'tool result: { "status": "restarted", "ready": "2/2" }', output: 'Billing on staging restarted; 2 of 2 replicas ready.' },
       obsSup('finish', '', 2.84, 3.04, 160, 136),
     ];
@@ -2322,7 +2322,7 @@
   let obsRun = 0, obsKey = 'slow', obsData = null, obsPicked = 0;   // obsPicked: the stream in which the presenter chose a step
   const obsTag = (agent, text) => el('span', `obs-atag a-${agent}`, text);
   const obsSec = (label, ...kids) => { const d = el('div', 'obs-sec'); d.append(el('p', null, label), ...kids); return d; };
-  // inspector text breaks only where it reads well: a number stays with its unit (46 s, 2 of 2 replicas, slide 16),
+  // inspector text breaks only where it reads well: a number stays with its unit (46 s, 2 of 2 replicas),
   // a label with its value (thread infra-0398, "ready": "2/2"), and a line may end with a · but never start with one
   const obsGlue = t => t.replace(/(\d) of (\d)/g, '$1\u00a0of\u00a0$2').replace(/(\d) (s|min|chunks|replicas)\b/g, '$1\u00a0$2')
     .replace(/slide (\d)/g, 'slide\u00a0$1').replace(/": /g, '":\u00a0').replace(/ · /g, '\u00a0· ').replace(/(\w) <b>/g, '$1\u00a0<b>');
@@ -2461,7 +2461,7 @@
     svg.innerHTML = `<polyline points="${pts.map(p => p.map(n => n.toFixed(1)).join(',')).join(' ')}"/>`;
   });
   function obsCost() {
-    const hw = +($('#cHw')?.value || 3000000), run = +($('#cRun')?.value || 125000);
+    const hw = 3000000, run = 125000;   // an illustrative ₹30 lakh server over three years, plus ₹1.25 lakh a month to run
     const perRequest = (hw / 36 + run) / 30 / 1284;     // monthly server cost spread over 1,284 requests a day
     const d = perRequest / INR_PER_USD;
     $('#obsCost').textContent = `≈ ${perRequest < 1 ? '₹' + perRequest.toFixed(2) : inr(perRequest)} (${d < 0.01 ? '< $0.01' : '$' + d.toFixed(2)})`;

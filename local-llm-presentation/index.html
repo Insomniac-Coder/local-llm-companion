@@ -592,8 +592,16 @@
 <section class="slide" id="agents" data-label="11 · Multi-agent orchestration">
   <div class="frame"><div class="pad">
     <header class="s-head">
-      <p class="eyebrow rv"><span class="ch">11</span> Multi-agent orchestration</p>
-      <h2 data-gen>One supervisor, three specialists</h2>
+      <div class="s-head-row rag-head">
+        <div>
+          <p class="eyebrow rv"><span class="ch">11</span> Multi-agent orchestration</p>
+          <h2 data-gen>One supervisor, three specialists</h2>
+        </div>
+        <p class="rag-ring rv" style="--d:2">
+          <svg viewBox="0 0 64 64" aria-hidden="true"><circle class="rag-ring-c" cx="32" cy="32" r="30"/><circle class="rag-ring-c" cx="32" cy="32" r="25"/><circle class="rag-ring-c" cx="32" cy="32" r="20"/><circle class="rag-ring-c on" cx="32" cy="32" r="15"/><circle class="rag-ring-c" cx="32" cy="32" r="10"/><circle class="rag-ring-core" cx="32" cy="32" r="5.5"/></svg>
+          <span>The harness, opened: <b>tools</b>, each agent holding only the tools its job needs</span>
+        </p>
+      </div>
       <p class="sub ag-sub rv" style="--d:2">Our LangGraph proof of concept routes each request to the agent built for it, and loops back to another agent until the job is done.</p>
     </header>
     <div class="ag-main">
@@ -751,12 +759,20 @@
 <!-- BUILD:hitl END -->
 
 <!-- BUILD:observe START -->
-<!-- ================================================================ 17 · LANGSMITH -->
+<!-- ================================================================ 15 · LANGSMITH -->
 <section class="slide" id="observe" data-label="13 · Observability">
   <div class="frame"><div class="pad">
     <header class="s-head">
-      <p class="eyebrow rv"><span class="ch">13</span> Observability</p>
-      <h2 data-gen>Every hop, every prompt, on the record</h2>
+      <div class="s-head-row rag-head">
+        <div>
+          <p class="eyebrow rv"><span class="ch">13</span> Observability</p>
+          <h2 data-gen>Every hop, every prompt, on the record</h2>
+        </div>
+        <p class="rag-ring rv" style="--d:2">
+          <svg viewBox="0 0 64 64" aria-hidden="true"><circle class="rag-ring-c on" cx="32" cy="32" r="30"/><circle class="rag-ring-c" cx="32" cy="32" r="25"/><circle class="rag-ring-c" cx="32" cy="32" r="20"/><circle class="rag-ring-c" cx="32" cy="32" r="15"/><circle class="rag-ring-c" cx="32" cy="32" r="10"/><circle class="rag-ring-core" cx="32" cy="32" r="5.5"/></svg>
+          <span>The harness, opened: the <b>audit log</b>, every hop traced and kept</span>
+        </p>
+      </div>
       <p class="sub obs-sub rv" style="--d:2">LangSmith traces every request: which agent and which model ran each step, what it read, and the time and tokens it took.</p>
     </header>
     <div class="obs-app card rv" style="--d:3">
@@ -789,7 +805,7 @@
       <li><p class="obs-tl">Internal cost</p><p class="obs-tv" id="obsCost">≈ ₹5 ($0.06)</p><p class="obs-tc">a request: server cost ÷ requests, illustrative</p></li>
       <li><p class="obs-tl">Traces stay in</p><p class="obs-tv">Our network</p><p class="obs-tc">self-hosted, fields masked</p></li>
     </ul>
-    <details class="eng-note"><summary>Engineer's note</summary><p>Tracing is switched on with <code>LANGSMITH_TRACING=true</code>, plus <code>LANGSMITH_ENDPOINT</code> pointing at a self-hosted instance. LangChain and LangGraph runs are traced automatically; any other function can be added with the <code>@traceable</code> decorator. Each request becomes a tree of runs (chain, LLM, tool, retriever) with inputs, outputs, timings, token counts and errors; tag runs with metadata such as <code>thread_id</code>, user and department to filter and group them.</p><p>Dashboards and alerts cover latency, tokens, cost and error rates; user feedback can be attached to runs; saved runs become datasets for evaluations, so a new model or prompt is scored on our own questions before it goes live. Self-hosted LangSmith is offered on the Enterprise plan, inputs and outputs can be masked for sensitive data, and traces can also be exported over OpenTelemetry. Open-source alternatives such as Langfuse can be self-hosted too. Every LLM run records the model it used, so speed and cost can be compared model by model; the harness can then send each kind of step to the smallest model that does it well. The models shown (gpt-oss-20b for routing and short replies, gpt-oss-120b for tool use and grounded answers, Gemma 3 27B for drafting, all-MiniLM-L6-v2 for search embeddings) are examples of open-weight models we can host. The trace and figures on this slide are illustrative.</p></details>
+    <details class="eng-note"><summary>Engineer's note</summary><p>Tracing is switched on with <code>LANGSMITH_TRACING=true</code> and an API key (<code>LANGSMITH_API_KEY</code>), plus <code>LANGSMITH_ENDPOINT</code> pointing at a self-hosted instance. LangChain and LangGraph runs are traced automatically; any other function can be added with the <code>@traceable</code> decorator. Each request becomes a tree of runs (chain, LLM, tool, retriever) with inputs, outputs, timings, token counts and errors; tag runs with metadata such as <code>thread_id</code>, user and department to filter and group them.</p><p>Dashboards and alerts cover latency, tokens, cost and error rates; user feedback can be attached to runs; saved runs become datasets for evaluations, so a new model or prompt is scored on our own questions before it goes live. Self-hosted LangSmith is offered on the Enterprise plan, inputs and outputs can be masked for sensitive data, and traces can also be exported over OpenTelemetry. Open-source alternatives such as Langfuse can be self-hosted too. Every LLM run records the model it used, so speed and cost can be compared model by model; the harness can then send each kind of step to the smallest model that does it well. The models shown (gpt-oss-20b for routing and short replies, gpt-oss-120b for tool use and grounded answers, Gemma 3 27B for drafting, all-MiniLM-L6-v2 for search embeddings) are examples of open-weight models we can host. The trace and figures on this slide are illustrative.</p></details>
   </div></div>
 </section>
 <!-- BUILD:observe END -->

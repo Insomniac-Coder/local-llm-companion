@@ -798,7 +798,7 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 #agents .pad { gap: 20px; }
 #agents .s-head { gap: 10px; }
 #agents .ag-sub { max-width: none; }
-/* one colour per agent, shared with slide 17: supervisor navy, Infra amber, RAG emerald, General pink */
+/* one colour per agent, shared with slide 15: supervisor navy, Infra amber, RAG emerald, General pink */
 .ag-c-sup { --ac: #0b1a2c; --at: #0b1a2c; --as: #e3e9f1; }
 .ag-c-infra { --ac: #d97706; --at: #92400e; --as: #fef3c7; }
 .ag-c-rag { --ac: #059669; --at: #047857; --as: #d3f4e6; }
@@ -1045,10 +1045,10 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 /* BUILD:hitl END */
 
 /* BUILD:observe START */
-/* 17 LangSmith observability: a trace that streams in, an inspector, and the monitoring strip */
+/* 15 LangSmith observability: a trace that streams in, an inspector, and the monitoring strip */
 #observe .obs-sub { max-width: none; }
 #observe .pad { gap: 24px; }
-/* one colour per agent, shared with slide 15: supervisor navy, Infra amber, RAG emerald, General pink */
+/* one colour per agent, shared with slide 13: supervisor navy, Infra amber, RAG emerald, General pink */
 .a-sup { --ac: #0b1a2c; --at: #0b1a2c; --as: #e3e9f1; }
 .a-infra { --ac: #d97706; --at: #92400e; --as: #fef3c7; }
 .a-rag { --ac: #059669; --at: #047857; --as: #d3f4e6; }
@@ -1058,7 +1058,7 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .obs-runs { display: flex; gap: 8px; flex: 1; min-width: 0; }
 .obs-runchip { display: inline-flex; align-items: center; gap: 8px; padding: 5px 12px 5px 14px; border-radius: 999px; border: 1.5px solid var(--line-2); background: var(--paper); color: var(--ink-2); font: 500 14.5px/1.2 var(--sans); cursor: pointer; white-space: nowrap; transition: border-color 0.2s, box-shadow 0.2s, color 0.2s; }
 .obs-runchip:hover { border-color: var(--ink); color: var(--ink); }
-.obs-runchip.is-on { border-color: var(--ink); color: var(--ink); box-shadow: 0 1px 4px rgba(11, 26, 44, 0.14); }
+.obs-runchip.is-on { background: var(--ink); border-color: var(--ink); color: var(--on-ink); box-shadow: 0 1px 4px rgba(11, 26, 44, 0.14); }
 .obs-runchip .obs-atag { font: 600 12px/1 var(--mono); padding: 4px 7px; border-radius: 6px; color: var(--at); background: var(--as); }
 .obs-runchip .obs-atag.fail { color: var(--ink-2); background: var(--wash); box-shadow: inset 0 0 0 1px var(--line-2); }
 .obs-route { display: flex; align-items: center; gap: 14px; padding: 5px 18px; border-bottom: 1px solid var(--line); }
