@@ -1524,26 +1524,28 @@
       $('#ragNums').textContent = '';
       paintCells(cellsIn, null);
       resetRail(inRail);
-      if (!(await step(me, 500))) return false;
+      // the first beat waits for the ingest card's own fade-in (the deck's reveal), so the audience sees all of it
+      await Promise.all($('.rag-in').getAnimations().filter(a => a.transitionProperty === 'opacity').map(a => a.finished.catch(() => {})));
+      if (!(await step(me, 100))) return false;
       stage(inRail, 'doc');
       nudge($('#ragDoc'));
-      if (!(await step(me, 420))) return false;
+      if (!(await step(me, 360))) return false;
       // the document splits: each chunk card grows out of the document card
       stage(inRail, 'chunk');
       const d = mid($('#ragDoc'));
       tilesBox.classList.remove('is-pre');
       tiles.forEach((t, n) => {
         const m = mid(t);
-        t.animate([{ transform: `translate(${d.x - m.x}px, ${d.y - m.y}px) scale(0.3)`, opacity: 0 }, { transform: 'none', opacity: 1 }],
+        t.animate([{ transform: `translate(${d.x - m.x}px, ${d.y - m.y}px) scale(0.3)`, opacity: 0 }, { opacity: 1, offset: 0.15 }, { transform: 'none', opacity: 1 }],
           { duration: 560, delay: n * 70, easing: 'cubic-bezier(.2,.7,.2,1)', fill: 'backwards' });
       });
-      if (!(await step(me, 720))) return false;
+      if (!(await step(me, 580))) return false;
       // each chunk becomes numbers, then flies into the store as a dot
       stage(inRail, 'embed');
       let landed = 0, last = null;
       for (let i = 0; i < CH.length; i++) {
         showEmbed(i, true, i === 0);
-        if (!(await step(me, i === 0 ? 850 : 230))) return false;
+        if (!(await step(me, i === 0 ? 650 : 170))) return false;
         const c = CH[i];
         last = flyTo(el('i', `rag-pkt rag-h${c.h}`), endOf($('#ragCellsIn'), true), mapXY(c.x, c.y), 600, 36).then(ok => {
           if (!ok || me !== run) return;
@@ -1554,7 +1556,7 @@
         if (i === 0) stage(inRail, 'store');
       }
       await last;
-      if (!(await step(me, 350))) return false;
+      if (!(await step(me, 250))) return false;
       tiles.forEach(t => t.classList.remove('is-cur'));
       showEmbed(0, false);
       stage(inRail, null);
@@ -1613,14 +1615,18 @@
       if (Q.blocked) f.append(el('span', 'rag-tag is-x', '1 filtered'));
     }
     const rowsBox = $('#ragRows');
-    // the prompt keeps one slot per retrieved chunk (K of them), so nothing in the lane moves while a run fills it
+    // the prompt always has four slots (K at most): one per retrieved chunk, dashed until the chunk lands, and the rest
+    // marked "not retrieved", so nothing in the lane moves while a run fills it or when K changes
+    const emptySlot = (cls, label) => {
+      const li = el('li', 'rag-pr-row ' + cls);
+      li.dataset.slot = label;
+      li.append(el('span', 'rag-pr-ref', '\u00a0'), el('span', 'rag-pr-txt', '\u00a0'), el('span', 'rag-pr-w'));
+      return li;
+    };
+    const skipRows = k => Array.from({ length: 4 - k }, () => emptySlot('is-skip', `not retrieved · K = ${k}`));
+    const hitRows = () => $$('.rag-pr-row[data-c]', rowsBox);
     function slotRows(k) {
-      rowsBox.replaceChildren(...Array.from({ length: k }, (_, n) => {
-        const li = el('li', 'rag-pr-row is-wait');
-        li.dataset.slot = `chunk ${n + 1} of ${k}`;
-        li.append(el('span', 'rag-pr-ref', '\u00a0'), el('span', 'rag-pr-txt', '\u00a0'), el('span', 'rag-pr-w'));
-        return li;
-      }));
+      rowsBox.replaceChildren(...Array.from({ length: k }, (_, n) => emptySlot('is-wait', `chunk ${n + 1} of ${k}`)), ...skipRows(k));
     }
     function buildRows(Q, k, wait) {
       rowsBox.replaceChildren(...Q.hits.slice(0, k).map(([i, s], n) => {
@@ -1630,8 +1636,8 @@
         li.dataset.slot = `chunk ${n + 1} of ${k}`;
         li.append(el('span', 'rag-pr-ref', `${c.sec} · ${s.toFixed(2)}`), el('span', 'rag-pr-txt'), el('span', 'rag-pr-w', weak ? 'weak' : ''));
         return li;
-      }));
-      $$('.rag-pr-row', rowsBox).forEach(li => fit($('.rag-pr-txt', li), CH[+li.dataset.c].text(days)));
+      }), ...skipRows(k));
+      hitRows().forEach(li => fit($('.rag-pr-txt', li), CH[+li.dataset.c].text(days)));
       $('#ragPrQ').textContent = Q.q;
     }
     const ansEl = $('#ragAns'), caret = $('#ragCaret'), srcBox = $('#ragSrcs');
@@ -1720,7 +1726,7 @@
       // the chosen chunks lift out of the map into the prompt
       stage(askRail, 'prompt');
       buildRows(Q, K, true);
-      const rows = [...rowsBox.children];
+      const rows = hitRows();
       rows.forEach((row, n) => {
         const c = CH[+row.dataset.c], a = mapXY(c.x, c.y), rb = relBox(row);
         flyTo(el('span', `rag-lift rag-h${c.h}`, c.sec), { x: a.x - 22, y: a.y - 12 }, { x: rb.x + 8, y: rb.y + 2 }, 620, 50, n * 120)
@@ -1741,7 +1747,8 @@
     const chips = $$('.rag-chip'), kBtns = $$('.rag-k .seg-btn');
     const syncChips = () => chips.forEach(b => { const on = +b.dataset.q === qi; b.classList.toggle('is-on', on); b.setAttribute('aria-pressed', String(on)); });
     const syncK = () => kBtns.forEach(b => { const on = +b.dataset.k === K; b.classList.toggle('is-on', on); b.setAttribute('aria-pressed', String(on)); });
-    function begin() { const me = ++run; cancelFly(); if (!ingested) renderIngest(); return me; }
+    // a new run first finishes the ingest lane if the arrival or a re-ingest was still moving through it
+    function begin() { const me = ++run; cancelFly(); if (!ingested || inRail.classList.contains('is-run')) renderIngest(); return me; }
     chips.forEach(b => b.addEventListener('click', () => {
       qi = +b.dataset.q;
       syncChips();
