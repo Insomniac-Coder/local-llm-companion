@@ -865,7 +865,7 @@
           <div class="hitl-diff" aria-label="Proposed change">
             <p class="hitl-diff-file">deployment/checkout-service · production</p>
             <p class="hitl-del"><span aria-hidden="true">−</span> replicas: 2</p>
-            <p class="hitl-add"><span aria-hidden="true">+</span> replicas: <span class="hitl-new" id="hitlNew">4</span><span class="hitl-stepper" id="hitlStepper" hidden><button type="button" class="hitl-step-btn" id="hitlLess" aria-label="One replica fewer">−</button><output id="hitlEditVal" aria-live="polite">3</output><button type="button" class="hitl-step-btn" id="hitlMore" aria-label="One replica more">+</button></span></p>
+            <p class="hitl-add"><span aria-hidden="true">+</span> replicas: <span class="hitl-new" id="hitlNew">4</span><span class="hitl-stepper" id="hitlStepper" hidden><button type="button" class="hitl-step-btn" id="hitlLess" aria-label="One replica fewer">−</button><output id="hitlEditVal" aria-live="polite">4</output><button type="button" class="hitl-step-btn" id="hitlMore" aria-label="One replica more">+</button></span></p>
           </div>
           <p class="hitl-meta">Asked by the checkout team in chat · may approve: the on-call engineer</p>
           <div class="hitl-actions" id="hitlActions">
@@ -891,13 +891,13 @@
           <ul>
             <li class="hitl-auto"><b>Runs on its own</b><span>Reading metrics, logs and documents</span></li>
             <li class="hitl-admin"><b>Waits for an admin</b><span>Changes on staging, such as a restart</span></li>
-            <li class="hitl-hold"><b>Waits for an owner</b><span>Production changes, deletions, payments, emails outside the company</span></li>
+            <li class="hitl-hold"><b>Waits for an owner</b><span>Production changes, deletions, payments, external emails</span></li>
           </ul>
           <p class="caption">Who may approve is itself an access right, checked like any other.</p>
         </section>
       </div>
     </div>
-    <details class="eng-note"><summary>Engineer's note</summary><p>LangGraph pauses a run with <code>interrupt()</code>, called inside the node that is about to act, or with <code>interrupt_before=["execute"]</code> when the graph is compiled. Both need a checkpointer, which saves the run's state under its <code>thread_id</code>. The caller gets an <code>__interrupt__</code> payload describing the proposed change, and that is what the approval screen shows.</p><p>The decision resumes the same thread: <code>graph.invoke(Command(resume={"action": "edit", "replicas": 3}), config)</code>, and the node receives it as the return value of <code>interrupt()</code>. Edits can also be written into the saved state with <code>graph.update_state</code>. Because the checkpoint lives in a database (SQLite or Postgres), a restart while waiting loses nothing. In production, add a timeout and escalation for unanswered approvals and record who approved; the pause, the decision and the resume all appear in the LangSmith trace on the next slide.</p></details>
+    <details class="eng-note"><summary>Engineer's note</summary><p>LangGraph can pause a run in two ways, and both need a checkpointer, which saves the run's state under its <code>thread_id</code>. Called inside the node that is about to act, <code>interrupt()</code> stops the run and the caller gets an <code>__interrupt__</code> payload describing the proposed change: that is what the approval screen shows. The decision resumes the same thread with <code>graph.invoke(Command(resume={"action": "edit", "replicas": 3}), config)</code> and arrives as the return value of <code>interrupt()</code>. On resume the node runs again from its top, so call <code>interrupt()</code> before any side effect.</p><p>A static breakpoint, <code>interrupt_before=["execute"]</code> at compile time, instead stops the run before that node; an edit is written into the saved state with <code>graph.update_state</code>, and <code>graph.invoke(None, config)</code> continues. Because the checkpoint lives in a database (SQLite or Postgres), a restart while waiting loses nothing. In production, add a timeout and escalation for unanswered approvals and record who approved. The pause, the decision and the resume all appear in the run's LangSmith trace; the next slide shows one: a staging restart that an admin approved.</p></details>
   </div></div>
 </section>
 <!-- BUILD:hitl END -->

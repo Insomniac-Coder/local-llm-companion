@@ -2351,16 +2351,17 @@
   // restores the run from the saved checkpoint, still waiting.
   const HITL_AFTER = { 3: ['460 ms', '66%'], 4: ['380 ms', '54%'], 5: ['340 ms', '45%'], 6: ['320 ms', '38%'] };
   const hitlSteps = $$('#hitlSteps .hitl-step');
-  const hitlCard = $('#hitlCard'), hitlLog = $('#hitlLog'), hitlFill = $('#hitlFill'), hitlOverlay = $('#hitlOverlay');
+  const hitlCard = $('#hitlCard'), hitlLog = $('#hitlLog'), hitlTrack = $('#hitlFill').parentElement, hitlOverlay = $('#hitlOverlay');
   const hitlBtn = { approve: $('#hitlApprove'), edit: $('#hitlEdit'), reject: $('#hitlReject'), restart: $('#hitlRestart') };
-  let hitlRun = 0, hitlState = 'idle', hitlEditing = false, hitlReplicas = 3;
+  let hitlRun = 0, hitlState = 'idle', hitlEditing = false, hitlReplicas = 4;
   const hitlPause = ms => sleep(reduced ? 0 : ms);
 
   function hitlMark(i, cls) {
     hitlSteps[i].classList.remove('done', 'wait', 'stop', 'skip');
     if (cls) hitlSteps[i].classList.add(cls);
   }
-  const hitlReach = i => hitlFill.style.setProperty('--p', i / (hitlSteps.length - 1));
+  // --p on the track drives the emerald fill; --k (set on a rejection) turns the rest of the track into a skipped stretch
+  const hitlReach = i => hitlTrack.style.setProperty('--p', i / (hitlSteps.length - 1));
   function hitlLine(time, text, kind) {
     const li = el('li', kind || null);
     li.append(el('time', null, time), el('span', null, text));
@@ -2377,18 +2378,18 @@
     $('#hitlEditVal').textContent = hitlReplicas;
     $('#hitlLess').disabled = hitlReplicas <= 3;
     $('#hitlMore').disabled = hitlReplicas >= 6;
-    hitlBtn.approve.textContent = on ? `Approve ${hitlReplicas} replicas` : 'Approve';
+    hitlBtn.approve.textContent = on && hitlReplicas !== 4 ? `Approve ${hitlReplicas} replicas` : 'Approve';
     hitlBtn.edit.textContent = on ? 'Cancel edit' : 'Edit';
     hitlBtn.reject.hidden = on;
   }
   function hitlReset() {
     hitlRun++;
     hitlState = 'idle';
-    hitlReplicas = 3;
+    hitlReplicas = 4;
     hitlSteps.forEach((_, i) => hitlMark(i));
-    hitlReach(0);
+    hitlReach(0);   // a stale --k is harmless: --p stays at or below 3/7 until the next decision sets or clears it
     $('#hitlDecideLabel').textContent = 'A person decides';
-    $('#hitlDecideNote').textContent = 'approve · edit · reject';
+    $('#hitlDecideNote').textContent = 'approve, edit, reject';
     $('#hitlExecNote').textContent = 'apply the change';
     $('#hitlNew').textContent = '4';
     hitlLog.replaceChildren();
@@ -2396,7 +2397,7 @@
     hitlOverlay.hidden = true;
     $('#hitlKicker').textContent = 'Approval needed · Infra agent';
     $('#hitlActions').hidden = false;
-    hitlBtn.restart.hidden = false;
+    hitlBtn.restart.style.visibility = '';
     $('#hitlDecision').hidden = true;
     hitlSetEditing(false);
     hitlEnable(false);
@@ -2438,7 +2439,7 @@
     const reject = kind === 'reject';
     const [p95, cpu] = HITL_AFTER[n] || HITL_AFTER[4];
     const lines = reject ? [
-      ['10:42', 'Rejected: “Not during the sale; watch it for 15 minutes”', 'no'],
+      ['10:42', 'Rejected by the on-call engineer', 'no'],
       ['10:42', 'Resumed at checkpoint 7: no change made', ''],
       ['10:42', 'The agent will alert again if p95 stays above 2 s', ''],
       ['10:42', 'Reported back; the decision is in the trace', 'ok'],
@@ -2451,15 +2452,16 @@
     $('#hitlDecideLabel').textContent = reject ? 'Rejected' : kind === 'edit' ? 'Edited' : 'Approved';
     $('#hitlDecideNote').textContent = kind === 'edit' ? `${n} replicas, not 4` : 'on-call engineer';
     const stamp = $('#hitlDecision');
-    stamp.textContent = reject ? 'Rejected · no change made · 10:42' : kind === 'edit' ? `Approved with an edit: ${n} replicas · 10:42` : 'Approved by the on-call engineer · 10:42';
+    stamp.textContent = reject ? 'Rejected by the on-call engineer · no change · 10:42 · logged' : kind === 'edit' ? 'Approved with an edit by the on-call engineer · 10:42 · logged' : 'Approved by the on-call engineer · 10:42 · logged';
     stamp.className = 'hitl-decision' + (reject ? ' no' : '');
     $('#hitlActions').hidden = true;
     stamp.hidden = false;
     $('#hitlKicker').textContent = 'Decision recorded · Infra agent';
-    hitlBtn.restart.hidden = true;
+    hitlBtn.restart.style.visibility = 'hidden';   // keeps its space, so the card does not shrink
     hitlCard.classList.add('decided');
     $('#hitlExecNote').textContent = reject ? 'skipped' : `scaled 2 → ${n}`;
     hitlMark(3, 'done');
+    if (reject) hitlTrack.style.setProperty('--k', 4 / (hitlSteps.length - 1)); else hitlTrack.style.removeProperty('--k');
     for (let k = 0; k < 4; k++) {
       await hitlPause(k ? 650 : 250);
       if (me !== hitlRun) return;
@@ -2492,8 +2494,13 @@
     hitlOverlay.hidden = true;
     hitlWait(true);
   }
-  hitlBtn.approve.addEventListener('click', () => hitlDecide(hitlEditing ? 'edit' : 'approve'));
-  hitlBtn.edit.addEventListener('click', () => { if (hitlState === 'waiting') hitlSetEditing(!hitlEditing); });
+  // an edit that ends where the proposal started (4) is a plain approval
+  hitlBtn.approve.addEventListener('click', () => hitlDecide(hitlEditing && hitlReplicas !== 4 ? 'edit' : 'approve'));
+  hitlBtn.edit.addEventListener('click', () => {
+    if (hitlState !== 'waiting') return;
+    if (!hitlEditing) hitlReplicas = 4;   // the stepper starts at the proposal
+    hitlSetEditing(!hitlEditing);
+  });
   hitlBtn.reject.addEventListener('click', () => hitlDecide('reject'));
   hitlBtn.restart.addEventListener('click', hitlRestart);
   $('#hitlLess').addEventListener('click', () => { hitlReplicas = Math.max(3, hitlReplicas - 1); hitlSetEditing(true); });
