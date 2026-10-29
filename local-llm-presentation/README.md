@@ -1,6 +1,6 @@
 # The Next Word Is Ours
 
-An interactive slide deck for the AI Council on LLMs and the systems around them: how language models work,
+An interactive Show and Tell deck on LLMs and the systems around them: how language models work,
 how AI helps us, and the harness we have built around a model. **Sixteen slides, about fifteen minutes, in three parts**, then a summary:
 
 1. **What an LLM is**: what it is and how large; how it learns; why a trained model is frozen and needs RAG; how
@@ -13,7 +13,7 @@ how AI helps us, and the harness we have built around a model. **Sixteen slides,
    the model chosen for every step).
 
 It closes on a summary of the three parts (each with a link back to it, for the questions) and a call for
-questions and answers.
+questions and answers, with a Restart button back to the first slide.
 
 The deck never says "local" or "in-house", names no Chinese models and does not propose running models on laptops.
 Every slide has its own entrance; the bottom bar shows the three parts, **G** (or clicking the slide counter) opens

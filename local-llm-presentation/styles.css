@@ -1510,13 +1510,17 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .end-part b { color: var(--ink); font-weight: 600; }
 .end-back { justify-self: start; padding-top: 2px; text-decoration: none; }
 .end-back:hover .callout-title, .end-back:focus-visible .callout-title { text-decoration: underline; text-underline-offset: 3px; }
-.end-qa { display: grid; grid-template-columns: 64px auto minmax(0, 1fr); align-items: center; gap: 24px; padding: 22px 30px; border-radius: 20px; background: #0b1a2c; color: #f2f5f9; box-shadow: 0 14px 34px rgba(11, 26, 44, 0.22); }
+.end-qa { display: grid; grid-template-columns: 64px auto minmax(0, 1fr) auto; align-items: center; gap: 24px; padding: 22px 30px; border-radius: 20px; background: #0b1a2c; color: #f2f5f9; box-shadow: 0 14px 34px rgba(11, 26, 44, 0.22); }
 .end-rings { width: 64px; height: 64px; }
 .end-ring { fill: none; stroke: rgba(110, 231, 183, 0.4); stroke-width: 1.5; }
 .end-core { fill: #6ee7b7; }
 .end-qa-t { font: 700 40px/1.05 var(--display); letter-spacing: -0.03em; white-space: nowrap; }
 .end-qa-d { justify-self: end; text-align: right; font-size: 18px; line-height: 1.45; color: rgba(242, 245, 249, 0.82); }
 .end-qa .kbd { background: transparent; color: #f2f5f9; border-color: rgba(242, 245, 249, 0.45); }
+/* back to the first slide: a light pill on the navy banner */
+.end-restart { background: #f2f5f9; border-color: #f2f5f9; color: #0b1a2c; white-space: nowrap; }
+.end-restart:hover, .end-restart:focus-visible { background: #6ee7b7; border-color: #6ee7b7; color: #0b1a2c; }
+.end-restart svg { width: 19px; height: 19px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 /* the five harness rings light up from the core outwards, slowly, while the room asks questions */
 @media (prefers-reduced-motion: no-preference) {
   .deck #close.on .end-ring { animation: end-ripple 3.6s ease-in-out infinite; animation-delay: calc(1.4s + var(--k, 0) * 0.22s); }
