@@ -1145,7 +1145,7 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .obs-meta b { font-weight: 500; color: var(--ink-2); }
 
 .obs-tiles { list-style: none; padding: 0; margin: 0; display: grid; gap: 14px;
-  grid-template-columns: auto repeat(3, minmax(max-content, 1fr)) auto auto; }   /* text tiles fit their one-line content; the three sparkline tiles share the rest */
+  grid-template-columns: auto repeat(3, minmax(max-content, 1fr)) auto; }   /* text tiles fit their one-line content; the three sparkline tiles share the rest */
 .obs-tiles li { padding: 8px 16px 8px; border-radius: 14px; background: var(--wash); display: grid; gap: 3px; align-content: start; }
 .obs-tl { font: 600 12.5px/1.2 var(--mono); letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
 .obs-tv { font: 680 24px/1.1 var(--display); letter-spacing: -0.02em; color: var(--ink); font-variant-numeric: tabular-nums; }

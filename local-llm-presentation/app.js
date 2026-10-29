@@ -2,9 +2,6 @@
 (() => {
   'use strict';
 
-  /* ------------------------------------------------------------------ settings */
-  const INR_PER_USD = 95.96;   // rupees per US dollar; every price on the page is derived from this
-
   /* ------------------------------------------------------------------ helpers */
   const $ = (s, r = document) => r.querySelector(s);
   const $$ = (s, r = document) => [...r.querySelectorAll(s)];
@@ -26,15 +23,6 @@
     return n;
   };
   const HL = ['var(--hl1)', 'var(--hl2)', 'var(--hl3)', 'var(--hl4)', 'var(--hl5)'];
-
-  /* ------------------------------------------------------------------ money: rupees first, dollars in brackets */
-  const num1 = x => (x >= 100 ? Math.round(x).toLocaleString('en-IN') : x >= 10 ? String(Math.round(x)) : String(Math.round(x * 10) / 10));
-  const inrParts = r => (r >= 1e7 ? [num1(r / 1e7), ' crore'] : r >= 1e5 ? [num1(r / 1e5), ' lakh'] : [Math.round(r).toLocaleString('en-IN'), '']);
-  const usdParts = d => (d >= 1e6 ? [num1(d / 1e6), 'M'] : d >= 1e3 ? [num1(d / 1e3), 'K'] : [String(Math.round(d)), '']);
-  const inr = r => { const [n, u] = inrParts(r); return `₹${n}${u}`; };
-  const usd = r => { const [n, u] = usdParts(r / INR_PER_USD); return `$${n}${u}`; };
-  const both = r => `${inr(r)} (${usd(r)})`;
-  $$('[data-rate]').forEach(n => { n.textContent = `₹${INR_PER_USD}`; });
 
   /* ------------------------------------------------------------------ tokenizer (approximate) */
   // Illustration only: real tokenizers learn their pieces from data. This keeps common words whole,
@@ -2449,7 +2437,7 @@
     b.addEventListener('click', () => obsStream(r.key));
     return b;
   }));
-  // sparklines (illustrative), and the internal cost per request from the cost slide's on-premises settings
+  // sparklines (illustrative)
   const OBS_SPARKS = {
     p95: [5.2, 5.0, 5.4, 4.9, 4.7, 5.1, 4.8, 4.6, 4.9, 5.3, 4.8, 4.7, 4.9, 4.6, 4.8, 5.0, 4.7, 4.6, 4.8, 4.9, 4.7, 4.8, 4.6, 4.8],
     tok: [2.9, 3.0, 3.1, 3.0, 3.2, 3.1, 3.0, 3.1, 3.2, 3.1, 3.0, 3.1, 3.1, 3.2, 3.0, 3.1, 3.1, 3.0, 3.2, 3.1, 3.1, 3.0, 3.1, 3.1],
@@ -2460,16 +2448,9 @@
     const pts = v.map((y, i) => [i / (v.length - 1) * 120, 23 - (y - lo) / (hi - lo || 1) * 20]);
     svg.innerHTML = `<polyline points="${pts.map(p => p.map(n => n.toFixed(1)).join(',')).join(' ')}"/>`;
   });
-  function obsCost() {
-    const hw = 3000000, run = 125000;   // an illustrative ₹30 lakh server over three years, plus ₹1.25 lakh a month to run
-    const perRequest = (hw / 36 + run) / 30 / 1284;     // monthly server cost spread over 1,284 requests a day
-    const d = perRequest / INR_PER_USD;
-    $('#obsCost').textContent = `≈ ${perRequest < 1 ? '₹' + perRequest.toFixed(2) : inr(perRequest)} (${d < 0.01 ? '< $0.01' : '$' + d.toFixed(2)})`;
-  }
   $('#obsReplay').addEventListener('click', () => obsStream(obsKey));
-  obsCost();
   obsStream('slow');
-  hooks.observe = () => { obsCost(); obsStream(obsKey); };
+  hooks.observe = () => obsStream(obsKey);
   /* BUILD:observe END */
 
   /* BUILD:polish START */

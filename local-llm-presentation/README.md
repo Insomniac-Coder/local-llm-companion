@@ -22,5 +22,4 @@ Fonts come from Google Fonts when online and fall back to system fonts offline.
 - Every slide fits the window. One scroll (mouse wheel or trackpad), one arrow key, Page Up/Down or a swipe
   moves one slide. Home and End jump to the first and last slide.
 - On slides with a technical deep-dive, an **Engineer's note** button appears in the bottom bar.
-- Prices are in rupees with US dollars in brackets, converted at `INR_PER_USD` (top of `app.js`, currently
-  ₹95.96 = $1). Department examples, glossary and myths are the `DEPTS`, `TERMS` and `MYTHS` lists in `app.js`.
+- Department examples, glossary and myths are the `DEPTS`, `TERMS` and `MYTHS` lists in `app.js`.
