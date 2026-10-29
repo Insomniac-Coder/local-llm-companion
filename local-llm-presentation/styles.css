@@ -1498,6 +1498,33 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .flow .obs-tiles .obs-wide { grid-column: 1 / -1; }
 /* BUILD:observe END */
 
+/* 16 summary and questions: one take-away card per part, and the Q&A */
+.pad.end { gap: 28px; }
+.end-parts { list-style: none; padding: 0; margin: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 22px; }
+.end-part { display: grid; grid-template-rows: auto auto 1fr auto; gap: 12px; padding: 22px 26px 20px; border-top: 4px solid var(--ours); }
+.end-n { width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center; font: 600 15px/1 var(--mono); color: #fff; background: var(--ours); }
+.end-part h3 { font: 680 26px/1.15 var(--display); letter-spacing: -0.02em; color: var(--ink); }
+.end-part ul { list-style: none; padding: 0; margin: 0; display: grid; gap: 9px; align-content: start; }
+.end-part ul li { position: relative; padding-left: 22px; font-size: 16.5px; line-height: 1.45; color: var(--ink-2); }
+.end-part ul li::before { content: ""; position: absolute; left: 1px; top: 0.5em; width: 9px; height: 9px; border-radius: 50%; background: var(--ours-soft); box-shadow: inset 0 0 0 2px var(--ours); }
+.end-part b { color: var(--ink); font-weight: 600; }
+.end-back { justify-self: start; padding-top: 2px; text-decoration: none; }
+.end-back:hover .callout-title, .end-back:focus-visible .callout-title { text-decoration: underline; text-underline-offset: 3px; }
+.end-qa { display: grid; grid-template-columns: 64px auto minmax(0, 1fr); align-items: center; gap: 24px; padding: 22px 30px; border-radius: 20px; background: #0b1a2c; color: #f2f5f9; box-shadow: 0 14px 34px rgba(11, 26, 44, 0.22); }
+.end-rings { width: 64px; height: 64px; }
+.end-ring { fill: none; stroke: rgba(110, 231, 183, 0.4); stroke-width: 1.5; }
+.end-core { fill: #6ee7b7; }
+.end-qa-t { font: 700 40px/1.05 var(--display); letter-spacing: -0.03em; white-space: nowrap; }
+.end-qa-d { justify-self: end; text-align: right; font-size: 18px; line-height: 1.45; color: rgba(242, 245, 249, 0.82); }
+.end-qa .kbd { background: transparent; color: #f2f5f9; border-color: rgba(242, 245, 249, 0.45); }
+/* the five harness rings light up from the core outwards, slowly, while the room asks questions */
+@media (prefers-reduced-motion: no-preference) {
+  .deck #close.on .end-ring { animation: end-ripple 3.6s ease-in-out infinite; animation-delay: calc(1.4s + var(--k, 0) * 0.22s); }
+}
+@keyframes end-ripple { 0%, 100% { stroke: rgba(110, 231, 183, 0.4); } 30% { stroke: #6ee7b7; } }
+.flow .end-parts, .flow .end-qa { grid-template-columns: 1fr; }
+.flow .end-qa-d { justify-self: start; text-align: left; }
+
 /* small mono heading used by callouts, panels and the note drawer */
 .callout-title { font: 600 14px/1.3 var(--mono); letter-spacing: 0.12em; text-transform: uppercase; color: var(--ours-ink); }
 

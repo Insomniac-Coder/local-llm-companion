@@ -3175,7 +3175,7 @@
     });
     pzLabel.classList.toggle('is-peek', peek >= 0);
     pzLabel.textContent = peek >= 0 ? `Go to part ${peek + 1} · ${PZ_PARTS[peek].name}`
-      : cur === 0 ? `${COUNT_WORDS[PZ_PARTS.length - 1] || PZ_PARTS.length} parts` : partName(k);
+      : cur === 0 ? `${COUNT_WORDS[PZ_PARTS.length - 1] || PZ_PARTS.length} parts` : slides[cur].dataset.bar || partName(k);   // a closing slide names itself
     countBtn.setAttribute('aria-label', `Slide ${cur + 1} of ${slides.length}. Open the slide list (G)`);
     if (navOpen()) markNav();
   }

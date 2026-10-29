@@ -1,7 +1,7 @@
 # The Next Word Is Ours
 
 An interactive slide deck for the AI Council on LLMs and the systems around them: how language models work,
-how AI helps us, and the harness we have built around a model. **Fifteen slides, about fifteen minutes, in three parts**:
+how AI helps us, and the harness we have built around a model. **Sixteen slides, about fifteen minutes, in three parts**, then a summary:
 
 1. **What an LLM is**: what it is and how large; how it learns; why a trained model is frozen and needs RAG; how
    it answers; temperature and top-K (a live instrument panel with a hallucination-risk gauge); memory, without and
@@ -11,6 +11,9 @@ how AI helps us, and the harness we have built around a model. **Fifteen slides,
    ChromaDB ingestion), tools (a LangGraph supervisor routing to RAG, Infra and General agents), rules (human in the
    loop: a run that pauses at a checkpoint for approval) and the audit log (LangSmith traces showing the agent and
    the model chosen for every step).
+
+It closes on a summary of the three parts (each with a link back to it, for the questions) and a call for
+questions and answers.
 
 The deck never says "local" or "in-house", names no Chinese models and does not propose running models on laptops.
 Every slide has its own entrance; the bottom bar shows the three parts, **G** (or clicking the slide counter) opens
