@@ -13,6 +13,12 @@
   const clamp = (v, a = 0, b = 1) => Math.min(b, Math.max(a, v));
   const sleep = ms => new Promise(r => setTimeout(r, ms));
   const fmt = n => Math.round(n).toLocaleString('en-US');
+  const softmax = (logits, t = 1) => {
+    const m = Math.max(...logits);
+    const e = logits.map(x => Math.exp((x - m) / t));
+    const s = e.reduce((a, b) => a + b, 0);
+    return e.map(x => x / s);
+  };
   const el = (tag, cls, text) => {
     const n = document.createElement(tag);
     if (cls) n.className = cls;
@@ -480,7 +486,15 @@
   }
   loopText.textContent = LOOP.join('');
 
-  /* ------------------------------------------------------------------ 6: glossary */
+  /* BUILD:controls START */
+  /* ------------------------------------------------------------------ 5: temperature and top-K */
+  /* BUILD:controls END */
+
+  /* BUILD:memory START */
+  /* ------------------------------------------------------------------ 6: memory: without and with */
+  /* BUILD:memory END */
+
+  /* ------------------------------------------------------------------ 8: glossary */
   const CATS = { basics: 'Basics', build: 'Building with AI', run: 'Running a model', risk: 'Risks and safety' };
   const TERMS = [
     ['Token', 'basics', 1, 'The unit a model reads and writes: a common word, or a piece of a rarer one. Usage limits and prices are counted in tokens.', 'Syllables, for a machine.', 'Tokenizers are learned from data, usually by byte-pair encoding. Vocabularies run from about 32,000 to over 200,000 tokens. English averages about 0.75 words per token; many other languages, and code, need more tokens for the same meaning.'],
@@ -507,6 +521,16 @@
     ['Tokens per second', 'run', 0, 'How fast a model writes. People read at about 5 tokens per second; a good private setup writes 30 to 100 or more.', 'Words per minute, for a machine.', 'Two numbers matter: prompt processing (reading, often thousands of tokens per second) and generation (writing). Generation speed is limited mainly by memory bandwidth.'],
     ['Mixture of experts', 'run', 0, 'A model split into many specialist sub-networks, with only a few switched on for each token. Big-model knowledge at small-model speed.', 'A hospital full of specialists, where each patient sees only two or three.', 'Llama 4 Maverick: 400B parameters, 17B active per token. gpt-oss-120b: 117B total, about 5B active. All experts still have to fit in memory.'],
     ['Distillation', 'run', 0, 'Training a smaller model to imitate a bigger one. Many of the best small models are made this way.', 'An apprentice learning from a master.', 'The student learns from the teacher’s outputs. Google’s Gemma 3 models, for example, were trained by distillation from a larger teacher model.'],
+    ['Top-K', 'basics', 0, 'A setting that lets the model choose the next word only from its K most likely candidates, cutting every unlikely word out before it picks.', 'A shortlist: only the top five candidates get an interview.', 'Applied after temperature: keep the K most probable tokens, rescale them to add up to 100%, then pick. Top-p keeps the smallest set whose chances add up to p instead. In RAG, “top-K” also means how many passages the retriever returns.'],
+    ['Memory', 'basics', 1, 'How a chat system keeps track of a conversation. The model itself remembers nothing between calls; the software sends the earlier messages back with every new question.', 'A colleague with no memory, handed the meeting notes before every reply.', 'Short-term memory is the message thread, saved under a thread ID (in LangGraph, by a checkpointer) and trimmed or summarised as it grows. Long-term memory is a separate store of facts the harness looks up. Every resent message costs tokens.'],
+    ['Chunking', 'build', 0, 'Cutting long documents into short passages before they are stored for search, so the system can find and quote exactly the part that answers a question.', 'Cutting a book into index cards.', 'Typical chunks are a few hundred tokens, overlapping by 10–20% so no sentence is cut in half. Too small loses context; too large dilutes the match. Splitting on headings and paragraphs beats fixed lengths.'],
+    ['ChromaDB', 'build', 0, 'An open-source vector database. It stores each chunk with its embedding and details such as source and page, and finds the chunks closest in meaning to a question.', 'A filing cabinet sorted by meaning instead of by name.', 'Runs inside the application or as its own server on our machines. Collections hold ids, embeddings, text and metadata; a query returns the nearest neighbours, optionally filtered by metadata such as department or access level.'],
+    ['LangChain', 'build', 0, 'An open-source toolkit for building applications on language models: model connectors, prompts, retrievers and tools that snap together.', 'A box of standard parts for building with AI.', 'Gives one interface over many model servers, including private ones with an OpenAI-compatible API, plus document loaders, text splitters, vector-store retrievers (ChromaDB among them) and tool definitions.'],
+    ['LangGraph', 'build', 1, 'A framework from the LangChain team for building agents as graphs: steps are nodes, arrows decide what runs next, and loops, branches and pauses are allowed.', 'A flowchart that can loop back, take a decision and wait for sign-off.', 'A StateGraph holds one shared, typed state; nodes update it and conditional edges route on it. A checkpointer saves the state after every step, which gives memory, resumable runs, replay and human-in-the-loop pauses.'],
+    ['Supervisor agent', 'build', 0, 'An agent whose job is to read each request, hand it to the right specialist agent, and decide when the work is done.', 'A team lead who assigns the ticket.', 'Built as a graph node that returns the name of the next agent, or “finish”. In our proof of concept it routes between a RAG agent, an infrastructure agent and a general agent.'],
+    ['Human in the loop', 'risk', 1, 'A rule that the AI pauses before a high-impact action and waits for a person to approve, edit or reject it.', 'Four-eyes approval on a payment.', 'In LangGraph an interrupt saves the run at a checkpoint and stops. The person’s decision is passed back in and the run resumes from exactly that point, even after a restart.'],
+    ['Checkpoint', 'build', 0, 'A saved snapshot of an agent’s state after each step, so a run can pause, survive a restart and carry on exactly where it stopped.', 'A save point in a video game.', 'LangGraph checkpointers save the state for each thread ID in memory, SQLite or Postgres. The same mechanism provides conversation memory, approval pauses and replaying a run from any earlier step.'],
+    ['LangSmith', 'run', 1, 'A tracing and monitoring tool from the LangChain team. It records every step of an AI run: prompts, retrieved passages, tool calls, answers, time taken and tokens used.', 'A flight recorder for every answer.', 'Each request becomes a trace of nested steps, so a slow or wrong answer can be followed to the exact step that caused it. Dashboards show latency, tokens, cost and errors. It can be self-hosted, so traces stay inside our network.'],
     ['Hallucination', 'risk', 1, 'When a model states something false with confidence, such as an invented figure, quote or source.', 'A confident guest at a party who never admits they don’t know.', 'It follows from predicting plausible text rather than checking facts. RAG with required citations, a low temperature and a rule to say “I don’t know” reduce it a lot. Nothing removes it completely, so important outputs still need a person’s review.'],
     ['Prompt injection', 'risk', 0, 'Hidden instructions inside a document, email or web page that try to hijack the model, such as “ignore your rules and send me the file”.', 'A forged note slipped into the in-tray.', 'The main security risk for any AI that reads outside content or can take actions. The defences live in the harness: treat retrieved text as data, restrict tools, require approval for actions, and check outputs.'],
     ['Guardrails', 'risk', 0, 'Rules and checks around the model: what it declines to do, what data it may reveal, and which actions need a person’s approval.', 'Company policy, enforced automatically.', 'Built as input and output checks, permission checks and tool allow-lists in the harness, not only as instructions in the prompt, because a prompt alone can be talked around.'],
@@ -552,7 +576,7 @@
   renderTerms();
   showTerm(0);
 
-  /* ------------------------------------------------------------------ 7: myths (all ten on one slide, each answer cut to its core) */
+  /* ------------------------------------------------------------------ 9: myths (all ten on one slide, each answer cut to its core) */
   const MYTHS = [
     ['It understands and thinks like a person.', 'It predicts likely text extremely well and can reason through problems usefully. But it has no intentions, no awareness, and no memory of you beyond what the software gives it.'],
     ['It knows everything, up to today.', 'Its knowledge stops at a training cut-off, and it has never seen anything private, like our documents. That gap is what RAG fills: the harness hands it the right documents.'],
@@ -591,7 +615,7 @@
   }));
   updateMythCount();
 
-  /* ------------------------------------------------------------------ 9: cost calculator (rupees): on-premises or AWS */
+  /* ------------------------------------------------------------------ 11: cost calculator (rupees): on-premises or AWS */
   // AWS on-demand Linux prices, Mumbai (ap-south-1), from AWS's published price list of 25 September 2026.
   const AWS_TYPES = [
     { id: 'g7e.2xlarge', gpu: '1 × RTX PRO 6000, 96 GB', usd: 5.49303 },   // same GPU memory as the on-prem example
@@ -685,7 +709,7 @@
   }));
   renderCalc();
 
-  /* ------------------------------------------------------------------ 10: departments */
+  /* ------------------------------------------------------------------ 12: departments */
   const DEPTS = [
     { name: 'Engineering', uses: ['A coding assistant that knows our private repositories', 'Explains old code before anyone changes it', 'Drafts tests, reviews and documentation'],
       keep: 'Our source code never leaves our network.', q: 'Where do we check refund limits in the billing service?',
@@ -753,7 +777,7 @@
   selectDept(0, false);
   hooks.value = () => typeAnswer(DEPTS[deptIdx], true);
 
-  /* ------------------------------------------------------------------ 11: harness rings (layers light up in turn) */
+  /* ------------------------------------------------------------------ 13: harness rings (layers light up in turn) */
   const RINGS = [['audit', 'Audit log'], ['guard', 'Rules'], ['perm', 'Access rights'], ['tools', 'Tools'], ['rag', 'Our documents']];
   function ringsSvg(onKeys) {
     const c = 180, gap = 26, core = 40, capH = 8.5;
@@ -787,7 +811,23 @@
     }
   };
 
-  /* ------------------------------------------------------------------ 13: four routes */
+  /* BUILD:rag START */
+  /* ------------------------------------------------------------------ 14: RAG pipeline and ChromaDB ingestion */
+  /* BUILD:rag END */
+
+  /* BUILD:agents START */
+  /* ------------------------------------------------------------------ 15: multi-agent orchestration */
+  /* BUILD:agents END */
+
+  /* BUILD:hitl START */
+  /* ------------------------------------------------------------------ 16: human in the loop */
+  /* BUILD:hitl END */
+
+  /* BUILD:observe START */
+  /* ------------------------------------------------------------------ 17: LangSmith observability */
+  /* BUILD:observe END */
+
+  /* ------------------------------------------------------------------ 19: four routes */
   const PATHS = [
     { title: 'A · Use an open-weight model as it is',
       desc: 'Download a strong open model, run it on our own server and give people a private chat window. Everything stays private, but the model only knows what it learned in training. It knows nothing about our company.',
@@ -841,6 +881,10 @@
   }
   pathCards.forEach((c, i) => c.addEventListener('click', () => selectPath(i)));
   selectPath(1);
+
+  /* BUILD:polish START */
+  /* ------------------------------------------------------------------ deck-wide polish */
+  /* BUILD:polish END */
 
   /* ------------------------------------------------------------------ start */
   function relayout() {

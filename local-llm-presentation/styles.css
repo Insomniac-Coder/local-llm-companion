@@ -261,7 +261,15 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .loop-text { min-height: 3.6em; }
 .loop-text .new { animation: tok-in 0.8s ease-out; border-radius: 0.12em; }
 
-/* 5 statement slide */
+/* BUILD:controls START */
+/* 5 temperature and top-K */
+/* BUILD:controls END */
+
+/* BUILD:memory START */
+/* 6 memory: without and with */
+/* BUILD:memory END */
+
+/* 7 statement slide */
 .pad.statement { justify-content: center; gap: 44px; }
 .statement-title { font-size: 104px; font-weight: 700; line-height: 0.98; letter-spacing: -0.035em; max-width: 12ch; }
 .three { display: grid; grid-template-columns: repeat(3, 1fr); gap: 40px; }
@@ -271,7 +279,7 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .statement-foot { font-size: 25px; line-height: 1.5; color: var(--ink-2); max-width: 58ch; }
 .statement-foot b { color: var(--ours); }
 
-/* 6 glossary */
+/* 8 glossary */
 .gl { display: grid; grid-template-columns: 1fr 560px; gap: 40px; flex: 1; min-height: 0; }
 .gl-left { display: grid; gap: 18px; align-content: start; }
 .gl-controls { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; }
@@ -300,7 +308,7 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .gd-tech-label { font: 600 13px/1 var(--mono); letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); margin-top: 4px; }
 .gd-tech { font-size: 16.5px; line-height: 1.5; color: var(--ink-2); }
 
-/* 7 myths: ten on one slide */
+/* 9 myths: ten on one slide */
 .myth-count { font: 500 16px/1.3 var(--mono); color: var(--muted); white-space: nowrap; }
 .myth-num { color: var(--ours-ink); font-weight: 600; }
 .myth-grid { display: grid; grid-template-columns: repeat(5, 1fr); grid-auto-rows: 1fr; gap: 16px; flex: 1; min-height: 0; }
@@ -322,7 +330,7 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .myth-hint { margin-top: auto; font: 500 14px/1 var(--mono); color: var(--muted); }
 .myth-real { font-size: 15px; line-height: 1.45; color: #0b1a2c; }
 
-/* 8 rent or own: table */
+/* 10 rent or own: table */
 .table-wrap { overflow: hidden; }
 .cmp { width: 100%; border-collapse: collapse; font-size: 18px; }
 .cmp th, .cmp td { text-align: left; vertical-align: middle; padding: 12px 24px; border-bottom: 1px solid var(--line); line-height: 1.35; }
@@ -337,7 +345,7 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .cmp tr.em td:last-child { font-weight: 600; }
 .fair { font-size: 18px; color: var(--ink-2); max-width: 110ch; }
 
-/* 9 cost */
+/* 11 cost */
 .grid-line { stroke: var(--line); stroke-width: 1; }
 .svg-label { fill: var(--muted); font: 400 12px var(--mono); }
 .calc { display: grid; grid-template-columns: 430px 250px 1fr; gap: 40px; padding: 30px 34px; align-items: start; }
@@ -375,7 +383,7 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .calc-compare { font-size: 15.5px; line-height: 1.45; color: var(--ink-2); }
 .calc-compare b { color: var(--ink); font-weight: 600; }
 
-/* 10 where it pays off: evidence beside the departments */
+/* 12 where it pays off: evidence beside the departments */
 .pays { display: grid; grid-template-columns: 380px 1fr; gap: 48px; align-items: start; }
 .ev-list { display: grid; gap: 24px; align-content: start; }
 .ev { display: grid; gap: 8px; align-content: start; padding-top: 16px; border-top: 3px solid var(--ink); }
@@ -400,7 +408,7 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .src { font: 400 14px/1 var(--mono); color: #0b1a2c; padding: 7px 12px; border-radius: 999px; background: var(--hl3); animation: pop 0.3s ease-out backwards; }
 .src::before { content: "Source · "; opacity: 0.6; }
 
-/* 11 harness */
+/* 13 harness */
 .harness-intro { display: grid; grid-template-columns: 1fr 360px; gap: 56px; align-items: center; }
 .hi-text { display: grid; gap: 18px; }
 .hi-text h2 { max-width: 20ch; }
@@ -417,7 +425,23 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .callout p { font-size: 17px; line-height: 1.5; color: var(--ink-2); }
 .control-list li { padding-top: 14px; border-top: 2px solid var(--ink); font-size: 18.5px; line-height: 1.45; color: var(--ink-2); }
 
-/* 12 companion */
+/* BUILD:rag START */
+/* 14 RAG pipeline and ChromaDB ingestion */
+/* BUILD:rag END */
+
+/* BUILD:agents START */
+/* 15 multi-agent orchestration */
+/* BUILD:agents END */
+
+/* BUILD:hitl START */
+/* 16 human in the loop */
+/* BUILD:hitl END */
+
+/* BUILD:observe START */
+/* 17 LangSmith observability */
+/* BUILD:observe END */
+
+/* 18 companion */
 .proof { display: grid; grid-template-columns: 1fr 1fr; gap: 56px; align-items: center; flex: 1; }
 .proof-text { display: grid; gap: 18px; align-content: center; }
 .proof-text p:not(.eyebrow) { font-size: 20px; line-height: 1.55; color: var(--ink-2); }
@@ -427,7 +451,7 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .stat-unit { font: 600 13px/1.3 var(--mono); letter-spacing: 0.1em; text-transform: uppercase; color: var(--ours-ink); }
 .stat p:last-child { font-size: 16px; line-height: 1.45; color: var(--ink-2); }
 
-/* 13 routes */
+/* 19 routes */
 .kv { display: grid; gap: 12px; }
 .kv dt { font: 400 14px/1.3 var(--mono); color: var(--muted); margin-bottom: 2px; }
 .kv dd { font-size: 19px; color: var(--ink); line-height: 1.4; }
@@ -470,7 +494,7 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .reco-flow li:first-child b { color: rgba(255, 255, 255, 0.8); }
 .reco-flow s { color: var(--muted); text-decoration-color: var(--faint); }
 
-/* 14 plan */
+/* 20 plan */
 .timeline { list-style: none; padding: 0; display: grid; grid-template-columns: repeat(4, 1fr); position: relative; margin-top: 16px; }
 .timeline::before, .timeline::after { content: ""; position: absolute; left: 0; top: 0; height: 3px; border-radius: 2px; }
 .timeline::before { right: 0; background: var(--line); }
@@ -578,3 +602,7 @@ html[data-tone="dark"] .bar-fill { background: #34d399; }
 
 #hostSeg { display: inline-flex; flex: none; flex-wrap: nowrap; white-space: nowrap; }
 .flow #hostSeg { flex-wrap: wrap; white-space: normal; }
+
+/* BUILD:polish START */
+/* deck-wide polish: per-slide motion and finish */
+/* BUILD:polish END */
