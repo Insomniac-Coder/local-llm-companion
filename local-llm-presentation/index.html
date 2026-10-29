@@ -469,9 +469,9 @@
       </article>
     </div>
     <ul class="mem-facts">
-      <li class="rv" style="--d:5"><b>The model does not learn.</b> Memory is resent text, not training, kept in our own database under our retention policy.</li>
-      <li class="rv" style="--d:6"><b>Memory costs tokens.</b> Every turn resends the thread, so the PC Companion trims or summarises long ones.</li>
-      <li class="rv" style="--d:7"><b>Two kinds of memory.</b> The thread is short-term; long-term facts such as “Priya works in Finance” sit in a separate store.</li>
+      <li class="rv" style="--d:5"><b>The model does not learn.</b> Memory is re-sent text, not training, kept in our own database under our retention policy.</li>
+      <li class="rv" style="--d:6"><b>Memory costs tokens.</b> Every turn re-sends the thread, so the harness (the software around the model) trims or summarises long ones.</li>
+      <li class="rv" style="--d:7"><b>Two kinds of memory.</b> The thread is short&#8209;term; long&#8209;term facts such as “Priya works in Finance” sit in a separate store.</li>
     </ul>
     <details class="eng-note"><summary>Engineer's note</summary><p>Chat-completion APIs, like the model behind them, are stateless: every call carries the full list of messages, and the model keeps nothing between calls. In LangGraph, memory comes from a <b>checkpointer</b> passed to <code>compile()</code>: <code>InMemorySaver</code> for development, <code>SqliteSaver</code> on a single machine, <code>PostgresSaver</code> in production. Each call names its thread with <code>config={"configurable": {"thread_id": "finance-priya-0412"}}</code>; the graph state is saved after every step, so the next call on that thread, even after a restart (with a database-backed checkpointer), carries on from the saved state. The <code>messages</code> key uses the <code>add_messages</code> reducer, which appends new messages instead of overwriting the list.</p><p>To stay inside the context window, <code>trim_messages</code> keeps the system prompt and the most recent turns within a token budget, or a summarisation node replaces older turns with a short summary. Long-term memory is a separate <b>store</b> (<code>InMemoryStore</code>, <code>PostgresStore</code>) with per-user namespaces such as <code>("memories", user_id)</code>, shared across threads. Prompt caching (prefix caching in vLLM and llama.cpp) makes resending an unchanged start of the thread cheap. Threads and stored facts live in our own database under our retention policy, so deleting a thread deletes the memory. Token counts on the slide are illustrative; retrieved documents would add to them.</p></details>
   </div></div>
@@ -830,12 +830,20 @@
 <!-- BUILD:agents END -->
 
 <!-- BUILD:hitl START -->
-<!-- ================================================================ 16 · HUMAN IN THE LOOP -->
+<!-- ================================================================ 14 · HUMAN IN THE LOOP -->
 <section class="slide" id="hitl" data-label="12 · Human in the loop">
   <div class="frame"><div class="pad">
     <header class="s-head">
-      <p class="eyebrow rv"><span class="ch">12</span> Human in the loop</p>
-      <h2 data-gen>The agent proposes. A person decides.</h2>
+      <div class="s-head-row rag-head">
+        <div>
+          <p class="eyebrow rv"><span class="ch">12</span> Human in the loop</p>
+          <h2 data-gen>The agent proposes. A person decides.</h2>
+        </div>
+        <p class="rag-ring rv" style="--d:2">
+          <svg viewBox="0 0 64 64" aria-hidden="true"><circle class="rag-ring-c" cx="32" cy="32" r="30"/><circle class="rag-ring-c on" cx="32" cy="32" r="25"/><circle class="rag-ring-c" cx="32" cy="32" r="20"/><circle class="rag-ring-c" cx="32" cy="32" r="15"/><circle class="rag-ring-c" cx="32" cy="32" r="10"/><circle class="rag-ring-core" cx="32" cy="32" r="5.5"/></svg>
+          <span>The harness, opened: <b>rules</b>, so high&#8209;impact actions wait for a person</span>
+        </p>
+      </div>
       <p class="sub hitl-sub rv" style="--d:2">Before a high-impact action, LangGraph saves the run at a checkpoint and stops until a person approves, edits or rejects the plan.</p>
     </header>
     <div class="hitl-track rv" style="--d:3">

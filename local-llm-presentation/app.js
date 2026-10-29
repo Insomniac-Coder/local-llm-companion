@@ -1206,7 +1206,7 @@
     const out = [];
     let glue = false;
     for (const t of tokenize(text)) {
-      if (t[0] === ' ' && out.length) {
+      if (t[0] === '\u00a0' && out.length) {
         let k = out.length - 1;
         while (k > 0 && !/^[ \n]/.test(out[k])) k--;
         out.push(out.splice(k).join('') + t);
@@ -1258,7 +1258,7 @@
     void s1.chat.offsetHeight;
     wrap.style.height = pill.offsetHeight + 'px';
     old.forEach(g => { g.style.height = '0px'; g.style.opacity = '0'; g.style.marginTop = '0px'; });
-    await sleep(600); if (!memOk(me)) return null;
+    await sleep(750); if (!memOk(me)) return null;   // fade 0.18 s, then collapse 0.5 s after a 0.15 s delay
     old.forEach(g => g.remove());
     wrap.classList.remove('mem-going');
     wrap.style.height = '';
@@ -2365,7 +2365,7 @@
   /* BUILD:agents END */
 
   /* BUILD:hitl START */
-  /* ------------------------------------------------------------------ 16: human in the loop */
+  /* ------------------------------------------------------------------ 14: human in the loop */
   // The run plays up to the checkpoint and stops there. Nothing happens until the presenter approves, edits or
   // rejects; each choice resumes the same run from checkpoint 7. "Restart the server" wipes the screen and
   // restores the run from the saved checkpoint, still waiting.
@@ -2400,6 +2400,7 @@
     $('#hitlMore').disabled = hitlReplicas >= 6;
     hitlBtn.approve.textContent = on && hitlReplicas !== 4 ? `Approve ${hitlReplicas} replicas` : 'Approve';
     hitlBtn.edit.textContent = on ? 'Cancel edit' : 'Edit';
+    $('#hitlActions').classList.toggle('editing', on);   // the approve button keeps its long width, so Cancel edit stays put
     hitlBtn.reject.hidden = on;
   }
   function hitlReset() {
@@ -2472,7 +2473,7 @@
     $('#hitlDecideLabel').textContent = reject ? 'Rejected' : kind === 'edit' ? 'Edited' : 'Approved';
     $('#hitlDecideNote').textContent = kind === 'edit' ? `${n} replicas, not 4` : 'on-call engineer';
     const stamp = $('#hitlDecision');
-    stamp.textContent = reject ? 'Rejected by the on-call engineer · no change · 10:42 · logged' : kind === 'edit' ? 'Approved with an edit by the on-call engineer · 10:42 · logged' : 'Approved by the on-call engineer · 10:42 · logged';
+    stamp.textContent = reject ? 'Rejected by the on-call engineer · no change · 10:42 · logged' : kind === 'edit' ? `Edited to ${n} replicas by the on-call engineer · 10:42 · logged` : 'Approved by the on-call engineer · 10:42 · logged';
     stamp.className = 'hitl-decision' + (reject ? ' no' : '');
     $('#hitlActions').hidden = true;
     stamp.hidden = false;
