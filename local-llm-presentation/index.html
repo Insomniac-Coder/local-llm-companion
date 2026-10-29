@@ -191,11 +191,76 @@
 <!-- BUILD:memory START -->
 <!-- ================================================================ 6 · MEMORY -->
 <section class="slide" id="memory" data-label="05 · Memory">
-  <div class="frame"><div class="pad">
+  <div class="frame"><div class="pad mem-pad">
     <header class="s-head">
       <p class="eyebrow rv"><span class="ch">05</span> Memory</p>
-      <h2 data-gen>Memory</h2>
+      <h2 data-gen>The model forgets. The harness remembers.</h2>
     </header>
+    <div class="mem-stage">
+      <article class="mem-pane card rv" style="--d:2" id="memPane0" data-side="0" aria-labelledby="memTitle0">
+        <header class="mem-head">
+          <p class="mem-title" id="memTitle0"><span class="mem-led" aria-hidden="true"></span>Without memory <span class="mem-kind">· stateless</span></p>
+          <p class="mem-badge" id="memBadge0">no thread_id · nothing saved</p>
+        </header>
+        <div class="mem-body">
+          <div class="mem-chat" id="memChat0" aria-live="polite"></div>
+          <footer class="mem-insp">
+            <div class="mem-insp-main">
+              <p class="mem-insp-label">What the model receives this turn</p>
+              <div class="mem-chips" id="memChips0"></div>
+            </div>
+            <div class="mem-meter">
+              <span class="mem-hist" aria-hidden="true"><span class="mem-cols" id="memCols0"><i></i><i></i><i></i><i></i></span><span>per turn</span></span>
+              <p class="mem-count"><b id="memCount0">0</b><span>tokens</span></p>
+            </div>
+          </footer>
+          <div class="mem-cover" id="memCover0" hidden><span class="mem-cover-icon" aria-hidden="true"></span><p></p></div>
+        </div>
+      </article>
+
+      <div class="mem-spine rv" style="--d:3">
+        <div class="mem-who" id="memWho" aria-hidden="true">
+          <span class="mem-wire"></span>
+          <span class="mem-packet l"></span><span class="mem-packet r"></span>
+          <span class="mem-avatar">P</span>
+        </div>
+        <p class="mem-same">Priya sends the same messages to both apps</p>
+        <div class="mem-controls" role="group" aria-label="Play the conversation">
+          <p class="mem-step" id="memStep" aria-live="polite">Turn 1 of 3</p>
+          <button type="button" class="btn btn-primary" id="memNext">Next message</button>
+          <button type="button" class="btn mem-tomorrow" id="memTomorrow" disabled>Come back tomorrow</button>
+          <button type="button" class="btn btn-small" id="memReplay">Replay</button>
+        </div>
+        <p class="mem-illus">Token counts are illustrative</p>
+      </div>
+
+      <article class="mem-pane mem-keeps card rv" style="--d:4" id="memPane1" data-side="1" aria-labelledby="memTitle1">
+        <header class="mem-head">
+          <p class="mem-title" id="memTitle1"><span class="mem-led" aria-hidden="true"></span>With memory <span class="mem-kind">· a saved thread</span></p>
+          <p class="mem-badge" id="memBadge1">thread_id: finance-priya-0412</p>
+        </header>
+        <div class="mem-body">
+          <div class="mem-chat" id="memChat1" aria-live="polite"></div>
+          <footer class="mem-insp">
+            <div class="mem-insp-main">
+              <p class="mem-insp-label">What the model receives this turn</p>
+              <div class="mem-chips" id="memChips1"></div>
+            </div>
+            <div class="mem-meter">
+              <span class="mem-hist" aria-hidden="true"><span class="mem-cols" id="memCols1"><i></i><i></i><i></i><i></i></span><span>per turn</span></span>
+              <p class="mem-count"><b id="memCount1">0</b><span>tokens</span></p>
+            </div>
+          </footer>
+          <div class="mem-cover" id="memCover1" hidden><span class="mem-cover-icon" aria-hidden="true"></span><p></p></div>
+        </div>
+      </article>
+    </div>
+    <ul class="mem-facts">
+      <li class="rv" style="--d:5"><b>The model does not learn.</b> Memory is re-sent text, not training, kept in our own database under our retention policy.</li>
+      <li class="rv" style="--d:6"><b>Memory costs tokens.</b> Every turn resends the thread, so the PC Companion trims or summarises long ones.</li>
+      <li class="rv" style="--d:7"><b>Two kinds of memory.</b> The thread is short-term; long-term facts such as “Priya works in Finance” sit in a separate store.</li>
+    </ul>
+    <details class="eng-note"><summary>Engineer's note</summary><p>Chat model APIs are stateless: every call carries the full list of messages, and the model keeps nothing between calls. In LangGraph, memory comes from a <b>checkpointer</b> passed to <code>compile()</code>: <code>InMemorySaver</code> for development, <code>SqliteSaver</code> or <code>PostgresSaver</code> in production. Each call names its thread with <code>config={"configurable": {"thread_id": "finance-priya-0412"}}</code>; the graph state is saved after every step, so the next call on that thread, even after a restart, carries on from the saved state. The <code>messages</code> key uses the <code>add_messages</code> reducer, which appends new messages instead of overwriting the list.</p><p>To stay inside the context window, <code>trim_messages</code> keeps the system prompt and the most recent turns within a token budget, or a summarisation node replaces older turns with a short summary. Long-term memory is a separate <b>store</b> (<code>InMemoryStore</code>, <code>PostgresStore</code>) with per-user namespaces such as <code>("memories", user_id)</code>, shared across threads. Prompt caching (prefix caching in vLLM and llama.cpp) makes resending an unchanged start of the thread cheap. Threads and stored facts live in our own database under our retention policy, so deleting a thread deletes the memory. Token counts on the slide are illustrative; retrieved documents would add to them.</p></details>
   </div></div>
 </section>
 <!-- BUILD:memory END -->

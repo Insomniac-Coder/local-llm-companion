@@ -492,6 +492,272 @@
 
   /* BUILD:memory START */
   /* ------------------------------------------------------------------ 6: memory: without and with */
+  // Two chat apps get the same messages from Priya. The stateless one sends the model only the newest message; the
+  // one with memory sends the whole thread every turn and saves it under its thread_id after every step. "Come back
+  // tomorrow" closes both apps: only the saved thread comes back. Token counts are illustrative: the deck's
+  // tokenizer, plus 4 tokens of chat formatting per message, plus a short system prompt.
+  const MEM_TURNS = [
+    { q: 'I’m Priya from Finance. Summarise last month’s travel report.',
+      a: ['Travel spend was 18% over budget, mainly because of two unplanned client visits and higher airfares.',
+        'Travel spend was 18% over budget, mainly because of two unplanned client visits and higher airfares.'],
+      ref: [null, null] },
+    { q: 'And without those two visits?',
+      a: ['Which visits do you mean? I can’t see any earlier messages.', 'Without those two visits, travel was 3% under budget.'],
+      ref: ['no history', 'used: turn 1'] },
+    { q: 'Draft a two-line note to my team about it.',
+      a: ['Happy to help. Who is your team, and what should the note say?',
+        'Hi team: travel was 18% over budget last month because of two unplanned client visits. Without them, we were 3% under. Thanks,\u00a0Priya'],
+      ref: ['no history', 'used: turns 1, 2'] },
+    { q: 'Morning! Can you shorten that note to one line?',
+      a: ['Which note do you mean? This looks like a new conversation.', 'Hi team: two unplanned client visits put travel 18% over budget last month.\u00a0Priya'],
+      ref: ['no history', 'used: saved thread'] },
+  ];
+  const MEM_SYS = 28;
+  const memTok = t => tokenize(t).length + 4;
+  const memSide = [0, 1].map(k => ({
+    chat: $('#memChat' + k), chips: $('#memChips' + k), count: $('#memCount' + k), cols: $$('#memCols' + k + ' i'),
+    cover: $('#memCover' + k), badge: $('#memBadge' + k), shown: 0,
+  }));
+  const memBtn = { next: $('#memNext'), tomorrow: $('#memTomorrow'), replay: $('#memReplay') };
+  const memWho = $('#memWho'), memStepEl = $('#memStep');
+  let memRun = 0, memAt = 0, memBusy = false, memAuto = true;
+  const memOk = me => me === memRun && isActive('memory');
+  const memRestart = (n, cls) => { n.classList.remove(cls); void n.offsetWidth; n.classList.add(cls); };
+
+  // what the model receives at turn n (1–4): the stateless app sends the system prompt and the newest message only
+  function memSent(s, n) {
+    const you = k => ({ label: 'Priya ' + k, cls: 'you', tok: memTok(MEM_TURNS[k - 1].q) });
+    const ai = k => ({ label: 'AI ' + k, cls: 'ai', tok: memTok(MEM_TURNS[k - 1].a[s]) });
+    const list = [{ label: 'System', cls: 'sys', tok: MEM_SYS }];
+    if (n === 4) {
+      if (s) list.push({ label: 'Yesterday’s thread · 6', cls: 'thread', tok: [1, 2, 3].reduce((t, k) => t + you(k).tok + ai(k).tok, 0) });
+    } else {
+      for (let k = 1; k < n; k++) list.push(...[you(k), ai(k)].map(c => (s ? c : { ...c, cls: 'ghost', tok: 0 })));
+    }
+    list.push(you(n));
+    return list;
+  }
+  const memTotal = (s, n) => memSent(s, n).reduce((t, c) => t + c.tok, 0);
+  const memShow = v => (v >= 1 ? '~' + Math.max(5, Math.round(v / 5) * 5) : '0');
+  const MEM_MAX = Math.max(...[1, 2, 3, 4].map(n => memTotal(1, n)));
+
+  function memChip(c, animate) {
+    const n = el('span', 'mem-chip ' + c.cls, c.label);
+    if (c.cls === 'ghost') { n.title = 'Shown on screen, not sent to the model'; n.setAttribute('aria-label', c.label + ', not sent'); }
+    if (!animate) n.style.animation = 'none';
+    return n;
+  }
+  function memCountTo(side, to, animate) {
+    const from = side.shown;
+    side.shown = to;
+    if (!animate || reduced) { side.count.textContent = memShow(to); return; }
+    const me = memRun, t0 = performance.now();
+    const tick = now => {
+      if (me !== memRun) return;
+      const k = clamp((now - t0) / 320);
+      side.count.textContent = memShow(from + (to - from) * (1 - Math.pow(1 - k, 3)));
+      if (k < 1) requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
+  function memCols(s, n) {
+    memSide[s].cols.forEach((c, k) => {
+      c.style.setProperty('--h', k < n ? (memTotal(s, k + 1) / MEM_MAX).toFixed(3) : 0);
+      c.classList.toggle('now', k === n - 1);
+    });
+  }
+
+  // chat pieces
+  const memStill = n => { n.style.animation = 'none'; return n; };
+  function memRef(a, s, n, animate) {
+    const r = MEM_TURNS[n - 1].ref[s];
+    if (!r) return;
+    const c = el('span', 'mem-ref' + (s ? '' : ' no'), r);
+    a.append(' ', animate ? c : memStill(c));   // a real space, so a wrapped chip starts flush left
+  }
+  function memA(s, n, full) {
+    const a = el('p', 'mem-msg mem-a' + (!s && n > 1 ? ' lost' : ''));
+    if (full) { a.append(el('span', 'mem-text', MEM_TURNS[n - 1].a[s])); memRef(a, s, n, false); }
+    else a.innerHTML = '<span class="mem-dots" role="img" aria-label="Writing"><i></i><i></i><i></i></span>';
+    return a;
+  }
+  function memTurnEl(s, n, full, animate) {
+    const g = el('div', 'mem-turn');
+    g.dataset.t = n;
+    g.append(el('p', 'mem-msg mem-q' + (animate ? ' mem-in' : ''), MEM_TURNS[n - 1].q));
+    if (full) g.append(memA(s, n, true));
+    return g;
+  }
+  const memLine = (cls, text, animate) => { const n = el('p', cls, text); return animate ? n : memStill(n); };
+  const memReceipt = (s, animate, text) => memLine('mem-receipt', text || (s ? '✓ saved to the thread' : 'nothing saved'), animate);
+  function memFoldEl(animate) {
+    const w = el('div', 'mem-foldwrap');
+    w.append(memStill(el('p', 'mem-fold', 'Yesterday · 4 earlier messages')));
+    if (!animate) memStill(w);
+    return w;
+  }
+  function memCover(side, kind, text, id) {
+    side.cover.className = 'mem-cover' + (kind === 'loading' ? ' loading' : '');
+    $('p', side.cover).textContent = text;
+    if (id) $('p', side.cover).append(el('span', 'mem-cover-id', id));
+    side.cover.hidden = false;
+  }
+
+  function memControls() {
+    memStepEl.textContent = memAt === 4 ? 'Next morning' : `Turn ${Math.max(1, memAt)} of 3`;
+    memBtn.next.disabled = memAt >= 3;
+    memBtn.tomorrow.disabled = memAt !== 3;
+    memBtn.tomorrow.classList.toggle('invite', memAt === 3 && !memBusy);
+  }
+
+  // the finished state after turn n (0–3, or 4 for the next morning), drawn without motion
+  function memRender(n) {
+    memRun++;
+    memAt = n;
+    memBusy = false;
+    memSide.forEach((side, s) => {
+      side.cover.hidden = true;
+      side.chat.classList.remove('mem-off');
+      side.chat.removeAttribute('aria-busy');
+      const kids = [];
+      if (n === 4) {
+        if (s) kids.push(memFoldEl(false), memTurnEl(s, 3, true), memLine('mem-day', 'Next morning · same thread'));
+        else kids.push(memLine('mem-day', 'Next morning · new conversation'));
+        kids.push(memTurnEl(s, 4, true));
+      } else {
+        for (let k = 1; k <= n; k++) kids.push(memTurnEl(s, k, true));
+      }
+      if (n) kids.push(memReceipt(s, false));
+      side.chat.replaceChildren(...kids);
+      side.chips.replaceChildren(...(n ? memSent(s, n).map(c => memChip(c, false)) : []));
+      memCountTo(side, n ? memTotal(s, n) : 0, false);
+      memCols(s, n);
+    });
+    memControls();
+  }
+
+  // the harness builds this turn's request: each message it sends lights up as its chip joins the stack
+  async function memSend(s, n, me) {
+    const side = memSide[s];
+    const list = memSent(s, n);
+    const msgs = $$('.mem-msg, .mem-fold', side.chat);
+    side.chips.replaceChildren();
+    memCountTo(side, 0, false);
+    let k = 0, sum = 0;
+    for (const c of list) {
+      if (me !== memRun) return;
+      side.chips.append(memChip(c, true));
+      const lit = c.cls === 'thread' ? msgs.slice(0, -1) : c === list[list.length - 1] ? [msgs[msgs.length - 1]] : c.cls === 'ghost' || c.cls === 'sys' ? [] : [msgs[k++]];
+      lit.forEach(m => m && memRestart(m, 'mem-lit'));
+      sum += c.tok;
+      memCountTo(side, sum, true);
+      await sleep(c.cls === 'ghost' ? 90 : 170);
+    }
+    memCols(s, n);
+  }
+  async function memType(a, s, n, me) {
+    const span = el('span', 'mem-text');
+    a.replaceChildren(span);
+    for (const t of tokenize(MEM_TURNS[n - 1].a[s])) {
+      if (me !== memRun) return;
+      span.textContent += t;
+      await sleep(34);
+    }
+    memRef(a, s, n, true);
+  }
+
+  // overnight: both apps close; only the one with a thread_id gets its conversation back
+  async function memMorning(me) {
+    const [s0, s1] = memSide;
+    memSide.forEach(side => { side.chat.classList.add('mem-off'); memCover(side, 'night', 'Priya closes the app for the night'); });
+    await sleep(1500); if (!memOk(me)) return null;
+    s0.chat.replaceChildren(memLine('mem-day', 'Next morning · new conversation', true));
+    s0.chips.replaceChildren();
+    memCountTo(s0, 0, true);
+    s0.chat.classList.remove('mem-off');
+    s0.cover.hidden = true;
+    memCover(s1, 'loading', 'Loading the saved thread', 'thread_id: finance-priya-0412');
+    await sleep(1400); if (!memOk(me)) return null;
+    s1.chat.replaceChildren(...[1, 2, 3].map(k => memTurnEl(1, k, true)), memReceipt(1, true, '✓ thread restored from our database'));
+    $$('.mem-msg', s1.chat).forEach((m, k) => { m.classList.add('mem-restore'); m.style.setProperty('--k', k); });
+    s1.chat.classList.remove('mem-off');
+    s1.cover.hidden = true;
+    memRestart(s1.badge, 'mem-save');
+    await sleep(2300); if (!memOk(me)) return null;
+    // Priya carries on: yesterday's first two turns fold away to make room, but they are still sent
+    s1.chat.querySelector('.mem-receipt')?.remove();
+    const old = $$('.mem-turn', s1.chat).filter(g => +g.dataset.t < 3);
+    const wrap = memFoldEl(true);
+    wrap.classList.add('mem-going');
+    wrap.style.height = '0px';
+    wrap.style.opacity = '0';
+    s1.chat.prepend(wrap);
+    old.forEach(g => { g.style.height = g.offsetHeight + 'px'; g.classList.add('mem-going'); });
+    void s1.chat.offsetHeight;
+    wrap.style.height = wrap.firstChild.offsetHeight + 'px';
+    wrap.style.opacity = '1';
+    old.forEach(g => { g.style.height = '0px'; g.style.opacity = '0'; g.style.marginTop = '0px'; });
+    await sleep(600); if (!memOk(me)) return null;
+    old.forEach(g => g.remove());
+    wrap.classList.remove('mem-going');
+    wrap.style.height = '';
+    s1.chat.append(memLine('mem-day', 'Next morning · same thread', true));
+    await sleep(350); if (!memOk(me)) return null;
+    return memSide.map((side, s) => { const g = memTurnEl(s, 4, false, true); side.chat.append(g); return g; });
+  }
+
+  // one turn, animated from the finished state of the turn before
+  async function memPlay(n) {
+    const me = ++memRun;
+    memAt = n;
+    memBusy = true;
+    memControls();
+    memSide.forEach(side => side.chat.querySelector('.mem-receipt')?.remove());
+    const groups = n === 4 ? await memMorning(me) : memSide.map((side, s) => { const g = memTurnEl(s, n, false, true); side.chat.append(g); return g; });
+    if (!groups || !memOk(me)) return;
+    memRestart(memWho, 'send');
+    await sleep(500); if (!memOk(me)) return;
+    await Promise.all([0, 1].map(s => memSend(s, n, me)));
+    await sleep(300); if (!memOk(me)) return;
+    const as = groups.map((g, s) => { const a = memA(s, n, false); a.classList.add('mem-in'); g.append(a); return a; });
+    await sleep(700); if (!memOk(me)) return;
+    memSide.forEach(side => side.chat.setAttribute('aria-busy', 'true'));
+    await Promise.all(as.map((a, s) => memType(a, s, n, me)));
+    memSide.forEach(side => side.chat.removeAttribute('aria-busy'));
+    if (!memOk(me)) return;
+    await sleep(250); if (!memOk(me)) return;
+    memSide.forEach((side, s) => side.chat.append(memReceipt(s, true)));
+    memRestart(memSide[1].badge, 'mem-save');
+    memBusy = false;
+    memControls();
+    if (memAuto && n < 3) {
+      await sleep(3800);
+      if (memOk(me) && memAuto) memPlay(n + 1);
+    }
+  }
+  async function memStart(arriving) {
+    memRender(0);
+    if (reduced) { memRender(arriving ? 3 : 1); return; }
+    const me = memRun;
+    await sleep(arriving ? 900 : 300);
+    if (memOk(me)) memPlay(1);
+  }
+  memBtn.next.addEventListener('click', () => {
+    memAuto = false;
+    if (memAt >= 3) return;
+    const n = memAt;
+    if (memBusy) memRender(n);           // finish the turn on screen first
+    if (reduced) memRender(n + 1); else memPlay(n + 1);
+  });
+  memBtn.tomorrow.addEventListener('click', () => {
+    memAuto = false;
+    if (memAt !== 3) return;
+    if (memBusy) memRender(3);
+    if (reduced) memRender(4); else memPlay(4);
+  });
+  memBtn.replay.addEventListener('click', () => { memAuto = true; memStart(false); });
+  memRender(3);
+  hooks.memory = () => { memAuto = true; memStart(true); };
   /* BUILD:memory END */
 
   /* ------------------------------------------------------------------ 8: glossary */
