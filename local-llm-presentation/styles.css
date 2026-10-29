@@ -1497,7 +1497,9 @@ html[data-tone="dark"] .bar-fill { background: #34d399; }
   .deck .bar { grid-template-columns: minmax(150px, 1fr) minmax(120px, 300px) minmax(max-content, 1fr); gap: 18px; padding-left: 22px; }
 }
 /* too narrow for the slide's name beside the brand: the part name in the middle says where we are */
-@media (max-width: 1023px) { .deck .bar-label { display: none; } }
+/* the brand and the longest slide name need about 1,440 px; below that the name would be cut off, so it steps aside
+   (the eyebrow, the part name in the middle and the slide list still say where we are) */
+@media (max-width: 1439px) { .deck .bar-label { display: none; } }
 .pz-track { display: grid; gap: 7px; min-width: 0; }
 .flow .pz-track { display: none; }
 .pz-label {

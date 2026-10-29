@@ -1,7 +1,7 @@
 # The Next Word Is Ours
 
-An interactive slide deck for the AI Council, proposing that we run our own private AI: open-weight language
-models with our own harness and RAG. **Fifteen slides, about fifteen minutes, in three parts**:
+An interactive slide deck for the AI Council on LLMs and the systems around them: how language models work,
+how AI helps us, and the harness we have built around a model. **Fifteen slides, about fifteen minutes, in three parts**:
 
 1. **What an LLM is**: what it is and how large; how it learns; why a trained model is frozen and needs RAG; how
    it answers; temperature and top-K (a live instrument panel with a hallucination-risk gauge); memory, without and
@@ -12,7 +12,7 @@ models with our own harness and RAG. **Fifteen slides, about fifteen minutes, in
    loop: a run that pauses at a checkpoint for approval) and the audit log (LangSmith traces showing the agent and
    the model chosen for every step).
 
-The deck says "our own" or "private" AI throughout, never "local" or "in-house", and names no Chinese models.
+The deck never says "local" or "in-house", names no Chinese models and does not propose running models on laptops.
 Every slide has its own entrance; the bottom bar shows the three parts, **G** (or clicking the slide counter) opens
 a slide list, and the harness rings link to their slides. It is built for a PC screen.
 
