@@ -668,8 +668,17 @@
   <div class="frame"><div class="pad">
     <header class="s-head">
       <p class="eyebrow rv"><span class="ch">13</span> Multi-agent orchestration</p>
-      <h2 data-gen>Multi-agent orchestration</h2>
+      <h2 data-gen>One supervisor, three specialists</h2>
+      <p class="sub rv" style="--d:2">Our LangGraph proof of concept: a supervisor agent reads each request, decides what type it is and routes it to the agent built for that job.</p>
     </header>
+    <ul class="control-list rv" style="--d:3">
+      <li><b>Supervisor agent</b>: receives every request, classifies it and routes it; every result comes back to it. Runs on gpt&#8209;oss&#8209;20b.</li>
+      <li><b>RAG agent</b>: knowledge questions, answered from our documents through ChromaDB. Runs on gpt&#8209;oss&#8209;120b.</li>
+      <li><b>Infra agent</b>: infrastructure tasks such as checking, restarting or scaling a service. Runs on gpt&#8209;oss&#8209;120b.</li>
+      <li><b>General agent</b>: the fallback for drafting and general questions. Runs on gemma&#8209;3&#8209;27b.</li>
+      <li><b>Why a graph, not a chain</b>: it can loop back, keeps one shared state, chooses the next step at run time and recovers from failures.</li>
+      <li class="muted">The interactive diagram for this slide is being finished.</li>
+    </ul>
   </div></div>
 </section>
 <!-- BUILD:agents END -->
