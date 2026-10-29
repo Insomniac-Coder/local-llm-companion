@@ -219,29 +219,75 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .stage-stat b { display: block; font: 700 36px/1.1 var(--display); letter-spacing: -0.03em; margin-bottom: 4px; }
 .stage .stage-result { color: var(--muted); font-size: 17px; }
 
-/* 5 work: stepper */
-.stepper { display: grid; grid-template-columns: 560px 1fr; gap: 32px; flex: 1; min-height: 0; }
-.steps { list-style: none; padding: 0; display: grid; gap: 6px; align-content: start; }
+/* 5 work: stepper. A rail of seven steps on the left (it never moves: only colours change), one stage card on the
+   right whose seven panels are fixed-size diagrams (886 × 360 canvas px). Panel motion is CSS keyed to
+   .frame-v.is-on (and .is-out while a panel fades away, so nothing snaps mid-fade); app.js restarts it on every
+   activation and offsets it by --wk-t0 on arrival, so the slide's own entrance finishes first. */
+#work h2, #work .sub { max-width: none; }
+.stepper { display: grid; grid-template-columns: 460px 1fr; gap: 32px; flex: 1; min-height: 0; }
+.wk-rail { position: relative; display: flex; flex-direction: column; min-height: 0; }
+.wk-rail-svg { position: absolute; left: 0; top: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
+.wk-rail-line { fill: none; stroke: var(--line-2); stroke-width: 2; }
+.wk-rail-loop { fill: none; stroke: var(--line-2); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; transition: stroke 0.3s; }
+.wk-rail-head { fill: var(--line-2); transition: fill 0.3s; }
+#work.wk-at7 .wk-rail-loop { stroke: var(--ours); }
+#work.wk-at7 .wk-rail-head { fill: var(--ours); }
+.steps { list-style: none; margin: 0; padding: 0 0 0 30px; display: grid; gap: 4px; align-content: start; position: relative; }
 .step {
-  width: 100%; display: grid; grid-template-columns: 40px 1fr; column-gap: 14px; align-items: center; text-align: left;
-  padding: 11px 16px; border: 1px solid transparent; border-radius: 14px; background: transparent; cursor: pointer; transition: background-color 0.25s, border-color 0.25s;
+  width: 100%; display: grid; grid-template-columns: 34px 1fr; column-gap: 16px; row-gap: 1px; align-items: center; text-align: left;
+  padding: 9px 16px; border: 1px solid transparent; border-radius: 14px; background: transparent; cursor: pointer;
+  transition: background-color 0.25s, border-color 0.25s, box-shadow 0.25s;
 }
 .step:hover { background: var(--wash); }
-.step-n { width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center; font: 600 15px/1 var(--mono); border: 1.5px solid var(--line-2); color: var(--muted); transition: all 0.25s; }
-.step-t { font-weight: 600; font-size: 19.5px; color: var(--ink-2); }
-.step-d { grid-column: 2; display: none; font-size: 16.5px; line-height: 1.45; color: var(--ink-2); margin-top: 6px; }
+.step-n {
+  grid-row: 1 / span 2; width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center;
+  font: 600 15px/1 var(--mono); border: 1.5px solid var(--line-2); background: var(--paper); color: var(--muted);
+  transition: background-color 0.25s, border-color 0.25s, color 0.25s;
+}
+.step-t { font-weight: 600; font-size: 19px; line-height: 1.3; color: var(--ink-2); }
+.wk-tag { font: 400 14px/1.35 var(--mono); color: var(--muted); transition: color 0.25s; }
 .step.is-on { background: var(--paper); border-color: var(--line); box-shadow: var(--shadow); }
 .step.is-on .step-n { background: var(--ours); border-color: var(--ours); color: #fff; }
 .step.is-on .step-t { color: var(--ink); }
-.step.is-on .step-d { display: block; }
+.step.is-on .wk-tag { color: var(--ours-ink); }
+.wk-model { margin-top: auto; padding: 0 8px 2px 47px; font-size: 16px; line-height: 1.45; color: var(--muted); text-wrap: balance; }
+.wk-model b { color: var(--ink-2); }
+
 .stage-panel { position: relative; overflow: hidden; }
-.frame-v { position: absolute; inset: 0; padding: 22px 30px; display: flex; flex-direction: column; justify-content: center; gap: 14px; opacity: 0; transform: scale(0.985); transition: opacity 0.4s, transform 0.4s; pointer-events: none; }
-.frame-v.is-on { opacity: 1; transform: none; pointer-events: auto; }
-.fv-label { font: 500 14px/1 var(--mono); letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted); }
+.wk-prog { position: absolute; left: 0; right: 0; top: 0; height: 3px; z-index: 2; opacity: 0; transition: opacity 0.3s; pointer-events: none; }
+.wk-prog.is-on { opacity: 1; }
+.wk-prog i { display: block; height: 100%; background: var(--ours); transform-origin: left center; transform: scaleX(0); }
+.wk-prog.is-on i { animation: wk-prog var(--wk-dur, 6s) linear var(--wk-t0, 0s) forwards; }
+@keyframes wk-prog { to { transform: scaleX(1); } }
+.frame-v {
+  position: absolute; inset: 0; padding: 24px 30px 22px; display: flex; flex-direction: column;
+  opacity: 0; transform: scale(0.985); transition: opacity 0.2s, transform 0.2s; pointer-events: none;
+}
+/* the old panel is gone before the new one is more than faintly visible: two texts never sit on top of each other */
+.frame-v.is-on { opacity: 1; transform: none; pointer-events: auto; transition: opacity 0.35s 0.15s, transform 0.35s 0.15s; }
+.frame-v:not(.is-on):not(.is-out) { visibility: hidden; }   /* nothing in a hidden panel can take keyboard focus */
+.wk-kick { font: 600 14px/1.3 var(--mono); letter-spacing: 0.14em; text-transform: uppercase; color: var(--ours-ink); }
+.wk-desc { margin-top: 8px; min-height: 3em; font-size: 18.5px; line-height: 1.5; color: var(--ink-2); text-wrap: pretty; }
+.wk-dia { position: relative; flex: none; height: 360px; margin-top: 18px; }
+.wk-cap { margin-top: auto; font: 400 15px/1.5 var(--mono); color: var(--muted); text-wrap: pretty; }
+.wk-cap b { color: var(--ink-2); font-weight: 500; }
+.wk-lab { font: 500 13px/1.3 var(--mono); letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); }
+.wk-big { font: 650 30px/1.1 var(--display); letter-spacing: -0.02em; color: var(--ink); font-variation-settings: "opsz" 72; }
 .fv-text { font: 600 34px/1.2 var(--display); letter-spacing: -0.02em; }
 .fv-text.small { font-size: 22px; color: var(--ink-2); }
-.fv-arrow { font: 400 16px/1 var(--mono); color: var(--muted); }
-.tok-row, .pick { display: flex; flex-wrap: wrap; gap: 8px; }
+
+/* step 1: the sentence is marked token by token, then each token drops out as a chip with its ID */
+.wk-sent { margin-top: 8px; font: 600 34px/1.25 var(--display); letter-spacing: -0.02em; color: var(--ink); }
+.wk-m { background: linear-gradient(var(--hl), var(--hl)) left bottom / 100% 0.2em no-repeat; }
+.wk-cut { margin-top: 10px; font: 400 15px/1.4 var(--mono); color: var(--muted); }
+.tok-row { display: flex; flex-wrap: wrap; gap: 8px; }
+.wk-toks { margin-top: 12px; flex-wrap: nowrap; gap: 12px; align-items: flex-start; }
+.wk-tok { display: grid; justify-items: center; gap: 9px; }
+.wk-id { font: 500 15px/1.2 var(--mono); color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.wk-ids-note { align-self: flex-end; margin-left: 10px; font: 400 14px/1.3 var(--mono); color: var(--faint); white-space: nowrap; }
+.wk-tiles { position: absolute; left: 0; right: 0; bottom: 10px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+.wk-tile { background: var(--wash); border-radius: 14px; padding: 15px 20px 17px; }
+.wk-tile p:not(.wk-big) { margin-top: 6px; font-size: 16px; line-height: 1.4; color: var(--ink-2); }
 .tk-chip { font: 400 20px/1 var(--mono); padding: 9px 11px; border-radius: 8px; white-space: pre; background: var(--wash); color: #0b1a2c; transition: all 0.3s; }
 .tk-chip.hl1 { background: var(--hl1); }
 .tk-chip.hl2 { background: var(--hl2); }
@@ -250,23 +296,289 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .tk-chip.hl5 { background: var(--hl5); }
 .tk-chip.dim { opacity: 0.45; }
 .tk-chip.picked { background: var(--ours); color: #fff; transform: scale(1.12); }
-.tok-ids { font: 400 16px/1.4 var(--mono); color: var(--ink-2); }
-.tok-ids span { color: var(--faint); }
+#work .wk-pickrow .pick { gap: 16px; }   /* room for the picked chip's 1.12 scale */
+/* the old embedding strips (kept for anything else that uses them) */
 .emb { display: grid; gap: 7px; }
 .emb-row { display: grid; grid-template-columns: 7em 1fr; align-items: center; gap: 12px; font: 400 15px/1 var(--mono); color: var(--ink-2); }
 .emb-cells { display: grid; grid-template-columns: repeat(24, 1fr); gap: 3px; }
 .emb-cells i { height: 18px; border-radius: 3px; background: var(--ours); }
+
+/* step 2: ID → one row of the embedding table → its numbers → a place on the map of meaning */
+.wk-d2 { height: 338px; }
+.wk-ez { position: absolute; top: 0; bottom: 0; }
+.wk-ez-a { left: 0; width: 232px; }
+.wk-ez-b { left: 256px; width: 330px; }
+.wk-ez-c { left: 608px; width: 278px; }
+.wk-table { position: absolute; left: 102px; top: 26px; width: 130px; height: 260px; overflow: visible; }
+.wk-tcell { fill: var(--ink-2); }
+.wk-tlit { fill: var(--ours); }
+.wk-tring { fill: none; stroke: var(--ours); stroke-width: 1.5; }
+.wk-rowtag { position: absolute; left: 0; width: 86px; top: 52px; display: grid; justify-items: end; gap: 5px; }
+.wk-rowchip { font: 500 15px/1 var(--mono); padding: 5px 7px; border-radius: 6px; background: var(--hl4); color: #0b1a2c; }
+.wk-rowid { font: 500 13px/1.2 var(--mono); color: var(--ours-ink); white-space: nowrap; }
+.wk-tdim { position: absolute; left: 0; right: 0; top: 296px; font: 400 13px/1.4 var(--mono); color: var(--muted); }
+.wk-link { position: absolute; left: 102px; top: 0; width: 484px; height: 338px; overflow: visible; pointer-events: none; }
+.wk-band { fill: var(--ours); opacity: 0; }
+.wk-tarrow { fill: none; stroke: var(--ours); stroke-width: 2; stroke-linecap: round; }
+.wk-tarrow-h { fill: var(--ours); }
+.wk-vec { position: absolute; left: 0; right: 0; }
+.wk-vec[data-v="contract"] { top: 24px; }
+.wk-vec[data-v="agreement"] { top: 100px; }
+.wk-vec[data-v="picnic"] { top: 176px; }
+.wk-vname { font: 600 15px/1.3 var(--mono); color: var(--ink); }
+.wk-vec[data-v="picnic"] .wk-vname { color: var(--ink-2); }
+.wk-cells { margin-top: 5px; display: flex; gap: 4px; align-items: center; }
+.wk-cells i {
+  flex: none; width: 54px; height: 32px; border-radius: 6px; display: grid; place-items: center;
+  font: 500 13.5px/1 var(--mono); font-style: normal; color: #0b1a2c; font-variant-numeric: tabular-nums;
+  background: color-mix(in srgb, var(--wk-c) var(--wk-a), var(--paper));
+}
+.wk-cells .wk-more { width: auto; height: auto; background: none; padding: 0 2px; font-size: 16px; color: var(--muted); }
+.wk-foot { position: absolute; left: 0; right: 0; top: 250px; text-wrap: pretty; font: 400 13px/1.45 var(--mono); color: var(--muted); }
+.wk-map { position: absolute; left: 0; right: 0; top: 24px; height: 176px; border-radius: 12px; background: var(--wash); overflow: hidden; }
+.wk-halo { position: absolute; width: 132px; height: 132px; margin: -66px 0 0 -66px; border-radius: 50%; background: radial-gradient(closest-side, rgba(5, 150, 105, 0.16), rgba(5, 150, 105, 0.05) 70%, transparent); }
+.wk-dot { position: absolute; width: 10px; height: 10px; margin: -5px 0 0 -5px; border-radius: 50%; background: var(--ink-2); }
+.wk-dot.is-key { width: 14px; height: 14px; margin: -7px 0 0 -7px; background: var(--ours); box-shadow: 0 0 0 4px rgba(5, 150, 105, 0.18); }
+.wk-dot.is-far { background: var(--faint); }
+.wk-word { position: absolute; font: 500 14px/1 var(--mono); color: var(--ink-2); white-space: nowrap; transform: translateY(-50%); }
+.wk-word.is-key { font-weight: 600; color: var(--ours-ink); }
+.wk-word.is-far { color: var(--muted); }
+.wk-simlab { position: absolute; left: 0; top: 214px; }
+.wk-sims { position: absolute; left: 0; right: 0; top: 238px; display: grid; gap: 7px; }
+.wk-sim { display: grid; grid-template-columns: 90px 1fr 38px; gap: 10px; align-items: center; font: 400 14px/1.2 var(--mono); color: var(--ink-2); }
+.wk-sim-t { height: 8px; border-radius: 4px; background: var(--line); overflow: hidden; }
+.wk-sim-t i { display: block; height: 100%; width: 100%; border-radius: 4px; background: var(--ours); transform-origin: left center; transform: scaleX(var(--s)); }
+.wk-sim.is-far .wk-sim-t i { background: var(--faint); }
+.wk-sim b { font-weight: 600; color: var(--ink); text-align: right; font-variant-numeric: tabular-nums; }
+.wk-notes { margin-top: auto; text-wrap: pretty; display: grid; grid-template-columns: 300px 1fr; gap: 30px; font: 400 14px/1.45 var(--mono); color: var(--muted); }
+.wk-notes b { color: var(--ink-2); font-weight: 600; }
+
+/* step 3: attention lines from "bank", the weights under each word, and what "bank" mixes in */
 #attnSeg .seg-btn { font-size: 15px; padding: 8px 14px; }
-.attn-stage { position: relative; padding-top: 96px; }
+.attn-stage { position: absolute; left: 0; right: 0; top: 56px; height: 160px; }
 .attn-svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
-.attn-words { display: flex; flex-wrap: wrap; gap: 9px; position: relative; }
-.aw { font: 400 19px/1 var(--mono); padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line); background: color-mix(in srgb, var(--hl1) calc(var(--a, 0) * 100%), var(--paper)); transition: background-color 0.4s; }
-.aw.focus { border: 2px solid var(--ink); font-weight: 600; background: var(--paper); }
-.attn-line { fill: none; stroke: var(--ink); stroke-linecap: round; transition: opacity 0.4s; }
-.attn-meaning { font-size: 19px; color: var(--ink-2); }
+.attn-words { position: absolute; left: 0; top: 96px; display: flex; gap: 10px; }
+.aw { display: grid; justify-items: center; gap: 7px; }
+.aw-w { font: 400 19px/1 var(--mono); padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line); background: color-mix(in srgb, var(--hl1) calc(var(--a, 0) * 100%), var(--paper)); transition: background-color 0.4s; }
+.aw.focus .aw-w { border: 2px solid var(--ink); padding: 9px 11px; font-weight: 600; background: var(--paper); }
+.aw-p { font: 500 14px/1 var(--mono); color: var(--muted); font-variant-numeric: tabular-nums; }
+.aw.focus .aw-p { color: var(--ink); }
+.attn-line { fill: none; stroke: var(--ink); stroke-linecap: round; }
+.wk-mixlab { position: absolute; left: 0; top: 232px; }
+.wk-mix { position: absolute; left: 0; right: 0; top: 254px; height: 34px; display: flex; gap: 3px; }
+.wk-mix span {
+  flex: none; height: 100%; border-radius: 6px; display: grid; place-items: center; overflow: hidden; white-space: nowrap;
+  font: 500 14px/1 var(--mono); color: #0b1a2c; background: color-mix(in srgb, var(--hl1) var(--m, 30%), var(--paper));
+  border: 1px solid color-mix(in srgb, var(--hl1) 70%, var(--line));
+}
+.wk-mix span.is-self { background: var(--paper); border-color: var(--line-2); }
+.wk-heads { position: absolute; right: 0; top: 64px; width: 280px; }
+.wk-head { display: grid; grid-template-columns: 136px 1fr; gap: 14px; align-items: end; height: 40px; }
+.wk-head svg { width: 136px; height: 34px; overflow: visible; }
+.wk-head span { padding-bottom: 1px; font: 400 14px/1.2 var(--mono); color: var(--ink-2); white-space: nowrap; }
+.wk-hd { fill: var(--line-2); }
+.wk-hd.is-q { fill: var(--paper); stroke: var(--ink); stroke-width: 2; }
+.wk-ha { fill: none; stroke: var(--ink); stroke-linecap: round; }
+.attn-meaning { position: absolute; left: 0; right: 0; top: 306px; font-size: 19px; color: var(--ink-2); }
 .attn-meaning b { background: var(--hl1); padding: 0 4px; border-radius: 4px; color: #0b1a2c; }
-.loop-text { min-height: 3.6em; }
+
+/* step 4: 48 layers, a token's numbers rising through them, one layer zoomed in, the meaning gauge */
+.wk-stack { position: absolute; left: 80px; top: 6px; width: 300px; height: 336px; overflow: visible; }
+.wk-layer { fill: var(--line); }
+.wk-layer.is-done { fill: color-mix(in srgb, var(--wk-tint, var(--ours)) 30%, var(--line)); }
+.wk-layer.is-zoom { fill: var(--line-2); }
+.wk-layer.is-zoom.is-done { fill: color-mix(in srgb, var(--wk-tint, var(--ours)) 55%, var(--line)); }
+.wk-zline { stroke: var(--line-2); stroke-width: 1.5; stroke-dasharray: 3 4; fill: none; }
+.wk-lnum { position: absolute; left: 0; width: 68px; text-align: right; font: 400 13px/18px var(--mono); color: var(--muted); }
+.wk-rise {
+  position: absolute; left: 120px; top: 0; width: 170px; height: 16px; display: flex; gap: 2px; padding: 2px;
+  border-radius: 5px; background: var(--paper); box-shadow: 0 2px 8px rgba(11, 26, 44, 0.22); will-change: transform;
+}
+.wk-rise i { flex: 1; border-radius: 2px; background: var(--line-2); }
+.wk-lr { position: absolute; left: 400px; right: 0; top: 0; bottom: 0; }
+.wk-zoom { margin-top: 10px; display: grid; grid-template-columns: 1fr 34px 1fr; align-items: stretch; }
+.wk-zoom .wk-blk-arr { align-self: center; }
+.wk-blk { border: 1.5px solid var(--line-2); border-radius: 12px; padding: 11px 15px 12px; background: var(--paper); }
+.wk-blk-t { font-weight: 600; font-size: 17px; line-height: 1.3; color: var(--ink); }
+.wk-blk-d { margin-top: 2px; font-size: 15px; line-height: 1.4; color: var(--ink-2); }
+.wk-blk-arr { text-align: center; font: 400 18px/1 var(--mono); color: var(--muted); }
+.wk-glab { margin-top: 44px; }
+.wk-gauge { margin-top: 10px; display: grid; grid-template-columns: 54px 1fr 54px; gap: 12px; align-items: center; font: 500 15px/1.2 var(--mono); color: var(--muted); }
+.wk-g-r { text-align: right; }
+.wk-gauge .is-win { color: var(--ink); font-weight: 600; }
+.wk-g-track { position: relative; height: 10px; border-radius: 5px; background: var(--wash); box-shadow: inset 0 0 0 1px var(--line); }
+.wk-g-track::before { content: ""; position: absolute; left: 50%; top: -4px; bottom: -4px; width: 2px; margin-left: -1px; background: var(--line-2); }
+.wk-g-fill { position: absolute; top: 0; bottom: 0; left: 50%; width: 50%; border-radius: 5px; background: var(--wk-tint, var(--ours)); transform-origin: left center; transform: scaleX(0); opacity: 0.55; }
+.wk-g-fill.is-left { left: 0; transform-origin: right center; }
+.wk-g-dot { position: absolute; top: 50%; left: 0; width: 18px; height: 18px; margin: -9px 0 0 -9px; border-radius: 50%; background: var(--paper); border: 3px solid var(--wk-tint, var(--ours)); will-change: transform; }
+.wk-g-read { margin-top: 10px; font: 400 14px/1.4 var(--mono); color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.wk-g-sent { color: var(--muted); }
+.wk-l48 { position: absolute; left: 0; right: 0; bottom: 0; display: grid; grid-template-columns: auto 1fr; gap: 20px; align-items: center; padding: 16px 20px; border-radius: 14px; background: var(--wash); }
+.wk-l48 .wk-big { color: var(--ours-ink); }
+.wk-l48 p:not(.wk-big) { font-size: 16px; line-height: 1.4; color: var(--ink-2); }
+#work { --wk-river: color-mix(in srgb, #0284c7 80%, var(--hl3)); }
+
+/* step 5: raw scores, softmax, probabilities, and the long tail */
+.wk-sc-head, #work .wk-scores .bar-row { display: grid; grid-template-columns: 118px 100px 34px 1fr 58px; gap: 14px; align-items: center; }
+.wk-sc-head { margin-top: 18px; white-space: nowrap; font: 500 13px/1.3 var(--mono); letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); }
+.wk-sc-head span:nth-child(2) { text-align: right; }
+.wk-scores { margin-top: 12px; gap: 13px; }
+.wk-logit { text-align: right; font-variant-numeric: tabular-nums; color: var(--ink-2); }
+.wk-arr { text-align: center; color: var(--faint); }
+#work .wk-scores .bar-fill { transform-origin: left center; }
+#work .wk-scores .bar-label { font: inherit; letter-spacing: normal; opacity: 1; }   /* not the bottom bar's 13 px label */
+.wk-tail { position: absolute; left: 0; right: 0; top: 250px; }
+.wk-tail-svg { width: 100%; height: 56px; overflow: visible; }
+.wk-tbar { fill: var(--line-2); }
+.wk-tbar.is-top { fill: color-mix(in srgb, var(--ours) 45%, var(--line-2)); }
+.wk-tbar.is-1 { fill: var(--ours); }
+.wk-tail .caption { margin-top: 10px; }
+
+/* step 6: one draw from the odds; the two dials in miniature */
+.wk-odds { position: absolute; left: 0; right: 0; top: 50px; height: 44px; display: flex; gap: 3px; }
+.wk-odds span {
+  flex: none; height: 100%; border-radius: 7px; display: grid; place-items: center; white-space: nowrap; overflow: hidden;
+  font: 500 15px/1 var(--mono); color: #0b1a2c; background: var(--wash); transition: background-color 0.35s, color 0.35s, box-shadow 0.35s;
+}
+.wk-odds span.is-rest { background: repeating-linear-gradient(135deg, var(--wash) 0 5px, var(--line) 5px 7px); }
+.wk-needle { position: absolute; left: 0; top: -24px; width: 0; height: 0; border-left: 9px solid transparent; border-right: 9px solid transparent; border-top: 14px solid var(--ink); margin-left: -9px; transform: translateX(var(--n4, 0)); will-change: transform; }
+.wk-odds-rest { position: absolute; right: 0; top: 102px; font: 400 13px/1.3 var(--mono); color: var(--muted); }
+.wk-pickrow { position: absolute; left: 0; right: 0; top: 140px; display: flex; justify-content: space-between; align-items: center; }
+.pick { display: flex; flex-wrap: wrap; gap: 8px; }
+.wk-xref { display: block; padding: 12px 18px; border-radius: 12px; border: 1px solid var(--line); background: var(--paper); text-decoration: none; transition: border-color 0.2s; }
+.wk-xref:hover { border-color: var(--ink); }
+.wk-dials { position: absolute; left: 0; right: 0; bottom: 0; display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.wk-dial { padding: 14px 20px 16px; border-radius: 14px; background: var(--wash); }
+.wk-dial-t { font-weight: 600; font-size: 17px; line-height: 1.3; color: var(--ink); margin-bottom: 10px; }
+.wk-mini { display: grid; grid-template-columns: 150px 1fr; gap: 12px; align-items: center; min-height: 26px; font: 400 14px/1.3 var(--mono); color: var(--ink-2); }
+.wk-mini + .wk-mini { margin-top: 8px; }
+.wk-mini-note { display: block; color: var(--muted); }
+.wk-mstrip { display: flex; gap: 2px; height: 14px; }
+.wk-mstrip i { flex: none; height: 100%; border-radius: 3px; background: var(--line-2); }
+.wk-mstrip i:first-child { background: var(--ours); }
+.wk-mstrip i.is-cut { background: repeating-linear-gradient(135deg, transparent 0 3px, var(--line-2) 3px 5px); opacity: 0.7; }
+
+/* step 7: prefill, decode, the KV cache, the context window and speed */
+.wk-loop { font: 600 22px/1.35 var(--display); letter-spacing: -0.015em; }
+.wk-loop-p { display: block; width: fit-content; padding: 0 0.12em; margin-left: -0.12em; color: var(--muted); border-radius: 0.15em; }
+.wk-loop-a { display: block; min-height: 1.35em; color: var(--ink); }
 .loop-text .new { animation: tok-in 0.8s ease-out; border-radius: 0.12em; }
+.wk-kv { position: absolute; left: 0; right: 0; top: 80px; display: grid; grid-template-columns: 96px 1fr; column-gap: 12px; }
+.wk-kv .wk-lab { grid-row: 1; align-self: center; }
+.wk-kv-cells { grid-column: 2; display: flex; gap: 4px; }
+.wk-kv-cells i { flex: 1; height: 22px; border-radius: 4px; background: var(--wash); box-shadow: inset 0 0 0 1px var(--line); transition: background-color 0.25s, box-shadow 0.25s; }
+.wk-kv-cells i.is-p { background: color-mix(in srgb, var(--hl3) 80%, var(--paper)); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--hl3), var(--ink) 15%); }
+.wk-kv-cells i.is-d { background: color-mix(in srgb, var(--ours) 70%, var(--paper)); box-shadow: inset 0 0 0 1px var(--ours); }
+.wk-kv-b { grid-row: 2; margin-top: 7px; padding-top: 6px; border-top: 1.5px solid var(--line-2); font: 400 13px/1.3 var(--mono); color: var(--muted); white-space: nowrap; }
+.wk-kv-pre { grid-column: 2; width: calc((100% - 80px) / 21 * 6 + 20px); }
+.wk-kv-dec { grid-column: 2; margin-left: calc((100% - 80px) / 21 * 6 + 24px); }
+.wk-trip { color: var(--ours-ink); font-weight: 500; }
+.wk-ctx { position: absolute; left: 0; right: 0; top: 152px; display: grid; grid-template-columns: 250px 1fr; gap: 12px; align-items: center; }
+.wk-ctx-n { margin-top: 3px; font: 400 14px/1.3 var(--mono); color: var(--ink-2); white-space: nowrap; }
+.wk-ctx-n b { font-weight: 600; color: var(--ink); }
+.wk-ctx-box { display: flex; gap: 6px; align-items: center; padding: 6px; border: 1.5px dashed var(--line-2); border-radius: 12px; }
+.wk-ctx-box span { font: 400 14px/1 var(--mono); padding: 8px 10px; border-radius: 7px; background: var(--wash); color: var(--ink-2); white-space: nowrap; }
+.wk-ctx-box span:nth-child(2) { background: color-mix(in srgb, var(--hl2) 70%, var(--paper)); }
+.wk-ctx-box span:nth-child(4) { background: color-mix(in srgb, var(--ours) 22%, var(--paper)); }
+.wk-ctx-box .wk-ctx-free { margin-left: auto; background: none; color: var(--muted); padding-right: 6px; }
+.wk-speed { position: absolute; left: 0; right: 0; bottom: 0; display: grid; grid-template-columns: 1fr 292px; gap: 22px; align-items: end; }
+.wk-sp-chart .wk-lab { margin-bottom: 8px; }
+.wk-sp { display: grid; grid-template-columns: 200px 1fr 96px; gap: 12px; align-items: center; height: 27px; font: 400 14px/1.2 var(--mono); color: var(--ink-2); }
+.wk-sp b { font-weight: 600; color: var(--ink); font-variant-numeric: tabular-nums; }
+.wk-sp-t { position: relative; height: 9px; border-radius: 5px; background: var(--wash); }
+.wk-sp-t i { position: absolute; top: 0; bottom: 0; left: calc(var(--a, 0) / 110 * 100%); width: calc((var(--v) - var(--a, 0)) / 110 * 100%); border-radius: 5px; background: var(--line-2); transform-origin: left center; }
+.wk-sp-range .wk-sp-t i { background: color-mix(in srgb, var(--ours) 30%, var(--wash)); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ours) 45%, transparent); }
+.wk-sp-ours .wk-sp-t i { background: var(--ours); }
+.wk-sp-ours b { color: var(--ours-ink); }
+.wk-trips { padding: 15px 18px 16px; border-radius: 14px; background: var(--wash); }
+.wk-trips p:not(.wk-big) { margin-top: 6px; font-size: 15.5px; line-height: 1.4; color: var(--ink-2); }
+
+/* panel motion: plays each time a panel becomes active; reduced motion collapses it to the final state */
+@media (prefers-reduced-motion: no-preference) {
+  .frame-v:is(.is-on, .is-out) .wk-m { animation: wk-under 0.32s ease-out backwards; animation-delay: calc(var(--wk-t0, 0s) + 0.1s + var(--k, 0) * 0.11s); }
+  .frame-v:is(.is-on, .is-out) .wk-cut { animation: pz-fade 0.4s ease-out backwards; animation-delay: calc(var(--wk-t0, 0s) + 0.72s); }
+  .frame-v:is(.is-on, .is-out) .wk-toks .tk-chip { animation: pz-pop 0.42s cubic-bezier(0.2, 0.8, 0.3, 1.25) backwards; animation-delay: calc(var(--wk-t0, 0s) + 0.85s + var(--k, 0) * 0.09s); }
+  .frame-v:is(.is-on, .is-out) .wk-id { animation: pz-fade 0.35s ease-out backwards; animation-delay: calc(var(--wk-t0, 0s) + 1.2s + var(--k, 0) * 0.09s); }
+  .frame-v:is(.is-on, .is-out) .wk-ids-note { animation: pz-fade 0.4s ease-out backwards; animation-delay: calc(var(--wk-t0, 0s) + 1.8s); }
+  .frame-v:is(.is-on, .is-out) .wk-tile { animation: pz-rise 0.55s cubic-bezier(0.2, 0.7, 0.2, 1) backwards; animation-delay: calc(var(--wk-t0, 0s) + 1.9s + var(--k, 0) * 0.12s); }
+
+  .frame-v:is(.is-on, .is-out) .wk-tcell { animation: pz-fade 0.3s ease-out backwards; animation-delay: calc(var(--wk-t0, 0s) + var(--k, 0) * 0.012s); }
+  .frame-v:is(.is-on, .is-out) :is(.wk-tlit, .wk-tring, .wk-tarrow, .wk-tarrow-h) { animation: pz-fade 0.3s ease-out backwards; animation-delay: calc(var(--wk-t0, 0s) + 0.95s); }
+  .frame-v:is(.is-on, .is-out) .wk-rowtag { animation: wk-slide-r 0.45s cubic-bezier(0.2, 0.7, 0.2, 1) backwards; animation-delay: calc(var(--wk-t0, 0s) + 0.55s); }
+  .frame-v:is(.is-on, .is-out) .wk-band { animation: wk-unfold 0.9s cubic-bezier(0.3, 0.6, 0.2, 1) backwards; animation-delay: calc(var(--wk-t0, 0s) + 1.25s); }
+  .frame-v:is(.is-on, .is-out) .wk-ez-b > .wk-lab { animation: pz-fade 0.4s ease-out backwards; animation-delay: calc(var(--wk-t0, 0s) + 1.3s); }
+  .frame-v:is(.is-on, .is-out) .wk-vec .wk-vname { animation: pz-fade 0.35s ease-out backwards; animation-delay: calc(var(--wk-t0, 0s) + var(--vd, 1.4s)); }
+  .frame-v:is(.is-on, .is-out) .wk-vec .wk-cells > * { animation: wk-cell 0.4s cubic-bezier(0.2, 0.8, 0.3, 1.2) backwards; animation-delay: calc(var(--wk-t0, 0s) + var(--vd, 1.4s) + 0.1s + var(--k, 0) * 0.07s); }
+  .frame-v:is(.is-on, .is-out) .wk-foot { animation: pz-fade 0.5s ease-out backwards; animation-delay: calc(var(--wk-t0, 0s) + 3s); }
+  .frame-v:is(.is-on, .is-out) .wk-ez-c > .wk-lab:first-child, .frame-v:is(.is-on, .is-out) .wk-map { animation: pz-fade 0.5s ease-out backwards; animation-delay: calc(var(--wk-t0, 0s) + 2.9s); }
+  .frame-v:is(.is-on, .is-out) .wk-map .is-key { animation: wk-drop 0.6s cubic-bezier(0.3, 0.7, 0.3, 1.3) backwards; animation-delay: calc(var(--wk-t0, 0s) + 3.25s); }
+  .frame-v:is(.is-on, .is-out) .wk-map .wk-word.is-key { animation-name: pz-fade; }
+  .frame-v:is(.is-on, .is-out) .wk-map :is(.wk-dot, .wk-word):not(.is-key) { animation: pz-pop 0.4s ease-out backwards; animation-delay: calc(var(--wk-t0, 0s) + 3.75s + var(--k, 0) * 0.1s); }
+  .frame-v:is(.is-on, .is-out) .wk-halo { animation: pz-fade 0.8s ease-out backwards; animation-delay: calc(var(--wk-t0, 0s) + 3.7s); }
+  .frame-v:is(.is-on, .is-out) .wk-simlab { animation: pz-fade 0.4s ease-out backwards; animation-delay: calc(var(--wk-t0, 0s) + 4.3s); }
+  .frame-v:is(.is-on, .is-out) .wk-sim { animation: pz-fade 0.35s ease-out backwards; animation-delay: calc(var(--wk-t0, 0s) + 4.4s + var(--k, 0) * 0.12s); }
+  .frame-v:is(.is-on, .is-out) .wk-sim-t i { animation: wk-grow 0.6s cubic-bezier(0.2, 0.7, 0.2, 1) backwards; animation-delay: calc(var(--wk-t0, 0s) + 4.5s + var(--k, 0) * 0.12s); }
+  .frame-v:is(.is-on, .is-out) .wk-notes p { animation: pz-fade 0.5s ease-out backwards; animation-delay: calc(var(--wk-t0, 0s) + 5s + var(--k, 0) * 0.3s); }
+
+  .frame-v:is(.is-on, .is-out) .aw { animation: pz-pop 0.35s ease-out backwards; animation-delay: calc(var(--wk-t0, 0s) + 0.1s + var(--k, 0) * 0.05s); }
+  .frame-v:is(.is-on, .is-out) .attn-line { animation: wk-draw 0.8s cubic-bezier(0.4, 0, 0.2, 1) backwards; animation-delay: calc(var(--wk-t0, 0s) + 0.5s + var(--k, 0) * 0.06s); }
+  .frame-v:is(.is-on, .is-out) .aw-p { animation: pz-fade 0.35s ease-out backwards; animation-delay: calc(var(--wk-t0, 0s) + 1.2s); }
+  .frame-v:is(.is-on, .is-out) .wk-mixlab { animation: pz-fade 0.4s ease-out backwards; animation-delay: calc(var(--wk-t0, 0s) + 1.5s); }
+  .frame-v:is(.is-on, .is-out) .wk-mix span { animation: wk-cell 0.45s cubic-bezier(0.2, 0.8, 0.3, 1.1) backwards; animation-delay: calc(var(--wk-t0, 0s) + 1.65s + var(--k, 0) * 0.1s); }
+  .frame-v:is(.is-on, .is-out) .wk-heads > * { animation: pz-fade 0.45s ease-out backwards; animation-delay: calc(var(--wk-t0, 0s) + 2.6s + var(--k, 0) * 0.25s); }
+  .frame-v:is(.is-on, .is-out) .attn-meaning { animation: pz-rise 0.5s cubic-bezier(0.2, 0.7, 0.2, 1) backwards; animation-delay: calc(var(--wk-t0, 0s) + 2.4s); }
+
+  .frame-v:is(.is-on, .is-out) .wk-lr > * { animation: pz-fade 0.45s ease-out backwards; animation-delay: calc(var(--wk-t0, 0s) + 0.15s + var(--k, 0) * 0.15s); }
+  .frame-v:is(.is-on, .is-out) .wk-l48 { animation-delay: calc(var(--wk-t0, 0s) + 4.6s); }
+  .frame-v:is(.is-on, .is-out) .wk-zline { animation: pz-fade 0.6s ease-out backwards; animation-delay: calc(var(--wk-t0, 0s) + 0.3s); }
+
+  .frame-v:is(.is-on, .is-out) .wk-scores .wk-logit { animation: pz-fade 0.35s ease-out backwards; animation-delay: calc(var(--wk-t0, 0s) + 0.2s + var(--r, 0) * 0.1s); }
+  .frame-v:is(.is-on, .is-out) .wk-scores .wk-arr { animation: wk-slide-r 0.35s ease-out backwards; animation-delay: calc(var(--wk-t0, 0s) + 0.85s + var(--r, 0) * 0.06s); }
+  .frame-v:is(.is-on, .is-out) .wk-scores .bar-fill { animation: wk-grow 0.7s cubic-bezier(0.2, 0.7, 0.2, 1) backwards; animation-delay: calc(var(--wk-t0, 0s) + 1.05s + var(--r, 0) * 0.08s); }
+  .frame-v:is(.is-on, .is-out) .wk-scores .bar-val { animation: pz-fade 0.35s ease-out backwards; animation-delay: calc(var(--wk-t0, 0s) + 1.4s + var(--r, 0) * 0.08s); }
+  .frame-v:is(.is-on, .is-out) .wk-tbar { animation: wk-up 0.5s ease-out backwards; animation-delay: calc(var(--wk-t0, 0s) + 1.9s + var(--k, 0) * 0.008s); }
+  .frame-v:is(.is-on, .is-out) .wk-tail .caption { animation: pz-fade 0.5s ease-out backwards; animation-delay: calc(var(--wk-t0, 0s) + 2.6s); }
+
+  .frame-v:is(.is-on, .is-out) .wk-odds span { animation: wk-cell 0.4s ease-out backwards; animation-delay: calc(var(--wk-t0, 0s) + 0.15s + var(--k, 0) * 0.07s); }
+  .frame-v:is(.is-on, .is-out) .wk-needle { animation: wk-draw-pick 2.4s cubic-bezier(0.2, 0.6, 0.15, 1) backwards; animation-delay: calc(var(--wk-t0, 0s) + 0.7s); }
+  .frame-v:is(.is-on, .is-out) .wk-odds span.is-win { animation: wk-cell 0.4s ease-out backwards, wk-win 0.6s ease-out backwards; animation-delay: calc(var(--wk-t0, 0s) + 0.15s), calc(var(--wk-t0, 0s) + 3.05s); }
+  .frame-v:is(.is-on, .is-out) .wk-odds-rest { animation: pz-fade 0.4s ease-out backwards; animation-delay: calc(var(--wk-t0, 0s) + 0.6s); }
+  .frame-v:is(.is-on, .is-out) .pick .tk-chip { animation: pz-pop 0.4s ease-out backwards; animation-delay: calc(var(--wk-t0, 0s) + 3.1s + var(--k, 0) * 0.06s); }
+  .frame-v:is(.is-on, .is-out) .pick .picked { animation: wk-picked 0.9s cubic-bezier(0.2, 0.8, 0.3, 1.2) backwards; animation-delay: calc(var(--wk-t0, 0s) + 3.1s + var(--k, 0) * 0.06s); }
+  .frame-v:is(.is-on, .is-out) .wk-xref, .frame-v:is(.is-on, .is-out) .wk-dial { animation: pz-rise 0.5s cubic-bezier(0.2, 0.7, 0.2, 1) backwards; animation-delay: calc(var(--wk-t0, 0s) + 3.7s + var(--k, 0) * 0.15s); }
+
+  .frame-v:is(.is-on, .is-out) .wk-ctx { animation: pz-fade 0.5s ease-out backwards; animation-delay: calc(var(--wk-t0, 0s) + 0.4s); }
+  .frame-v:is(.is-on, .is-out) .wk-sp-t i { animation: wk-grow 0.8s cubic-bezier(0.2, 0.7, 0.2, 1) backwards; animation-delay: calc(var(--wk-t0, 0s) + 0.9s + var(--k, 0) * 0.12s); }
+  .frame-v:is(.is-on, .is-out) .wk-trips { animation: pz-rise 0.5s cubic-bezier(0.2, 0.7, 0.2, 1) backwards; animation-delay: calc(var(--wk-t0, 0s) + 1.6s); }
+  .wk-loop-p.wk-burst { animation: wk-burst 0.9s ease-out; }
+}
+@keyframes wk-under { from { background-size: 0% 0.2em; } }
+@keyframes wk-slide-r { from { opacity: 0; transform: translateX(-10px); } }
+@keyframes wk-cell { from { opacity: 0; transform: scale(0.7); } }
+@keyframes wk-grow { from { transform: scaleX(0); } }
+@keyframes wk-up { from { transform: scaleY(0); } }
+@keyframes wk-draw { from { stroke-dashoffset: var(--len, 400); } }
+@keyframes wk-unfold { 0% { opacity: 0; transform: scaleX(0.28); } 12% { opacity: 0.45; transform: scaleX(0.28); } 70% { opacity: 0.2; transform: scaleX(1); } 100% { opacity: 0; transform: scaleX(1); } }
+@keyframes wk-drop { 0% { opacity: 0; transform: translateY(-34px); } 60% { opacity: 1; } }
+/* "This" stays as plain as its neighbours until the pointer settles on it, then turns emerald with a brief ring */
+@keyframes wk-win {
+  0% { background: color-mix(in srgb, var(--line-2) 60%, var(--paper)); box-shadow: 0 0 0 0 rgba(5, 150, 105, 0); }
+  40% { box-shadow: 0 0 0 6px rgba(5, 150, 105, 0.3); }
+  100% { box-shadow: 0 0 0 0 rgba(5, 150, 105, 0); }
+}
+@keyframes wk-picked {
+  0% { opacity: 0; transform: translateY(10px) scale(0.9); background: var(--wash); color: #0b1a2c; }
+  40% { opacity: 1; transform: none; background: var(--wash); color: #0b1a2c; }
+}
+@keyframes wk-burst { 0% { background: transparent; color: var(--muted); } 25% { background: color-mix(in srgb, var(--hl3) 75%, transparent); color: var(--ink); } 100% { background: transparent; color: var(--muted); } }
+@keyframes wk-draw-pick {
+  0% { opacity: 0; transform: translateX(var(--n0)); }
+  8% { opacity: 1; }
+  30% { transform: translateX(var(--n1)); }
+  55% { transform: translateX(var(--n2)); }
+  78% { transform: translateX(var(--n3)); }
+  100% { opacity: 1; transform: translateX(var(--n4)); }
+}
 
 /* BUILD:controls START */
 /* 6 temperature and top-K: an instrument panel. Dials on the left, the live odds in the centre (a cut line slides
@@ -1363,17 +1675,17 @@ html[data-tone="dark"] .bar-fill { background: #34d399; }
   .deck #learn.on .stage > :nth-child(4) { animation-delay: calc(var(--pz-s) + 0.38s); }
 }
 
-/* ---------------------------------------------------------------- 5 work: the six steps arrive in order, tokens split */
+/* ---------------------------------------------------------------- 5 work: the seven steps arrive in order */
 @media (prefers-reduced-motion: no-preference) {
   .deck #work.on #steps > li { animation: pz-rise 0.6s cubic-bezier(0.2, 0.7, 0.2, 1) backwards; }
   .deck #work.on #steps > li:nth-child(1) { animation-delay: 0.42s; }
-  .deck #work.on #steps > li:nth-child(2) { animation-delay: 0.5s; }
-  .deck #work.on #steps > li:nth-child(3) { animation-delay: 0.58s; }
-  .deck #work.on #steps > li:nth-child(4) { animation-delay: 0.66s; }
-  .deck #work.on #steps > li:nth-child(5) { animation-delay: 0.74s; }
-  .deck #work.on #steps > li:nth-child(6) { animation-delay: 0.82s; }
-  .deck #work.on .frame-v.is-on .tok-row .tk-chip { animation: pz-pop 0.42s cubic-bezier(0.2, 0.8, 0.3, 1.25) backwards; animation-delay: calc(0.12s + var(--pz-k, 0) * 70ms); }
-  .deck #work.on.pz-in .frame-v.is-on .tok-row .tk-chip { animation-delay: calc(0.95s + var(--pz-k, 0) * 110ms); }
+  .deck #work.on #steps > li:nth-child(2) { animation-delay: 0.49s; }
+  .deck #work.on #steps > li:nth-child(3) { animation-delay: 0.56s; }
+  .deck #work.on #steps > li:nth-child(4) { animation-delay: 0.63s; }
+  .deck #work.on #steps > li:nth-child(5) { animation-delay: 0.7s; }
+  .deck #work.on #steps > li:nth-child(6) { animation-delay: 0.77s; }
+  .deck #work.on #steps > li:nth-child(7) { animation-delay: 0.84s; }
+  .deck #work.on .wk-rail-svg, .deck #work.on .wk-model { animation: pz-fade 0.7s ease-out 1.05s backwards; }
 }
 
 /* ---------------------------------------------------------------- 4 frozen: frost forms, the points freeze, RAG glows */

@@ -384,107 +384,418 @@
     runGen();
   }
 
-  /* ------------------------------------------------------------------ 4: six steps of inference */
+  /* ------------------------------------------------------------------ 5: how it answers, seven steps of inference */
+  // The rail on the left never moves; only the stage card changes. Panel motion is CSS keyed to .frame-v.is-on, so
+  // showStep() restarts it by re-adding the class; the few moving parts CSS cannot do (the vector rising through the
+  // layers, decode streaming into the KV cache) run here, only while their panel is on and the slide is active.
+  const seeded = seed => () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+  const WK_SVG = 'http://www.w3.org/2000/svg';
+  const wkSvg = (tag, attrs = {}) => { const n = document.createElementNS(WK_SVG, tag); for (const k in attrs) n.setAttribute(k, attrs[k]); return n; };
+  const wkSlide = $('#work');
   const stepBtns = $$('#steps .step');
-  const framesV = $$('.frame-v');
-  let stepNow = 1, autoplay = true, autoTimer = 0;
-  function showStep(n) {
+  const framesV = $$('#work .frame-v');
+  const wkProg = $('#wkProg');
+  const WK_DWELL = [6.5, 10.5, 8.5, 8.5, 7, 8, 11];   // seconds each step stays up while the slide plays itself
+  let stepNow = 1, autoplay = true, autoTimer = 0, wkArrived = -1e9, wkRun = 0;
+  const wkLive = run => run === wkRun && isActive('work');
+  // stagger index for CSS: --k on each child, in order
+  const wkStagger = (nodes, start = 0) => nodes.forEach((n, k) => n.style.setProperty('--k', k + start));
+  // a node's layout position inside a positioned ancestor, from offsets: unaffected by any transform, scale or
+  // entrance animation (a transformed ancestor becomes the offsetParent, so walk the chain rather than trust one hop)
+  const offIn = (n, anc) => { let x = 0, y = 0; for (let p = n; p && p !== anc; p = p.offsetParent) { x += p.offsetLeft; y += p.offsetTop; } return { x, y }; };
+
+  function showStep(n, arriving = false) {
     stepNow = n;
-    stepBtns.forEach(b => b.classList.toggle('is-on', +b.dataset.step === n));
-    framesV.forEach(f => f.classList.toggle('is-on', +f.dataset.frame === n));
-    if (n === 3) requestAnimationFrame(drawAttention);
-    if (n === 6) runLoop();
+    const run = ++wkRun;
+    // on arrival the stepper fades in first; panel motion waits for it
+    const t0 = Math.max(0, 0.95 - (performance.now() - wkArrived) / 1000);
+    stepBtns.forEach(b => {
+      const on = +b.dataset.step === n;
+      b.classList.toggle('is-on', on);
+      if (on) b.setAttribute('aria-current', 'step'); else b.removeAttribute('aria-current');
+    });
+    wkSlide.classList.toggle('wk-at7', n === 7);
+    framesV.forEach(f => {
+      const on = +f.dataset.frame === n;
+      clearTimeout(f.wkOut);
+      f.setAttribute('aria-hidden', String(!on));
+      if (on) {
+        f.classList.remove('is-on', 'is-out');
+        f.style.setProperty('--wk-t0', t0.toFixed(2) + 's');
+        void f.offsetWidth;                       // restart this panel's CSS motion from the top
+        f.classList.add('is-on');
+      } else if (arriving) {
+        f.classList.remove('is-on', 'is-out');     // coming back to the slide: no old panel fading out
+      } else if (f.classList.contains('is-on')) {
+        f.classList.replace('is-on', 'is-out');   // keep its motion running while it fades, so nothing snaps
+        f.wkOut = setTimeout(() => f.classList.remove('is-out'), 450);
+      }
+    });
+    wkProg.classList.remove('is-on');
+    if (autoplay && !reduced) {
+      wkProg.style.setProperty('--wk-dur', WK_DWELL[n - 1] + 's');
+      wkProg.style.setProperty('--wk-t0', t0.toFixed(2) + 's');
+      void wkProg.offsetWidth;
+      wkProg.classList.add('is-on');
+    }
+    if (n === 3) drawAttention();
+    if (n === 4) runLayers(run, t0);
+    if (n === 7) runLoop(run, t0);
+    scheduleAuto(t0);
   }
-  function scheduleAuto() {
+  function scheduleAuto(t0 = 0) {
     clearTimeout(autoTimer);
     if (!autoplay || reduced) return;
     autoTimer = setTimeout(() => {
       if (!isActive('work') || !autoplay) return;
-      showStep(stepNow % 6 + 1);
-      scheduleAuto();
-    }, stepNow === 3 || stepNow === 6 ? 7000 : 5000);
+      showStep(stepNow % stepBtns.length + 1);
+    }, (WK_DWELL[stepNow - 1] + t0) * 1000);
   }
-  stepBtns.forEach(b => b.addEventListener('click', () => { autoplay = false; clearTimeout(autoTimer); showStep(+b.dataset.step); }));
-  hooks.work = () => { if (autoplay) { showStep(1); scheduleAuto(); } else if (stepNow === 3) drawAttention(); };
+  function stopAuto() { autoplay = false; clearTimeout(autoTimer); wkProg.classList.remove('is-on'); }
+  stepBtns.forEach(b => b.addEventListener('click', () => { stopAuto(); showStep(+b.dataset.step); }));
+  hooks.work = () => {
+    wkArrived = performance.now();
+    drawRail();
+    showStep(autoplay ? 1 : stepNow, true);
+  };
 
-  // step 2: embedding strips (a fixed pseudo-random pattern; "agreement" deliberately resembles "contract")
-  const seeded = seed => () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
-  const EMB = [['Summ', 11], ['arise', 23], [' this', 5], [' contract', 42], [' agreement *', 42], [' for', 7], [' me', 19]];
-  $('#embRows').replaceChildren(...EMB.map(([tok, seed], k) => {
-    const row = el('div', 'emb-row');
-    row.append(el('span', null, tok.trim()));
-    const cells = el('div', 'emb-cells');
-    const rnd = seeded(seed * 7919), jitter = seeded(k * 131 + 3);
-    for (let i = 0; i < 24; i++) {
-      const c = el('i');
-      c.style.opacity = clamp(rnd() + (k === 4 ? (jitter() - 0.5) * 0.18 : 0), 0.08, 1).toFixed(2);
-      cells.append(c);
+  // the rail: a quiet line through the step numbers, and the loop from step 7 back to step 2
+  const railSvg = $('#wkRailSvg');
+  function drawRail() {
+    const rail = railSvg.parentElement, ol = $('#steps'), lis = [...ol.children];
+    if (!lis.length || !rail.offsetHeight) return;
+    // from each list item's own box (never from inside it): the same numbers during the entrance and after it
+    const o = offIn(ol, rail), btn = lis[0].firstElementChild, dot = $('.step-n', btn);
+    const dx = btn.clientLeft + parseFloat(getComputedStyle(btn).paddingLeft) + dot.offsetWidth / 2, r = dot.offsetWidth / 2;
+    const c = lis.map(li => ({ x: o.x + li.offsetLeft + dx, y: o.y + li.offsetTop + li.offsetHeight / 2, r }));
+    const a = c[1], z = c[c.length - 1], lx = 12;
+    const D = [
+      ['wk-rail-line', `M${c[0].x} ${c[0].y}V${z.y}`],
+      ['wk-rail-loop', `M${z.x - z.r - 5} ${z.y}H${lx + 12}Q${lx} ${z.y} ${lx} ${z.y - 12}V${a.y + 12}Q${lx} ${a.y} ${lx + 12} ${a.y}H${a.x - a.r - 13}`],
+      ['wk-rail-head', `M${a.x - a.r - 4} ${a.y}l-10 -5.5v11z`],
+    ];
+    // the same three paths every time, updated in place
+    if (railSvg.children.length !== D.length) railSvg.replaceChildren(...D.map(([cls]) => wkSvg('path', { class: cls })));
+    D.forEach(([, d], i) => { if (railSvg.children[i].getAttribute('d') !== d) railSvg.children[i].setAttribute('d', d); });
+  }
+
+  // step 1: stagger the marks and the chips
+  wkStagger($$('#work .wk-sent .wk-m'));
+  wkStagger($$('#work .wk-toks .tk-chip'));
+  wkStagger($$('#work .wk-toks .wk-id'));
+  wkStagger($$('#work .wk-tile'));
+
+  // step 2: the embedding table (a tall grid of faint numbers, one row lit), the numbers of three tokens, the map
+  const WK_ROWS = 36, WK_COLS = 12, WK_LIT = 5, WK_PITCH = 7.2, WK_RH = 5;
+  {
+    const svg = $('#wkTable'), rnd = seeded(38411), W = 130, cw = (W - (WK_COLS - 1) * 1.6) / WK_COLS;
+    const cells = [];
+    for (let r = 0; r < WK_ROWS; r++) {
+      const fade = r > WK_ROWS - 9 ? (WK_ROWS - r) / 9 : 1;   // the table runs on below what is drawn
+      for (let c = 0; c < WK_COLS; c++) {
+        const lit = r === WK_LIT;
+        const n = wkSvg('rect', { class: lit ? 'wk-tlit' : 'wk-tcell', x: (c * (cw + 1.6)).toFixed(1), y: (r * WK_PITCH).toFixed(1), width: cw.toFixed(1), height: WK_RH, rx: 1.2,
+          opacity: (lit ? 0.45 + rnd() * 0.55 : (0.06 + rnd() * 0.2) * fade).toFixed(2) });
+        if (!lit) n.style.setProperty('--k', r);
+        cells.push(n);
+      }
     }
-    row.append(cells);
-    return row;
-  }));
+    cells.push(wkSvg('rect', { class: 'wk-tring', x: -3.5, y: WK_LIT * WK_PITCH - 3.5, width: W + 7, height: WK_RH + 7, rx: 3.5 }));
+    svg.setAttribute('viewBox', `0 0 ${W} 260`);
+    svg.replaceChildren(...cells);
+    // the lit row unfolds into the strip of numbers beside it
+    const link = $('#wkLink'), y = 26 + WK_LIT * WK_PITCH + WK_RH / 2;
+    link.setAttribute('viewBox', '0 0 484 338');
+    link.replaceChildren(
+      wkSvg('rect', { class: 'wk-band', x: 0, y: y - 17, width: 484, height: 34, rx: 7, style: 'transform-box: fill-box; transform-origin: left center' }),
+      wkSvg('path', { class: 'wk-tarrow', d: `M137 ${y}H146` }),
+      wkSvg('path', { class: 'wk-tarrow-h', d: `M152 ${y}l-7 -4.5v9z` }));
+  }
+  const WK_VECS = {   // first five of 3,840 numbers, illustrative; "agreement" deliberately close to "contract"
+    contract: [0.12, -0.48, 0.91, 0.03, -0.27],
+    agreement: [0.11, -0.45, 0.88, 0.05, -0.25],
+    picnic: [-0.62, 0.30, -0.05, 0.77, 0.41],
+  };
+  const wkNum = v => (v < 0 ? '−' : '') + Math.abs(v).toFixed(2);
+  $$('#work .wk-vec').forEach((vec, i) => {
+    const vals = WK_VECS[vec.dataset.v];
+    vec.style.setProperty('--vd', (1.45 + i * 0.5).toFixed(2) + 's');
+    const cells = vals.map((v, k) => {
+      const c = el('i', null, wkNum(v));
+      c.style.setProperty('--wk-c', v >= 0 ? 'var(--ours)' : 'var(--hl5)');
+      c.style.setProperty('--wk-a', Math.round(18 + Math.abs(v) * (v >= 0 ? 52 : 90)) + '%');
+      c.style.setProperty('--k', k);
+      return c;
+    });
+    const more = el('i', 'wk-more', '…');
+    more.style.setProperty('--k', vals.length);
+    $('.wk-cells', vec).replaceChildren(...cells, more);
+  });
+  {
+    // map of meaning (278 × 176): close neighbours inside the halo, "invoice" not far, two unrelated words far away
+    const P = [
+      { w: 'contract', x: 92, y: 80, key: true, side: 'l' },
+      { w: 'agreement', x: 122, y: 60, side: 'r' },
+      { w: 'lease', x: 102, y: 112, side: 'l' },
+      { w: 'invoice', x: 150, y: 128, side: 'r' },
+      { w: 'picnic', x: 238, y: 154, far: true, side: 'l' },
+      { w: 'banana', x: 244, y: 30, far: true, side: 'l' },
+    ];
+    const map = $('#wkMap'), halo = el('div', 'wk-halo');
+    halo.style.left = '98px'; halo.style.top = '88px';
+    const nodes = [halo];
+    P.forEach((p, k) => {
+      const cls = p.key ? ' is-key' : p.far ? ' is-far' : '';
+      const d = el('i', 'wk-dot' + cls), t = el('span', 'wk-word' + cls, p.w);
+      d.style.left = p.x + 'px'; d.style.top = p.y + 'px';
+      t.style.top = p.y + 'px';
+      const gap = p.key ? 19 : 14;   // clear of the dot (and the key dot's ring)
+      if (p.side === 'r') t.style.left = (p.x + gap) + 'px'; else t.style.right = (278 - p.x + gap) + 'px';
+      d.style.setProperty('--k', k); t.style.setProperty('--k', k);
+      nodes.push(d, t);
+    });
+    map.replaceChildren(...nodes);
+    const SIMS = [['agreement', 0.91], ['lease', 0.84], ['invoice', 0.62], ['picnic', 0.07]];
+    $('#wkSims').replaceChildren(...SIMS.map(([w, s], k) => {
+      const r = el('div', 'wk-sim' + (s < 0.3 ? ' is-far' : ''));
+      const t = el('span', 'wk-sim-t'), f = el('i');
+      f.style.setProperty('--s', s);
+      f.style.setProperty('--k', k);
+      t.append(f);
+      r.append(el('span', null, w), t, el('b', null, s.toFixed(2)));
+      r.style.setProperty('--k', k);
+      return r;
+    }));
+    wkStagger($$('#work .wk-notes p'));
+  }
 
-  // step 3: attention
+  // step 3: attention. "bank" looks back at every earlier word; the weights (illustrative) include itself
   const SENTS = [
-    { words: ['I', 'deposited', 'cash', 'at', 'the', 'bank'], w: [0.04, 0.34, 0.4, 0.06, 0.06],
+    { words: ['I', 'deposited', 'cash', 'at', 'the', 'bank'], w: [0.04, 0.34, 0.4, 0.06, 0.06], self: 0.1, sense: 'money',
       meaning: 'The model reads “bank” as <b>a place for money</b>, mostly because of “deposited” and “cash”.' },
-    { words: ['We', 'had', 'a', 'picnic', 'by', 'the', 'river', 'bank'], w: [0.03, 0.03, 0.02, 0.2, 0.08, 0.04, 0.6],
+    { words: ['We', 'had', 'a', 'picnic', 'by', 'the', 'river', 'bank'], w: [0.03, 0.03, 0.02, 0.2, 0.06, 0.04, 0.52], self: 0.1, sense: 'river',
       meaning: 'The model reads “bank” as <b>the side of a river</b>, mostly because of “river” and “picnic”.' },
   ];
   let sentIdx = 0;
-  const attnWords = $('#attnWords'), attnSvg = $('#attnSvg'), attnStage = $('#attnStage');
+  const attnWords = $('#attnWords'), attnSvg = $('#attnSvg'), attnStage = $('#attnStage'), wkMix = $('#wkMix');
+  const pct = x => Math.round(x * 100) + '%';
   function renderAttention() {
-    const s = SENTS[sentIdx];
+    const s = SENTS[sentIdx], last = s.words.length - 1;
     attnWords.replaceChildren(...s.words.map((w, i) => {
-      const n = el('span', 'aw' + (i === s.words.length - 1 ? ' focus' : ''), w);
-      if (i < s.w.length) n.style.setProperty('--a', Math.min(1, s.w[i] * 1.6).toFixed(2));
+      const n = el('span', 'aw' + (i === last ? ' focus' : ''));
+      const box = el('span', 'aw-w', w);
+      if (i < last) box.style.setProperty('--a', Math.min(1, s.w[i] * 1.6).toFixed(2));
+      n.append(box, el('span', 'aw-p', pct(i < last ? s.w[i] : s.self)));
+      n.style.setProperty('--k', i);
       return n;
     }));
+    // what "bank" takes in, largest share first
+    const parts = s.words.slice(0, last).map((w, i) => ({ w, p: s.w[i] })).concat({ w: 'bank', p: s.self, self: true }).sort((a, b) => b.p - a.p);
+    const full = 886 - (parts.length - 1) * 3;
+    wkMix.replaceChildren(...parts.map((q, k) => {
+      const label = `${q.w} ${pct(q.p)}`, wpx = full * q.p;
+      // a segment too narrow to hold its label cleanly stays unlabelled (14px mono: 8.4px a character)
+      const seg = el('span', q.self ? 'is-self' : null, wpx >= label.length * 8.4 + 14 ? label : null);
+      if (!seg.textContent) seg.title = label;
+      seg.style.width = wpx.toFixed(1) + 'px';
+      seg.style.setProperty('--m', Math.round(Math.min(100, 22 + q.p * 190)) + '%');
+      seg.style.setProperty('--k', k);
+      return seg;
+    }));
+    renderHeads(s);
     $('#attnMeaning').innerHTML = s.meaning;
+    $('#wkGSent').textContent = ` · “${s.words.join(' ')}”`;
     drawAttention();
   }
+  // three of the many heads, in miniature: each looks back from "bank" for something different (illustrative)
+  function renderHeads(s) {
+    const last = s.words.length - 1, dx = 132 / last, grammar = s.words.map(w => (w === 'the' ? 0.35 : w === 'at' || w === 'by' ? 0.55 : 0));
+    const HEADS = [['meaning', s.w], ['the word before', s.words.map((w, i) => (i === last - 1 ? 0.85 : 0))], ['grammar', grammar]];
+    const box = $('#wkHeads');
+    const rows = HEADS.map(([name, w], k) => {
+      const row = el('div', 'wk-head'), svg = wkSvg('svg', { viewBox: '-2 0 136 34', 'aria-hidden': 'true' });
+      const bx = last * dx;
+      w.slice(0, last).forEach((v, i) => {
+        if (v < 0.05) return;
+        const x = i * dx, lift = Math.min(26, 8 + (bx - x) * 0.18);
+        svg.append(wkSvg('path', { class: 'wk-ha', d: `M${bx} 24C${bx} ${24 - lift} ${x} ${24 - lift} ${x} 24`, 'stroke-width': (0.8 + v * 3.4).toFixed(1), opacity: (0.25 + v * 0.75).toFixed(2) }));
+      });
+      s.words.forEach((_, i) => svg.append(wkSvg('circle', { class: 'wk-hd' + (i === last ? ' is-q' : ''), cx: i * dx, cy: 29, r: i === last ? 4 : 3 })));
+      row.append(svg, el('span', null, name));
+      row.style.setProperty('--k', k + 1);
+      return row;
+    });
+    const lab = el('p', 'wk-lab', 'Three of its heads');
+    lab.style.setProperty('--k', 0);
+    box.replaceChildren(lab, ...rows);
+  }
+  // positions come from layout offsets, so the lines are right whatever the scale or a panel's fade transform
   function drawAttention() {
     const s = SENTS[sentIdx];
-    const box = attnStage.getBoundingClientRect();
-    if (!box.width) return;
+    const W = attnStage.offsetWidth, H = attnStage.offsetHeight;
+    if (!W) return;
     const pos = [...attnWords.children].map(c => {
-      const r = c.getBoundingClientRect();
-      return { x: (r.left - box.left + r.width / 2) / S, y: (r.top - box.top) / S };
+      const b = c.firstChild, o = offIn(b, attnStage);
+      return { x: o.x + b.offsetWidth / 2, y: o.y - 3 };
     });
     const f = pos[pos.length - 1];
-    attnSvg.setAttribute('viewBox', `0 0 ${box.width / S} ${box.height / S}`);
-    attnSvg.innerHTML = s.w.map((w, i) => {
+    attnSvg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+    attnSvg.replaceChildren(...s.w.map((w, i) => {
       const p = pos[i];
-      const lift = Math.min(86, 24 + Math.abs(f.x - p.x) * 0.26) + Math.max(0, f.y - p.y);
-      return `<path class="attn-line" d="M${f.x} ${f.y} C ${f.x} ${f.y - lift}, ${p.x} ${p.y - lift}, ${p.x} ${p.y}" stroke-width="${(1 + w * 10).toFixed(1)}" opacity="${(0.15 + w * 0.85).toFixed(2)}"/>`;
-    }).join('');
+      const lift = Math.min(86, 24 + Math.abs(f.x - p.x) * 0.26);
+      const path = wkSvg('path', { class: 'attn-line', d: `M${f.x.toFixed(1)} ${f.y.toFixed(1)} C ${f.x.toFixed(1)} ${(f.y - lift).toFixed(1)}, ${p.x.toFixed(1)} ${(p.y - lift).toFixed(1)}, ${p.x.toFixed(1)} ${p.y.toFixed(1)}`,
+        'stroke-width': (1 + w * 10).toFixed(1), opacity: (0.15 + w * 0.85).toFixed(2) });
+      const len = Math.ceil(Math.abs(f.x - p.x) + lift * 1.6 + 10);
+      path.style.cssText = `--k:${s.w.length - 1 - i};--len:${len};stroke-dasharray:${len}`;
+      return path;
+    }));
+    drawRail();
   }
   $$('#attnSeg .seg-btn').forEach(b => b.addEventListener('click', () => {
-    autoplay = false; clearTimeout(autoTimer);
+    stopAuto();
     sentIdx = +b.dataset.sent;
-    $$('#attnSeg .seg-btn').forEach(x => x.classList.toggle('is-on', x === b));
+    $$('#attnSeg .seg-btn').forEach(x => { x.classList.toggle('is-on', x === b); x.setAttribute('aria-pressed', String(x === b)); });
     renderAttention();
   }));
   renderAttention();
 
-  // step 6: the loop
+  // step 4: 48 layers; the "bank" vector rises through them and its meaning sharpens (towards the sentence chosen in step 3)
+  const WK_L = 48, WK_LP = 7, WK_ZOOM = 40;
+  const stack = $('#wkStack'), rise = $('#wkRise'), gDot = $('#wkGDot'), gFill = $('#wkGFill'), layerNow = $('#wkLayerNow');
+  const layerY = i => 336 - i * WK_LP;                       // top of layer i (1 = bottom) inside the stack
+  const layers = [];
+  {
+    for (let i = 1; i <= WK_L; i++) layers.push(wkSvg('rect', { class: 'wk-layer' + (i === WK_ZOOM ? ' is-zoom' : ''), x: 0, y: layerY(i) + 1.25, width: 250, height: 4.5, rx: 2.25 }));
+    const zy = layerY(WK_ZOOM) + 3.5;
+    stack.setAttribute('viewBox', '0 0 300 336');
+    stack.replaceChildren(...layers,
+      wkSvg('path', { class: 'wk-zline', d: `M256 ${zy}L316 21` }),
+      wkSvg('path', { class: 'wk-zline', d: `M256 ${zy}L316 110` }));
+    rise.replaceChildren(...Array.from({ length: 10 }, () => el('i')));
+    wkStagger($$('#work .wk-lr > *'));
+  }
+  const WK_CELL_ORDER = [3, 7, 1, 5, 9, 0, 4, 8, 2, 6];      // the cells settle one by one, not all at once
+  const mixC = (a, b, t) => `color-mix(in srgb, ${b} ${Math.round(t * 100)}%, ${a})`;
+  function paintLayers(p) {
+    const s = SENTS[sentIdx], river = s.sense === 'river';
+    const tint = river ? 'var(--wk-river)' : 'var(--ours)';
+    stack.parentElement.style.setProperty('--wk-tint', tint);
+    const at = 1 + p * (WK_L - 1);
+    layers.forEach((r, i) => r.classList.toggle('is-done', i + 1 <= at + 0.01));
+    rise.style.transform = `translateY(${(6 + layerY(at) + 3.5 - 8).toFixed(1)}px)`;
+    [...rise.children].forEach((c, k) => {
+      const t = clamp((p - WK_CELL_ORDER[k] * 0.06) / 0.4);
+      c.style.background = mixC('var(--line-2)', tint, t);
+    });
+    const lean = 0.44 * Math.pow(p, 0.9);                   // 0.5 = undecided, 0.94 = clearly one sense
+    const x = river ? 0.5 - lean : 0.5 + lean;
+    gDot.style.left = (x * 100).toFixed(1) + '%';
+    gFill.classList.toggle('is-left', river);
+    gFill.style.transform = `scaleX(${(lean * 2).toFixed(3)})`;
+    $('#wkGL').classList.toggle('is-win', river && p > 0.6);
+    $('#wkGR').classList.toggle('is-win', !river && p > 0.6);
+    layerNow.textContent = `layer ${Math.round(at)} of ${WK_L}`;
+  }
+  function runLayers(run, t0) {
+    if (reduced) { paintLayers(1); return; }
+    paintLayers(0);
+    const start = performance.now() + (t0 + 0.6) * 1000, dur = 4200;
+    const tick = now => {
+      if (!wkLive(run) || stepNow !== 4) return;
+      const k = clamp((now - start) / dur);
+      paintLayers(k < 0.5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2);
+      if (k < 1) requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
+  paintLayers(1);
+
+  // step 5: the long tail of the vocabulary, sorted by chance (square-root heights so the tail stays visible)
+  {
+    const svg = $('#wkTail'), P = [0.38, 0.27, 0.14, 0.11, 0.04], bars = [];
+    const H = 54, h = p => Math.max(1.5, H * Math.sqrt(p / 0.38));
+    let x = 0;
+    P.forEach((p, k) => { bars.push(wkSvg('rect', { class: 'wk-tbar ' + (k ? 'is-top' : 'is-1'), x, y: H - h(p), width: 12, height: h(p), rx: 2, style: `--k:${k}` })); x += 15; });
+    for (let k = 0; x < 886 - 4; k++) {
+      const p = 0.009 * Math.exp(-k / 48) + 0.00008;
+      bars.push(wkSvg('rect', { class: 'wk-tbar', x: x.toFixed(1), y: (H - h(p)).toFixed(1), width: 3.4, height: h(p).toFixed(1), rx: 1, style: `--k:${k + 5}` }));
+      x += 5.6;
+    }
+    bars.forEach(b => { b.style.transformBox = 'fill-box'; b.style.transformOrigin = 'center bottom'; });
+    svg.setAttribute('viewBox', `0 0 886 ${H}`);
+    svg.replaceChildren(...bars);
+  }
+
+  // step 6: the odds as one strip, a pointer that settles on "This", the dials in miniature
+  {
+    const odds = $('#wkOdds'), needle = $('.wk-needle', odds);
+    const ODDS = [['This', 38], ['Here', 27], ['The', 14], ['Sure', 11], ['Summary', 4], ['others', 6]];
+    const full = 886 - (ODDS.length - 1) * 3;
+    const segs = ODDS.map(([t, p], k) => {
+      const wpx = full * p / 100, label = `${t} ${p}%`;
+      // 15px mono: 9px a character; narrow segments are named in the line under the strip instead
+      const s = el('span', (k === 0 ? 'is-win' : '') + (k === ODDS.length - 1 ? ' is-rest' : ''), wpx >= label.length * 9 + 20 ? label : null);
+      if (!s.textContent) s.title = label;
+      s.style.width = wpx.toFixed(1) + 'px';
+      s.style.setProperty('--k', k);
+      if (k === 0) s.style.background = 'color-mix(in srgb, var(--ours) 32%, var(--paper))';
+      else if (k < 4) s.style.background = `color-mix(in srgb, var(--line-2) ${60 - k * 12}%, var(--paper))`;
+      return s;
+    });
+    odds.replaceChildren(...segs, needle);
+    // where the pointer swings before it settles inside "This" (canvas px along the strip)
+    [612, 140, 470, 250, 158].forEach((x, k) => needle.style.setProperty('--n' + k, x + 'px'));
+    $$('#work .pick .tk-chip').forEach((c, k) => c.style.setProperty('--k', k));
+    $$('#work .wk-mstrip').forEach(m => {
+      const ps = m.dataset.p.split(',').map(Number).filter(p => p > 0), cut = m.classList.contains('wk-k3');
+      const n = ps.length, sum = ps.reduce((a, b) => a + b, 0);
+      m.replaceChildren(...ps.map((p, k) => {
+        const i = el('i');
+        i.style.width = `calc((100% - ${(n - 1) * 2}px) * ${(p / sum).toFixed(4)})`;
+        if (cut && k >= 3) i.classList.add('is-cut');
+        return i;
+      }));
+    });
+    wkStagger([$('#work .wk-xref'), ...$$('#work .wk-dial')]);
+  }
+
+  // step 7: prefill reads the prompt in one burst; decode adds one token per trip; the KV cache fills as it goes
   const LOOP = ['This', ' contract', ' sets', ' out', ' a', ' two', '-year', ' supply', ' agreement', ' between', ' us', ' and', ' Acme', ' Ltd', '.'];
-  const loopText = $('#loopText');
-  let loopRun = 0;
-  async function runLoop() {
-    const me = ++loopRun;
-    if (reduced) { loopText.textContent = LOOP.join(''); return; }
-    while (stepNow === 6 && me === loopRun && isActive('work')) {
-      loopText.replaceChildren();
-      for (const t of LOOP) {
-        if (stepNow !== 6 || me !== loopRun) return;
-        loopText.append(el('span', 'new', t));
-        await sleep(170);
+  const WK_PROMPT = 6;
+  const loopText = $('#loopText'), kvBox = $('#wkKV'), tripEl = $('#wkTrip'), loopP = $('#wkLoopP');
+  kvBox.replaceChildren(...Array.from({ length: WK_PROMPT + LOOP.length }, () => el('i')));
+  const kvCells = [...kvBox.children];
+  wkStagger($$('#work .wk-sp-t i'));
+  function resetLoop(full) {
+    loopText.textContent = full ? LOOP.join('') : '';
+    kvCells.forEach((c, i) => { c.classList.toggle('is-p', full && i < WK_PROMPT); c.classList.toggle('is-d', full && i >= WK_PROMPT); });
+    tripEl.textContent = full ? `· ${LOOP.length} trips` : '';
+    loopP.classList.remove('wk-burst');
+  }
+  async function runLoop(run, t0) {
+    if (reduced) { resetLoop(true); return; }
+    const live = () => wkLive(run) && stepNow === 7;
+    resetLoop(false);
+    await sleep((t0 + 0.35) * 1000);
+    while (live()) {
+      resetLoop(false);
+      void loopP.offsetWidth;
+      loopP.classList.add('wk-burst');
+      kvCells.slice(0, WK_PROMPT).forEach(c => c.classList.add('is-p'));
+      tripEl.textContent = '';
+      await sleep(900);
+      for (let i = 0; i < LOOP.length; i++) {
+        if (!live()) return;
+        loopText.append(el('span', 'new', LOOP[i]));
+        kvCells[WK_PROMPT + i].classList.add('is-d');
+        tripEl.textContent = `· trip ${i + 1} of ${LOOP.length}`;
+        await sleep(300);
       }
-      await sleep(1800);
+      tripEl.textContent = `· ${LOOP.length} trips`;
+      await sleep(3200);
     }
   }
-  loopText.textContent = LOOP.join('');
+  resetLoop(true);
 
   /* BUILD:controls START */
   /* ------------------------------------------------------------------ 6: temperature and top-K */
@@ -2522,9 +2833,6 @@
     const m = t?.nodeType === 3 ? t.nodeValue.match(/^(\d+)([\s\S]*)$/) : null;
     if (m) { const n = el('span', null, m[1]); n.dataset.count = m[1]; t.replaceWith(n, m[2]); }
   }
-
-  /* 5 work: the prompt splits into its six tokens one after another */
-  $$('#work .frame-v[data-frame="1"] .tk-chip').forEach((c, k) => c.style.setProperty('--pz-k', k));
 
   /* 4 frozen: frost crystallises in the empty corner while the points freeze into place */
   const frost = (() => {
