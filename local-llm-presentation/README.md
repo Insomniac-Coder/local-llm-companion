@@ -3,7 +3,7 @@
 An interactive Show and Tell deck on LLMs and the systems around them: how language models work,
 how AI helps us, and the harness we have built around a model. **Sixteen slides, about fifteen minutes, in three parts**, then a summary:
 
-1. **What an LLM is**: what it is and how large; how it learns; why a trained model is frozen and needs RAG; how
+1. **What an LLM is**: what it is and how large; how it learns (with a tiny model you can train step by step); why a trained model is frozen and needs RAG; how
    it answers; temperature and top-K (a live instrument panel with a hallucination-risk gauge); memory, without and
    with a saved thread; forty terms; ten myths.
 2. **The benefits of AI**: how AI helps us, department by department.

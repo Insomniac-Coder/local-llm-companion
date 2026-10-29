@@ -377,6 +377,62 @@
     runGen();
   }
 
+  /* ------------------------------------------------------------------ 3: train a tiny model */
+  // Real gradient descent on five scores: each step shows it the right answer ("Paris") and nudges every score
+  const TRAIN_WORDS = ['Paris', 'London', 'beautiful', 'a', 'Lyon'];
+  const TRAIN_LR = 0.6;
+  let logits, trainStep, losses, training = false;
+  const trainBars = $('#trainBars'), trainMsg = $('#trainMsg'), lossSvg = $('#lossChart');
+  const lossOf = () => -Math.log(softmax(logits)[0]);
+  function renderTrain() {
+    const p = softmax(logits);
+    const top = p.indexOf(Math.max(...p));
+    setBars(trainBars, TRAIN_WORDS.map((w, i) => ({ label: `"${w}"`, p: p[i] })), top);
+    const guess = $('#trainGuess');   // the blank shows its best guess at this point in training
+    guess.textContent = TRAIN_WORDS[top];
+    guess.classList.toggle('is-right', top === 0);
+    const pc = Math.round(p[0] * 100);
+    trainMsg.textContent =
+      trainStep === 0 ? `Step 0. It has no idea yet: its top guess is "${TRAIN_WORDS[top]}".` :
+      top !== 0 ? `Step ${trainStep}. Getting warmer: "Paris" is now at ${pc}%.` :
+      p[0] < 0.9 ? `Step ${trainStep}. "Paris" is now its top guess, at ${pc}%.` :
+      `Step ${trainStep}. Learned (${pc}%). Real training does this for trillions of words at once.`;
+    drawLoss();
+  }
+  function drawLoss() {
+    const W = 420, H = 170, l = 34, r = 10, t = 10, b = 26;
+    const n = Math.max(20, losses.length - 1), maxL = 3;
+    const X = i => l + (i / n) * (W - l - r);
+    const Y = v => t + (1 - clamp(v / maxL)) * (H - t - b);
+    const pts = losses.map((v, i) => `${X(i).toFixed(1)},${Y(v).toFixed(1)}`).join(' ');
+    const last = losses[losses.length - 1];
+    lossSvg.innerHTML =
+      [1, 2, 3].map(v => `<line class="grid-line" x1="${l}" x2="${W - r}" y1="${Y(v)}" y2="${Y(v)}"/><text class="svg-label" x="${l - 8}" y="${Y(v) + 4}" text-anchor="end">${v}</text>`).join('') +
+      `<line class="axis" x1="${l}" x2="${W - r}" y1="${Y(0)}" y2="${Y(0)}"/>` +
+      `<text class="svg-label" x="${l - 8}" y="${Y(0) + 4}" text-anchor="end">0</text>` +
+      `<text class="svg-label" x="${W - r}" y="${H - 6}" text-anchor="end">training steps → ${losses.length - 1}</text>` +
+      `<polyline class="loss-line" points="${pts}"/>` +
+      `<circle class="loss-dot" cx="${X(losses.length - 1)}" cy="${Y(last)}" r="5"/>`;
+  }
+  function trainOnce() {
+    const p = softmax(logits);
+    logits = logits.map((v, i) => v - TRAIN_LR * (p[i] - (i === 0 ? 1 : 0)));
+    trainStep++;
+    losses.push(lossOf());
+  }
+  async function train(n) {
+    if (training) return;
+    training = true;
+    for (let k = 0; k < n; k++) { trainOnce(); renderTrain(); if (!reduced && n > 1) await sleep(70); }
+    training = false;
+  }
+  function resetTrain() { logits = [-0.9, 0.3, 0.6, 0.4, 0.1];   // "Paris" starts as a long shot (7%)
+    trainStep = 0; losses = [lossOf()]; renderTrain(); }
+  $('#train1').addEventListener('click', () => train(1));
+  $('#train20').addEventListener('click', () => train(20));
+  $('#trainReset').addEventListener('click', () => { if (!training) resetTrain(); });
+  resetTrain();
+
   /* ------------------------------------------------------------------ 5: how it answers, seven steps of inference */
   // The rail on the left never moves; only the stage card changes. Panel motion is CSS keyed to .frame-v.is-on, so
   // showStep() restarts it by re-adding the class; the few moving parts CSS cannot do (the vector rising through the

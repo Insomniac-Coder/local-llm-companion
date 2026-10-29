@@ -101,7 +101,24 @@
         <p class="stage-result">Result: the polished assistant you know from ChatGPT or Claude.</p>
       </li>
     </ol>
-    <details class="eng-note"><summary>Engineer's note</summary><p>Pre-training minimises cross-entropy loss on next-token prediction with gradient descent over mini-batches of millions of tokens across thousands of GPUs. Stage 2 is supervised fine-tuning (SFT); stage 3 is RLHF or a direct method such as DPO. Reasoning models add reinforcement learning with verifiable rewards (unit tests, exact answers). Meta reports about 30.8 million H100 GPU-hours for Llama 3.1 405B.</p></details>
+    <div class="trainer card rv" style="--d:6">
+      <div class="trainer-main">
+        <p class="trainer-k">Try it · train a tiny model that knows five words</p>
+        <p class="trainer-prompt">The capital of France is <span class="blank" id="trainGuess">____</span></p>
+        <div class="trainer-btns">
+          <button class="btn btn-primary" id="train1" type="button">Train 1 step</button>
+          <button class="btn" id="train20" type="button">Train 20 steps</button>
+          <button class="btn trainer-reset" id="trainReset" type="button">Start over</button>
+        </div>
+        <p class="trainer-msg" id="trainMsg" aria-live="polite">Step 0. It has no idea yet.</p>
+      </div>
+      <div class="bars trainer-bars" id="trainBars" aria-label="The model's guesses for the missing word"></div>
+      <div class="loss">
+        <p class="caption">How wrong it is (the “loss”) after each step</p>
+        <svg id="lossChart" viewBox="0 0 420 170" role="img" aria-label="Loss falling as the model trains"></svg>
+      </div>
+    </div>
+    <details class="eng-note"><summary>Engineer's note</summary><p>Pre-training minimises cross-entropy loss on next-token prediction with gradient descent over mini-batches of millions of tokens across thousands of GPUs. Stage 2 is supervised fine-tuning (SFT); stage 3 is RLHF or a direct method such as DPO. Reasoning models add reinforcement learning with verifiable rewards (unit tests, exact answers). Meta reports about 30.8 million H100 GPU-hours for Llama 3.1 405B.</p><p>The toy does real gradient descent on five scores (logits). With softmax probabilities p, the gradient of the loss −log p(Paris) is (p − 1) for “Paris” and p for every other word; each step subtracts the learning rate (0.6) times that gradient. A real model does the same for every position of every sentence, over a vocabulary of 100,000+ tokens and billions of parameters.</p></details>
   </div></div>
 </section>
 
