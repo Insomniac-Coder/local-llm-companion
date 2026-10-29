@@ -236,8 +236,8 @@
       case 'PageDown': d = 1; break;
       case 'PageUp': d = -1; break;
       case ' ': if (!onButton && !onRange) d = e.shiftKey ? -1 : 1; break;
-      case 'Home': go(0); e.preventDefault(); return;
-      case 'End': go(slides.length - 1); e.preventDefault(); return;
+      case 'Home': if (onRange) return; go(0); e.preventDefault(); return;
+      case 'End': if (onRange) return; go(slides.length - 1); e.preventDefault(); return;
       default: return;
     }
     if (!d) return;
