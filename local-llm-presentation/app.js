@@ -488,6 +488,229 @@
 
   /* BUILD:controls START */
   /* ------------------------------------------------------------------ 5: temperature and top-K */
+  // Chances = softmax(score ÷ T); top-K then keeps the K most likely words and rescales them to add up to 100%.
+  // The last three words are the "hallucinations": plausible-sounding, wrong. On arrival a short demo sweeps the
+  // dials from Facts to Brainstorm to Chat, drawing 12 answers on the way; touching anything hands over control.
+  const CTL_WORDS = [['safe', 2.3], ['private', 2.0], ['secure', 1.7], ['protected', 1.4], ['yours', 0.9], ['moving', -0.2], ['guessing', -0.9], ['in a volcano', -2.6]];
+  const CTL_ODD = 5;                       // index of the first nonsense word
+  const CTL_PRESETS = { facts: [0.2, 1], chat: [0.7, 5], brainstorm: [1.3, 8] };
+  const CTL_MAX = 0.15, CTL_SWEEP = 220;   // gauge: 0 to 15% over a 220° arc, square-root scale so the low band is readable
+  const CTL_BANDS = [0.01, 0.05];          // low below 1%, medium to 5%, high above
+  const ctlT = $('#ctlT'), ctlK = $('#ctlK'), ctlBars = $('#ctlBars'), ctlGauge = $('#ctlGauge'), ctlChips = $('#ctlChips');
+  const ctlPresetBtns = $$('#ctlPresets .seg-btn');
+  const ctl = { T: 0.7, K: 5 };
+  let ctlDrawnAt = '', ctlTouched = false, ctlDemo = 0, ctlMove = 0, ctlCutK = 0, ctlCutTimer = 0;
+  const ctlPct = x => (x > 0 && x < 0.005 ? '<1%' : Math.round(x * 100) + '%');
+  // whole percentages for the kept words that add up to exactly 100 (largest remainder), so the column checks out
+  const ctlWhole = xs => {
+    const raw = xs.map(x => x * 100), out = raw.map(Math.floor);
+    let left = 100 - out.reduce((a, b) => a + b, 0);
+    raw.map((x, i) => [x - out[i], i]).sort((a, b) => b[0] - a[0]).forEach(([, i]) => { if (left > 0) { out[i]++; left--; } });
+    return out.map((n, i) => (n === 0 && xs[i] > 0 ? '<1%' : n + '%'));
+  };
+  const ctlKey = (T, K) => `${T.toFixed(1)}|${K}`;
+  const ctlKLabel = K => (K >= CTL_WORDS.length ? 'all' : String(K));
+  function ctlOdds(T, K) {
+    const p = softmax(CTL_WORDS.map(w => w[1]), T);
+    const kept = p.slice(0, K).reduce((a, b) => a + b, 0);
+    const q = p.map((x, i) => (i < K ? x / kept : 0));
+    return { p, q, risk: q.slice(CTL_ODD).reduce((a, b) => a + b, 0) };
+  }
+
+  // bars: built once; rows below the cut slide down to make room for the cut line
+  const ctlRows = CTL_WORDS.map(([w], i) => {
+    const r = el('div', 'ctl-row' + (i >= CTL_ODD ? ' is-odd' : ''));
+    r.setAttribute('role', 'listitem');
+    r.style.setProperty('--i', i);
+    const track = el('span', 'ctl-track');
+    track.append(el('span', 'ctl-fill'));
+    r.append(el('span', 'ctl-word', w), track, el('span', 'ctl-val'));
+    return r;
+  });
+  const ctlCut = el('div', 'ctl-cut');
+  ctlCut.setAttribute('aria-hidden', 'true');
+  ctlCut.append(el('span', 'ctl-cut-pill'), el('span', 'ctl-cut-line'));
+  ctlBars.append(...ctlRows, ctlCut);
+  const ctlTicks = CTL_WORDS.map((_, i) => {
+    const s = el('span', null, ctlKLabel(i + 1));
+    s.style.setProperty('--t', i / (CTL_WORDS.length - 1));
+    return s;
+  });
+  $('#ctlTicks').append(...ctlTicks);
+
+  // gauge: three bands, tick labels outside the arc, the reading inside the opening below the needle
+  const G = { cx: 150, cy: 110, r: 92, w: 16 };
+  const gAngle = risk => CTL_SWEEP * Math.sqrt(clamp(risk / CTL_MAX));
+  const gPoint = (deg, rad) => { const th = (200 - deg) * Math.PI / 180; return [G.cx + rad * Math.cos(th), G.cy - rad * Math.sin(th)]; };
+  const gArc = (a, b) => {
+    const [x1, y1] = gPoint(a, G.r), [x2, y2] = gPoint(b, G.r);
+    return `M${x1.toFixed(2)} ${y1.toFixed(2)} A${G.r} ${G.r} 0 ${b - a > 180 ? 1 : 0} 1 ${x2.toFixed(2)} ${y2.toFixed(2)}`;
+  };
+  (() => {
+    const b1 = gAngle(CTL_BANDS[0]), b2 = gAngle(CTL_BANDS[1]), gap = 1.6;
+    let s = `<path class="ctl-band low" d="${gArc(0, b1 - gap / 2)}"/><path class="ctl-band mid" d="${gArc(b1 + gap / 2, b2 - gap / 2)}"/><path class="ctl-band high" d="${gArc(b2 + gap / 2, CTL_SWEEP)}"/>`;
+    for (const [v, lab] of [[0, '0%'], [CTL_BANDS[0], '1%'], [CTL_BANDS[1], '5%'], [CTL_MAX, '15%']]) {
+      const [x, y] = gPoint(gAngle(v), G.r + G.w / 2 + 14);
+      const anchor = x < G.cx - 8 ? 'end' : x > G.cx + 8 ? 'start' : 'middle';
+      s += `<text class="ctl-tick" x="${x.toFixed(1)}" y="${(y + 4.5).toFixed(1)}" text-anchor="${anchor}">${lab}</text>`;
+    }
+    const [nx, ny] = gPoint(0, 72);
+    s += `<g class="ctl-needle" id="ctlNeedle" style="transform-origin:${G.cx}px ${G.cy}px"><line x1="${G.cx}" y1="${G.cy}" x2="${nx.toFixed(2)}" y2="${ny.toFixed(2)}"/><circle cx="${G.cx}" cy="${G.cy}" r="9"/></g>`;
+    s += `<circle class="ctl-pivot-dot" cx="${G.cx}" cy="${G.cy}" r="3.5"/>`;
+    s += `<text class="ctl-num" id="ctlNum" x="${G.cx}" y="${G.cy + 47}" text-anchor="middle">0%</text>`;
+    s += `<text class="ctl-band-word" id="ctlBandWord" x="${G.cx}" y="${G.cy + 67}" text-anchor="middle">Low risk</text>`;
+    ctlGauge.innerHTML = s;
+  })();
+  const ctlNeedle = $('#ctlNeedle'), ctlNum = $('#ctlNum'), ctlBandWord = $('#ctlBandWord');
+
+  function ctlTakeaway(T, K, risk) {
+    if (K === 1) return 'Always the same word. Right for facts, numbers and code.';
+    if (T < 0.4) return 'Almost always the same word. Right for facts, numbers and code.';
+    if (T <= 1.1) return risk ? 'Mostly sensible, but a nonsense word can now slip through.' : 'Mostly sensible, with some variety. The usual setting for chat.';
+    return risk ? 'Odd words creep in. Fine for brainstorming, risky for anything factual.' : 'Varied, yet top-K keeps every pick sensible. Good for drafting ideas.';
+  }
+
+  function ctlRender(T, K) {
+    ctl.T = T; ctl.K = K;
+    const { p, q, risk } = ctlOdds(T, K);
+    const kept = ctlWhole(q.slice(0, K));
+    ctlT.value = T; ctlK.value = K;
+    paintRange(ctlT); paintRange(ctlK);
+    ctlK.setAttribute('aria-valuetext', K >= CTL_WORDS.length ? 'all words' : `top ${K}`);
+    $('#ctlTOut').textContent = T.toFixed(1);
+    $('#ctlKOut').textContent = ctlKLabel(K);
+    ctlTicks.forEach((s, i) => s.classList.toggle('is-on', i + 1 === K));
+    ctlRows.forEach((r, i) => {
+      const cut = i >= K, x = cut ? p[i] : q[i];
+      r.classList.toggle('is-cut', cut);
+      r.classList.toggle('is-top', i === 0);
+      r.style.setProperty('--cut', cut ? 1 : 0);
+      r.children[1].firstChild.style.setProperty('--w', x.toFixed(4));
+      r.children[2].textContent = cut ? ctlPct(x) : kept[i];
+      r.setAttribute('aria-label', `${CTL_WORDS[i][0]}: ${cut ? 'cut by top-K' : kept[i]}${i >= CTL_ODD ? ', nonsense' : ''}`);
+    });
+    const all = K >= CTL_WORDS.length;
+    // the cut line fades out, jumps and fades back in once the rows have glided apart, so it never crosses a word
+    if (K !== ctlCutK) {
+      if (ctlCutK) {
+        ctlCut.classList.add('is-hidden');
+        clearTimeout(ctlCutTimer);
+        ctlCutTimer = setTimeout(() => ctlCut.classList.remove('is-hidden'), reduced ? 0 : 380);
+      }
+      ctlCutK = K;
+      ctlCut.style.setProperty('--k', K);
+    }
+    ctlCut.classList.toggle('is-off', all);
+    ctlCut.firstChild.textContent = all ? 'top-K off · all 8 in play' : K === 1 ? 'top 1 kept · the rest cut' : `top ${K} kept · rescaled to 100%`;
+    // gauge
+    const band = risk === 0 ? 'none' : risk < CTL_BANDS[0] ? 'low' : risk < CTL_BANDS[1] ? 'mid' : 'high';
+    const shown = risk === 0 ? '0%' : risk < 0.001 ? '<0.1%' : (risk * 100).toFixed(1) + '%';
+    ctlGauge.dataset.band = band;
+    ctlNeedle.style.transform = `rotate(${gAngle(risk).toFixed(2)}deg)`;
+    ctlNum.textContent = shown;
+    ctlBandWord.textContent = band === 'none' ? 'cut by top-K' : band === 'mid' ? 'medium risk' : band + ' risk';
+    ctlGauge.setAttribute('aria-label', `Hallucination risk ${shown}: ${ctlBandWord.textContent}`);
+    const take = $('#ctlTake');
+    take.textContent = ctlTakeaway(T, K, risk);
+    take.className = 'ctl-take' + (band === 'mid' || band === 'high' ? ' ' + band : '');
+    ctlPresetBtns.forEach(b => {
+      const [pt, pk] = CTL_PRESETS[b.dataset.preset];
+      const on = Math.abs(pt - T) < 0.05 && pk === K;
+      b.classList.toggle('is-on', on);
+      b.setAttribute('aria-pressed', String(on));
+    });
+    ctlChips.classList.toggle('is-stale', !!ctlDrawnAt && ctlDrawnAt !== ctlKey(T, K));
+    if (ctlDrawnAt && ctlDrawnAt !== ctlKey(T, K)) $('#ctlTally').textContent = 'Dials moved: generate again';
+  }
+
+  function ctlEmpty() {
+    ctlDrawnAt = '';
+    ctlChips.classList.remove('is-stale');
+    ctlChips.replaceChildren(...Array.from({ length: 12 }, () => el('li', 'ctl-chip is-empty', '·')));
+    $('#ctlTally').textContent = '12 draws at the current settings';
+    const blank = $('#ctlBlank');
+    blank.className = 'ctl-blank';
+    blank.textContent = '';
+  }
+  function ctlSample() {
+    const T = Math.round(ctl.T * 10) / 10, K = ctl.K;
+    const { q } = ctlOdds(T, K);
+    const picks = Array.from({ length: 12 }, () => {
+      let r = Math.random(), i = 0;
+      while (i < K - 1 && (r -= q[i]) > 0) i++;   // never lands on a word top-K has cut
+      return i;
+    });
+    ctlDrawnAt = ctlKey(T, K);
+    ctlChips.classList.remove('is-stale');
+    ctlChips.replaceChildren(...picks.map((i, n) => {
+      const c = el('li', 'ctl-chip' + (i >= CTL_ODD ? ' is-odd' : ''), CTL_WORDS[i][0]);
+      c.style.setProperty('--n', n);
+      return c;
+    }));
+    const odd = picks.filter(i => i >= CTL_ODD).length;
+    const tally = $('#ctlTally');
+    tally.replaceChildren(el('b', odd ? 'is-odd' : null, odd ? `${odd} nonsense` : 'No nonsense'), ` in 12 · T ${T.toFixed(1)}, top-K ${ctlKLabel(K)}`);
+    const blank = $('#ctlBlank');
+    blank.className = 'ctl-blank';
+    void blank.offsetWidth;
+    blank.className = 'ctl-blank is-word' + (picks[0] >= CTL_ODD ? ' is-odd' : '');
+    blank.textContent = CTL_WORDS[picks[0]][0];
+  }
+
+  // smooth moves between settings (presets and the demo); a new move or any touch cancels the one running
+  const ctlEase = k => (k < 0.5 ? 4 * k * k * k : 1 - Math.pow(-2 * k + 2, 3) / 2);
+  const ctlStepAny = on => { ctlT.step = on ? 'any' : '0.1'; };
+  async function ctlGlide(to, ms, guard = () => true) {
+    const me = ++ctlMove, from = [ctl.T, ctl.K], t0 = performance.now();
+    if (reduced || ms <= 0) { ctlRender(...to); return true; }
+    ctlStepAny(true);
+    for (;;) {
+      if (me !== ctlMove || !guard()) { if (me === ctlMove) ctlStepAny(false); return false; }
+      const k = clamp((performance.now() - t0) / ms), e = ctlEase(k);
+      if (k >= 1) { ctlStepAny(false); ctlRender(...to); return true; }
+      ctlRender(from[0] + (to[0] - from[0]) * e, Math.round(from[1] + (to[1] - from[1]) * e));
+      await new Promise(requestAnimationFrame);
+    }
+  }
+  function ctlStop() {
+    ctlTouched = true;
+    ctlDemo++; ctlMove++;
+    ctlStepAny(false);
+    ctl.T = Math.round(ctl.T * 10) / 10;
+  }
+  async function ctlPlay() {
+    const me = ++ctlDemo;
+    const live = () => me === ctlDemo && !ctlTouched && isActive('controls');
+    const wait = async ms => { await sleep(ms); return live(); };
+    ctlMove++;
+    ctlRender(...CTL_PRESETS.facts);
+    ctlEmpty();
+    if (!await wait(1300)) return;
+    ctlSample();
+    if (!await wait(1500)) return;
+    if (!await ctlGlide(CTL_PRESETS.brainstorm, 2000, live)) return;
+    if (!await wait(350)) return;
+    ctlSample();
+    if (!await wait(2600)) return;
+    if (!await ctlGlide(CTL_PRESETS.chat, 1400, live)) return;
+    if (!await wait(350)) return;
+    ctlSample();
+  }
+
+  ctlT.addEventListener('input', () => { ctlStop(); ctlRender(Math.round(+ctlT.value * 10) / 10, ctl.K); });
+  ctlK.addEventListener('input', () => { ctlStop(); ctlRender(ctl.T, +ctlK.value); });
+  ctlPresetBtns.forEach(b => b.addEventListener('click', () => { ctlStop(); ctlGlide(CTL_PRESETS[b.dataset.preset], 650); }));
+  $('#ctlSample').addEventListener('click', () => { ctlStop(); ctlSample(); });
+  // the presenter takes over the moment they touch the panel
+  $('#ctlPanel').addEventListener('pointerdown', () => { if (!ctlTouched) ctlStop(); });
+  $('#ctlPanel').addEventListener('keydown', () => { if (!ctlTouched) ctlStop(); });
+
+  ctlRender(...CTL_PRESETS.chat);
+  ctlSample();
+  hooks.controls = () => {
+    if (reduced || ctlTouched) { ctlRender(ctl.T, ctl.K); return; }
+    ctlPlay();
+  };
   /* BUILD:controls END */
 
   /* BUILD:memory START */
