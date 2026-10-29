@@ -230,7 +230,7 @@
       <div class="ctl-risk">
         <p class="ctl-h">Hallucination risk</p>
         <svg class="ctl-gauge" id="ctlGauge" viewBox="0 0 300 182" role="img" aria-label="Hallucination risk"></svg>
-        <p class="ctl-risk-cap">Chance of a <span class="ctl-odd-dot" aria-hidden="true"></span>nonsense pick, each word</p>
+        <p class="ctl-risk-cap">Illustrative odds of a <span class="ctl-odd-dot" aria-hidden="true"></span>nonsense pick</p>
         <p class="ctl-take" id="ctlTake" aria-live="polite"></p>
       </div>
       <div class="ctl-sampler">
@@ -246,7 +246,7 @@
         <p class="callout-title">Why this matters for us</p>
         <p>The model never looks anything up: missing a fact, it still writes the most plausible words, a <b>hallucination</b>. The&nbsp;fix is not a bigger model or a lower dial but the right documents (RAG), with a low temperature.</p>
       </div>
-      <a class="ctl-xref" href="#rag"><span class="callout-title">Top-K again · slide 12 →</span><span>Search picks the top K passages.</span></a>
+      <a class="ctl-xref" href="#rag"><span class="callout-title">Top-K again in RAG →</span><span>Search picks the top K passages.</span></a>
     </div>
     <details class="eng-note"><summary>Engineer's note</summary>
       <p class="ctl-note">Each candidate's score (logit) <code>z</code> is divided by the temperature before the softmax: <code>p = softmax(z / T)</code>. Below 1 the odds sharpen, above 1 they flatten, and as T&nbsp;→&nbsp;0 sampling becomes <b>greedy decoding</b>: always the top token. <b>Top-k</b> keeps the k most probable tokens, zeroes the rest and renormalises the survivors to sum to 1.</p>
