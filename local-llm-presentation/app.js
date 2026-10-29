@@ -2217,7 +2217,7 @@
   // tool use and grounded answers, Gemma for drafting (illustrative choices of open-weight models we can host)
   const obsLlm = (model, temp, inTok, outTok) => ({ model, tok: inTok + outTok,
     meta: `temperature <b>${temp}</b> · <b>${fmt(inTok)}</b> tokens in, <b>${fmt(outTok)}</b> out` });
-  const OBS_EMBED = 'MiniLM-L6-v2';
+  const OBS_EMBED = 'all-MiniLM-L6-v2';
   const OBS_PICK = 'messages: the request\nchoose one of: rag_agent · infra_agent · general_agent · FINISH';
   const OBS_SLOW_REQ = 'Staging feels slow: check it and tell me what the runbook says';
   const OBS_SLOW_ANSWER = 'CPU-bound: p95 2.4 s, CPU 92% on 2 replicas. Runbook: scale out above 85% CPU for 10 min; on staging an admin approves the change.';
@@ -2235,16 +2235,17 @@
   function obsSlow(fail) {
     const S = fail ? 10.02 : 0, t = x => x + S;     // everything after the metrics call shifts by the timeout
     const spans = [
-      obsRoot(OBS_SLOW_REQ, OBS_SLOW_ANSWER, t(4.40), 'user <b>on-call engineer</b> · department <b>engineering</b> · thread <b>infra-0412</b>'),
+      obsRoot(OBS_SLOW_REQ, OBS_SLOW_ANSWER, t(4.40), 'user <b>on-call engineer</b> · department <b>engineering</b> · thread <b>infra-0398</b>'),
       obsSup('infra_agent', 'infrastructure task', 0, 0.42, 312, 280),
       { name: 'infra_agent', type: 'chain', agent: 'infra', depth: 1, t0: 0.42, t1: t(2.10),
-        input: `"${OBS_SLOW_REQ}"`, output: 'p95 2.4 s, CPU 92%, 2 replicas: looks CPU-bound', meta: '2 model calls · 1 tool call · <b>950</b> tokens' },
+        input: `"${OBS_SLOW_REQ}"`, output: 'p95 2.4 s, CPU 92%, 2 replicas: looks CPU bound',
+        meta: fail ? '2 model calls · 2 tool calls (1 timed out) · <b>950</b> tokens' : '2 model calls · 1 tool call · <b>950</b> tokens' },
       { name: 'choose a tool', type: 'llm', agent: 'infra', depth: 2, t0: 0.44, t1: 0.98, ...obsLlm('gpt-oss-120b', 0, 372, 38),
         input: 'system: You are the Infra agent. Use only the listed tools.\ntools: get_metrics, get_logs, restart_service (staging only, after an admin approves)', output: 'call get_metrics(env="staging", service="checkout")' },
       fail
         ? { name: 'get_metrics', type: 'tool', agent: 'infra', depth: 2, t0: 1.00, t1: 11.00, err: true,
             input: 'get_metrics(env="staging", service="checkout")', error: 'TimeoutError: the metrics API did not answer within 10 s',
-            diag: '<b>The slow step was the metrics API, not the model.</b> It timed out after 10 s; the automatic retry answered in 0.35 s. Fix or alert on the API before blaming the model.', meta: 'read-only · runs without approval · attempt <b>1 of 3</b>' }
+            diag: '<b>The slow step was the metrics API, not the model.</b> It timed out after 10 s; the automatic retry answered in 0.35 s. Fix or alert on the API, not the model.', meta: 'read-only · runs without approval · attempt <b>1 of 3</b>' }
         : { name: 'get_metrics', type: 'tool', agent: 'infra', depth: 2, t0: 1.00, t1: 1.35,
             input: 'get_metrics(env="staging", service="checkout")', output: '{ "p95_ms": 2400, "cpu": 0.92, "replicas": 2 }', meta: 'read-only · runs without approval (slide 14)' },
       ...(fail ? [{ name: 'get_metrics · retry', type: 'tool', agent: 'infra', depth: 2, t0: 11.02, t1: 11.37,
@@ -2318,10 +2319,14 @@
     { key: 'fail', label: 'Staging slow', tags: ['infra', 'rag'], fail: true, req: OBS_SLOW_REQ, build: () => obsSlow(true) },
   ];
   const obsApp = $('#observe .obs-app'), obsRows = $('#obsRows'), obsInsp = $('#obsInsp');
-  let obsRun = 0, obsKey = 'slow', obsData = null;
+  let obsRun = 0, obsKey = 'slow', obsData = null, obsPicked = 0;   // obsPicked: the stream in which the presenter chose a step
   const obsTag = (agent, text) => el('span', `obs-atag a-${agent}`, text);
   const obsSec = (label, ...kids) => { const d = el('div', 'obs-sec'); d.append(el('p', null, label), ...kids); return d; };
-  const obsCode = text => el('p', 'obs-code', text);
+  // inspector text breaks only where it reads well: a number stays with its unit (46 s, 2 of 2 replicas, slide 16),
+  // a label with its value (thread infra-0398, "ready": "2/2"), and a line may end with a · but never start with one
+  const obsGlue = t => t.replace(/(\d) of (\d)/g, '$1\u00a0of\u00a0$2').replace(/(\d) (s|min|chunks|replicas)\b/g, '$1\u00a0$2')
+    .replace(/slide (\d)/g, 'slide\u00a0$1').replace(/": /g, '":\u00a0').replace(/ · /g, '\u00a0· ').replace(/(\w) <b>/g, '$1\u00a0<b>');
+  const obsCode = text => el('p', 'obs-code', obsGlue(text));
   function obsSelect(i) {
     $$('.obs-span', obsRows).forEach(b => { const on = +b.dataset.i === i; b.classList.toggle('is-on', on); b.setAttribute('aria-pressed', String(on)); });
     const sp = obsData.spans[i];
@@ -2334,8 +2339,8 @@
     stats.append(`${(sp.t1 - sp.t0).toFixed(2)} s · from ${sp.t0.toFixed(2)} s${sp.tok ? ` · ${fmt(sp.tok)} tokens` : ''}`);
     const parts = [head, stats, obsSec('Input', obsCode(sp.input))];
     if (sp.error) {
-      parts.push(obsSec('Error', el('p', 'obs-err', sp.error)));
-      const d = el('p', 'obs-diag'); d.innerHTML = sp.diag; parts.push(d);
+      parts.push(obsSec('Error', el('p', 'obs-err', obsGlue(sp.error))));
+      const d = el('p', 'obs-diag'); d.innerHTML = obsGlue(sp.diag); parts.push(d);
     } else if (sp.chunks) {
       const ol = el('ol', 'obs-chunks');
       for (const [score, src, text] of OBS_CHUNKS[sp.chunks]) { const li = el('li'); li.append(el('b', null, score), el('em', null, src), el('span', null, text)); ol.append(li); }
@@ -2343,7 +2348,7 @@
     } else {
       parts.push(obsSec('Output', obsCode(sp.output)));
     }
-    const meta = el('p', 'obs-meta'); meta.innerHTML = sp.meta; parts.push(meta);
+    const meta = el('p', 'obs-meta'); meta.innerHTML = obsGlue(sp.meta); parts.push(meta);
     obsInsp.replaceChildren(...parts);
     obsInsp.classList.remove('pop'); void obsInsp.offsetWidth; obsInsp.classList.add('pop');
   }
@@ -2364,7 +2369,7 @@
     bar.style.setProperty('--grow', Math.max(0.22, growMs / 1000).toFixed(2) + 's');
     track.append(bar);
     b.append(name, el('span', 'obs-model' + (sp.model ? '' : ' none'), sp.model || '–'), track, el('span', 'obs-num', (sp.t1 - sp.t0).toFixed(2) + ' s'), el('span', 'obs-num' + (sp.tok ? '' : ' none'), sp.tok ? fmt(sp.tok) : '–'));
-    b.addEventListener('click', () => obsSelect(i));
+    b.addEventListener('click', () => { obsPicked = obsRun; obsSelect(i); });
     li.append(b);
     return li;
   }
@@ -2398,7 +2403,6 @@
     obsKey = key;
     obsData = run.build();
     obsData.total = obsData.spans[0].t1;
-    obsApp.classList.toggle('failed', !!run.fail);
     $$('.obs-runchip', $('#obsRuns')).forEach(b => { const on = b.dataset.run === key; b.classList.toggle('is-on', on); b.setAttribute('aria-pressed', String(on)); });
     obsAxis();
     obsRoute(run);
@@ -2432,16 +2436,16 @@
     if (me !== obsRun) return;
     obsApp.classList.remove('streaming');
     obsTotals(total, tokens(total));
-    obsSelect(obsData.pick);
+    if (obsPicked !== me) obsSelect(obsData.pick);
   }
   $('#obsRuns').replaceChildren(...OBS_RUNS.map(r => {
     const b = el('button', 'obs-runchip');
     b.type = 'button';
     b.dataset.run = r.key;
     b.setAttribute('aria-pressed', 'false');
-    b.setAttribute('aria-label', `${r.req}: ${r.tags.map(a => OBS_AGENT[a]).join(' then ')}${r.fail ? ', failed' : ''}`);
+    b.setAttribute('aria-label', `${r.req}: ${r.tags.map(a => OBS_AGENT[a]).join(' then ')}${r.fail ? ', 1 error, retried' : ''}`);
     b.append(el('span', null, r.label), ...r.tags.map(a => obsTag(a, OBS_SHORT[a])));
-    if (r.fail) b.append(el('span', 'obs-atag fail', 'failed'));
+    if (r.fail) b.append(el('span', 'obs-atag fail', '1 error'));
     b.addEventListener('click', () => obsStream(r.key));
     return b;
   }));
@@ -2459,7 +2463,8 @@
   function obsCost() {
     const hw = +($('#cHw')?.value || 3000000), run = +($('#cRun')?.value || 125000);
     const perRequest = (hw / 36 + run) / 30 / 1284;     // monthly server cost spread over 1,284 requests a day
-    $('#obsCost').textContent = `≈ ${inr(perRequest)}`;
+    const d = perRequest / INR_PER_USD;
+    $('#obsCost').textContent = `≈ ${perRequest < 1 ? '₹' + perRequest.toFixed(2) : inr(perRequest)} (${d < 0.01 ? '< $0.01' : '$' + d.toFixed(2)})`;
   }
   $('#obsReplay').addEventListener('click', () => obsStream(obsKey));
   obsCost();
