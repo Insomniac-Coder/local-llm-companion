@@ -212,7 +212,7 @@
             <output id="ctlTOut" for="ctlT">0.7</output>
           </div>
           <input class="range ctl-range" id="ctlT" type="range" min="0.1" max="2" step="0.1" value="0.7">
-          <div class="ctl-scale" aria-hidden="true"><span>Sharp · predictable</span><span>Flat · creative</span></div>
+          <div class="ctl-scale" aria-hidden="true"><span>Predictable</span><span>Creative</span><span>Chaotic</span></div>
         </div>
         <div class="ctl-dial">
           <div class="ctl-dial-head">
@@ -244,12 +244,12 @@
     <div class="ctl-foot rv" style="--d:4">
       <div class="callout ctl-why">
         <p class="callout-title">Why this matters for us</p>
-        <p>The model never looks anything up: missing a fact, it still writes the most plausible words, a <b>hallucination</b>. The fix is not a bigger model or a lower dial but the right documents (RAG), with a low temperature.</p>
+        <p>The model never looks anything up: missing a fact, it still writes the most plausible words, a <b>hallucination</b>. The&nbsp;fix is not a bigger model or a lower dial but the right documents (RAG), with a low temperature.</p>
       </div>
       <a class="ctl-xref" href="#rag"><span class="callout-title">Top-K again · slide 12 →</span><span>Search picks the top K passages.</span></a>
     </div>
     <details class="eng-note"><summary>Engineer's note</summary>
-      <p class="ctl-note">Each candidate's score (logit) <code>z</code> is divided by the temperature before the softmax: <code>p = softmax(z / T)</code>. Below 1 the odds sharpen, above 1 they flatten, and as T → 0 sampling becomes <b>greedy decoding</b>: always the top token. <b>Top-k</b> keeps the k most probable tokens, zeroes the rest and renormalises the survivors to sum to 1.</p>
+      <p class="ctl-note">Each candidate's score (logit) <code>z</code> is divided by the temperature before the softmax: <code>p = softmax(z / T)</code>. Below 1 the odds sharpen, above 1 they flatten, and as T&nbsp;→&nbsp;0 sampling becomes <b>greedy decoding</b>: always the top token. <b>Top-k</b> keeps the k most probable tokens, zeroes the rest and renormalises the survivors to sum to 1.</p>
       <p class="ctl-note"><b>Top-p</b> (nucleus sampling) keeps the smallest set of tokens whose probabilities add up to p, so the shortlist shrinks when the model is confident and grows when it is not. <b>Min-p</b> keeps tokens with at least a set fraction of the top token's probability. Temperature changes the probabilities but never their ranking, so applying it before or after top-k gives the same result; top-p and min-p cut on the probabilities themselves, so for them the order matters. <b>Repetition</b>, frequency and presence penalties lower the scores of tokens already used. A <b>fixed seed</b> makes sampling repeatable on the same setup, which matters for tests and evals.</p>
       <p class="ctl-note">Typical settings: chat about 0.7, often with top-p 0.9 to 0.95; extraction, code and RAG answers 0 to 0.3. A real vocabulary holds tens of thousands to over 200,000 tokens, and a high temperature hands the long tail real probability, which is why a cut-off is normally applied. None of these settings changes what the model knows, only how it chooses.</p>
     </details>

@@ -501,10 +501,13 @@
   const CTL_PRESETS = { facts: [0.2, 1], chat: [0.7, 5], brainstorm: [1.3, 8] };
   const CTL_MAX = 0.15, CTL_SWEEP = 220;   // gauge: 0 to 15% over a 220° arc, square-root scale so the low band is readable
   const CTL_BANDS = [0.01, 0.05];          // low below 1%, medium to 5%, high above
+  const CTL_TRACE = 0.045;                 // a cut word shown as 4% or less keeps an empty track: under two stripes of hatching
+                                           // (about 14 px) the bar reads as a glitch, not as a hatched bar
   const ctlT = $('#ctlT'), ctlK = $('#ctlK'), ctlBars = $('#ctlBars'), ctlGauge = $('#ctlGauge'), ctlChips = $('#ctlChips');
+  const ctlBlank = $('#ctlBlank'), ctlTally = $('#ctlTally');
   const ctlPresetBtns = $$('#ctlPresets .seg-btn');
   const ctl = { T: 0.7, K: 5 };
-  let ctlDrawnAt = '', ctlTouched = false, ctlDemo = 0, ctlMove = 0, ctlCutK = 0, ctlCutTimer = 0;
+  let ctlDrawnAt = '', ctlDrawnTally = [], ctlTouched = false, ctlDemo = 0, ctlMove = 0, ctlCutK = 0, ctlCutTimer = 0;
   const ctlPct = x => (x > 0 && x < 0.005 ? '<1%' : Math.round(x * 100) + '%');
   // whole percentages for the kept words that add up to exactly 100 (largest remainder), so the column checks out
   const ctlWhole = xs => {
@@ -568,11 +571,15 @@
   })();
   const ctlNeedle = $('#ctlNeedle'), ctlNum = $('#ctlNum'), ctlBandWord = $('#ctlBandWord');
 
-  function ctlTakeaway(T, K, risk) {
+  // the line reads the same numbers as the bars (the top word's kept chance) and the gauge (its band), so it never
+  // contradicts them
+  function ctlTakeaway(T, K, top, band) {
     if (K === 1) return 'Always the same word. Right for facts, numbers and code.';
-    if (T < 0.4) return 'Almost always the same word. Right for facts, numbers and code.';
-    if (T <= 1.1) return risk ? 'Mostly sensible, but a nonsense word can now slip through.' : 'Mostly sensible, with some variety. The usual setting for chat.';
-    return risk ? 'Odd words creep in. Fine for brainstorming, risky for anything factual.' : 'Varied, yet top-K keeps every pick sensible. Good for drafting ideas.';
+    if (band === 'high') return 'Odd words creep in. Fine for brainstorming, risky for anything factual.';
+    if (top >= 0.9) return 'Almost always the same word. Right for facts, numbers and code.';
+    if (T < 0.4) return 'Usually the top word, now and then the runner-up. Still a careful setting.';
+    if (band !== 'none') return 'Mostly sensible, but a nonsense word can now slip through.';
+    return T <= 1.1 ? 'Mostly sensible, with some variety. The\u00a0usual setting for chat.' : 'Varied, yet top-K keeps every pick sensible. Good for drafting ideas.';
   }
 
   function ctlRender(T, K) {
@@ -588,6 +595,7 @@
     ctlRows.forEach((r, i) => {
       const cut = i >= K, x = cut ? p[i] : q[i];
       r.classList.toggle('is-cut', cut);
+      r.classList.toggle('is-trace', cut && x < CTL_TRACE);
       r.classList.toggle('is-top', i === 0);
       r.style.setProperty('--cut', cut ? 1 : 0);
       r.children[1].firstChild.style.setProperty('--w', x.toFixed(4));
@@ -616,7 +624,7 @@
     ctlBandWord.textContent = band === 'none' ? 'cut by top-K' : band === 'mid' ? 'medium risk' : band + ' risk';
     ctlGauge.setAttribute('aria-label', `Hallucination risk ${shown}: ${ctlBandWord.textContent}`);
     const take = $('#ctlTake');
-    take.textContent = ctlTakeaway(T, K, risk);
+    take.textContent = ctlTakeaway(T, K, q[0], band);
     take.className = 'ctl-take' + (band === 'mid' || band === 'high' ? ' ' + band : '');
     ctlPresetBtns.forEach(b => {
       const [pt, pk] = CTL_PRESETS[b.dataset.preset];
@@ -624,18 +632,24 @@
       b.classList.toggle('is-on', on);
       b.setAttribute('aria-pressed', String(on));
     });
-    ctlChips.classList.toggle('is-stale', !!ctlDrawnAt && ctlDrawnAt !== ctlKey(T, K));
-    if (ctlDrawnAt && ctlDrawnAt !== ctlKey(T, K)) $('#ctlTally').textContent = 'Dials moved: generate again';
+    // the last draw dims (chips and the word in the blank) while the dials sit anywhere else, and comes back with them
+    const stale = !!ctlDrawnAt && ctlDrawnAt !== ctlKey(T, K);
+    ctlChips.classList.toggle('is-stale', stale);
+    ctlBlank.classList.toggle('is-stale', stale);
+    if (ctlDrawnAt && stale !== ctlTally.classList.contains('is-stale')) {
+      ctlTally.classList.toggle('is-stale', stale);
+      ctlTally.replaceChildren(...(stale ? ['Dials moved: generate again'] : ctlDrawnTally));
+    }
   }
 
   function ctlEmpty() {
     ctlDrawnAt = '';
     ctlChips.classList.remove('is-stale');
     ctlChips.replaceChildren(...Array.from({ length: 12 }, () => el('li', 'ctl-chip is-empty', '·')));
-    $('#ctlTally').textContent = '12 draws at the current settings';
-    const blank = $('#ctlBlank');
-    blank.className = 'ctl-blank';
-    blank.textContent = '';
+    ctlTally.classList.remove('is-stale');
+    ctlTally.textContent = '12 draws at the current settings';
+    ctlBlank.className = 'ctl-blank';
+    ctlBlank.textContent = '';
   }
   function ctlSample() {
     const T = Math.round(ctl.T * 10) / 10, K = ctl.K;
@@ -653,13 +667,13 @@
       return c;
     }));
     const odd = picks.filter(i => i >= CTL_ODD).length;
-    const tally = $('#ctlTally');
-    tally.replaceChildren(el('b', odd ? 'is-odd' : null, odd ? `${odd} nonsense` : 'No nonsense'), ` in 12 · T ${T.toFixed(1)}, top-K ${ctlKLabel(K)}`);
-    const blank = $('#ctlBlank');
-    blank.className = 'ctl-blank';
-    void blank.offsetWidth;
-    blank.className = 'ctl-blank is-word' + (picks[0] >= CTL_ODD ? ' is-odd' : '');
-    blank.textContent = CTL_WORDS[picks[0]][0];
+    ctlDrawnTally = [el('b', odd ? 'is-odd' : null, odd ? `${odd} nonsense` : 'No nonsense'), ` in 12 · T ${T.toFixed(1)}, top-K ${ctlKLabel(K)}`];
+    ctlTally.classList.remove('is-stale');
+    ctlTally.replaceChildren(...ctlDrawnTally);
+    ctlBlank.className = 'ctl-blank';
+    void ctlBlank.offsetWidth;
+    ctlBlank.className = 'ctl-blank is-word' + (picks[0] >= CTL_ODD ? ' is-odd' : '');
+    ctlBlank.textContent = CTL_WORDS[picks[0]][0];
   }
 
   // smooth moves between settings (presets and the demo); a new move or any touch cancels the one running

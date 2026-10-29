@@ -300,10 +300,11 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 /* the odds */
 .ctl-odds { display: grid; gap: 14px; align-content: start; }
 .ctl-prompt { font: 560 26px/1.25 var(--display); letter-spacing: -0.015em; color: var(--muted); }
-.ctl-blank { display: inline-block; min-width: 3.6em; padding: 0 6px; border-radius: 6px; border-bottom: 3px solid var(--ink); color: #0b1a2c; text-align: center; transition: background-color 0.3s; }
+.ctl-blank { display: inline-block; min-width: 3.6em; padding: 0 6px; border-radius: 6px; border-bottom: 3px solid var(--ink); color: #0b1a2c; text-align: center; transition: background-color 0.3s, opacity 0.3s; }
 .ctl-blank:empty::before { content: "\00a0"; }
 .ctl-blank.is-word { border-bottom-color: transparent; background: var(--hl2); animation: pop 0.35s ease-out; }
 .ctl-blank.is-word.is-odd { background: var(--warn-soft); color: var(--ctl-warn-ink); }
+.ctl-blank.is-stale { opacity: 0.38; }
 .ctl-bars { position: relative; height: calc(8 * var(--ctl-step) - 4px + var(--ctl-gap)); }
 .ctl-row {
   position: absolute; left: 0; right: 0; top: 0; height: 24px;
@@ -320,10 +321,12 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .ctl-row.is-top { color: var(--ink); font-weight: 500; }
 .ctl-row.is-odd .ctl-fill { background: var(--warn); }
 .ctl-val { text-align: right; font-variant-numeric: tabular-nums; }
-.ctl-row.is-cut { color: var(--faint); font-weight: 400; }
+.ctl-row.is-cut { color: var(--muted); font-weight: 400; }
 .ctl-row.is-cut .ctl-word, .ctl-row.is-cut .ctl-val { text-decoration: line-through; text-decoration-thickness: 1.5px; text-decoration-color: var(--faint); }
-.ctl-row.is-cut .ctl-word::before { opacity: 0.35; }
+.ctl-row.is-cut .ctl-word::before { opacity: 0.6; }
 .ctl-row.is-cut .ctl-fill { background: repeating-linear-gradient(135deg, var(--line-2) 0 3px, transparent 3px 7px); }
+/* a cut word with a tiny chance would leave a hatched sliver that reads as a glitch: its track stays empty */
+.ctl-row.is-cut.is-trace .ctl-fill { width: 0; }
 .ctl-cut {
   position: absolute; left: 0; right: 0; top: 0; height: 26px; display: flex; align-items: center; gap: 12px;
   transform: translateY(calc(var(--k) * var(--ctl-step))); transition: opacity 0.3s;
@@ -375,6 +378,8 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .ctl-chip.is-odd { background: var(--warn-soft); border-color: color-mix(in srgb, var(--warn) 45%, transparent); color: var(--ctl-warn-ink); font-weight: 600; }
 .ctl-chip.is-empty { background: transparent; border-style: dashed; border-color: var(--line-2); color: var(--faint); animation: none; }
 .ctl-chips.is-stale { opacity: 0.38; }
+/* the deck-wide reduced-motion rule shortens animations but keeps their delays: the chips must not trickle in */
+@media (prefers-reduced-motion: reduce) { .ctl-chip, .ctl-blank.is-word { animation: none; } }
 
 /* the footer */
 .ctl-foot { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 20px; }
