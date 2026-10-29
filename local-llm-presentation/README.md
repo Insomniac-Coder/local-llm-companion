@@ -10,7 +10,7 @@ models with our own harness and RAG. **Twenty slides, about twenty minutes, in f
 3. **What we have built**: the harness rings, then one slide per ring: our documents (the RAG pipeline and
    ChromaDB ingestion), tools (a LangGraph supervisor routing to RAG, Infra and General agents), rules (human in the
    loop: a run that pauses at a checkpoint for approval) and the audit log (LangSmith traces showing the agent and
-   the model chosen for every step); then the PC Companion prototype.
+   the model chosen for every step); then our system, the working prototype.
 4. **How we would do it**: the four routes and our recommendation, and the pilot plan.
 
 The deck says "our own" or "private" AI throughout, never "local" or "in-house", and names no Chinese models.
