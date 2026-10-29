@@ -2082,7 +2082,7 @@
   const AG_TYPE = { rag: 'Knowledge question', infra: 'Infrastructure task', gen: 'Anything else' };
   const AG_RUNS = [
     { key: 'vpn', label: 'VPN policy', req: 'What is our VPN policy for contractors?',
-      answer: 'Managed laptops only, and access ends on the contract end date.', cite: 'Security §3.2, §3.4',
+      answer: 'Managed devices only, and access ends on the contract end date.', cite: 'Security §3.2, §3.4',
       hops: [{ a: 'rag', tool: 'chroma', did: '<b>RAG agent</b> · ChromaDB: Security §3.2, §3.4', sources: ['Security §3.2', 'Security §3.4'] }] },
     { key: 'restart', label: 'Restart billing', req: 'Restart the billing service on staging',
       answer: 'Done: an admin approved, and billing on staging restarted with 2 of 2 replicas ready.',
@@ -2552,7 +2552,7 @@
   const OBS_CHUNKS = {
     slow: [['0.91', 'Scaling §2', 'Scale out above 85% CPU for 10 min'], ['0.84', 'Staging §1', 'An admin approves staging changes'],
       ['0.77', 'Alerts §3', 'p95 over 2 s for 5 min pages on-call'], ['0.62', 'Postmortem', 'Slow checkout: an under-sized cache']],
-    vpn: [['0.89', 'Security §3.2', 'Contractor VPN: managed laptops only'], ['0.81', 'Security §3.4', 'Access ends on the contract end date'],
+    vpn: [['0.89', 'Security §3.2', 'Contractor VPN: managed devices only'], ['0.81', 'Security §3.4', 'Access ends on the contract end date'],
       ['0.66', 'Onboarding §2', 'Managers request contractor access'], ['0.58', 'IT FAQ', 'Setting up the VPN client']],
   };
   const obsRoot = (req, answer, total, meta) => ({ name: 'supervisor graph', type: 'chain', depth: 0, t0: 0, t1: total, input: `"${req}"`, output: answer, meta });
@@ -2593,7 +2593,7 @@
   }
   function obsVpn() {
     const req = 'What is our VPN policy for contractors?';
-    const answer = 'Managed laptops only; access ends with the contract [Security §3.2, §3.4].';
+    const answer = 'Managed devices only; access ends with the contract [Security §3.2, §3.4].';
     const spans = [
       obsRoot(req, answer, 2.31, 'user <b>project manager</b> · department <b>delivery</b> · thread <b>delivery-0233</b>'),
       obsSup('rag_agent', 'knowledge question', 0, 0.36, 296, 268),
