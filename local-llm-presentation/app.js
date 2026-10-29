@@ -1240,7 +1240,7 @@
   };
 
   /* BUILD:rag START */
-  /* ------------------------------------------------------------------ 14: RAG pipeline and ChromaDB ingestion */
+  /* ------------------------------------------------------------------ 12: RAG pipeline and ChromaDB ingestion */
   // On arrival the HR policy is cut into chunks, each chunk becomes numbers and flies into the map as a dot; then the
   // first question runs the path back: its numbers drop a star onto the map, lines reach the K nearest chunks the
   // asker may see, those chunks lift into the prompt and the answer types with its source. Chips, top-K and the
@@ -1475,8 +1475,12 @@
       tilesBox.classList.remove('is-pre');
       tiles.forEach((t, n) => {
         const m = mid(t);
+        // earlier tiles stay above later ones, so a tile in flight passes under the ones that have landed
+        t.style.position = 'relative';
+        t.style.zIndex = String(10 - n);
+        const clear = () => { t.style.position = ''; t.style.zIndex = ''; };
         t.animate([{ transform: `translate(${d.x - m.x}px, ${d.y - m.y}px) scale(0.3)`, opacity: 0 }, { opacity: 1, offset: 0.15 }, { transform: 'none', opacity: 1 }],
-          { duration: 560, delay: n * 70, easing: 'cubic-bezier(.2,.7,.2,1)', fill: 'backwards' });
+          { duration: 560, delay: n * 70, easing: 'cubic-bezier(.2,.7,.2,1)', fill: 'backwards' }).finished.then(clear, clear);
       });
       if (!(await step(me, 580))) return false;
       // each chunk becomes numbers, then flies into the store as a dot
@@ -1562,7 +1566,7 @@
       li.append(el('span', 'rag-pr-ref', '\u00a0'), el('span', 'rag-pr-txt', '\u00a0'), el('span', 'rag-pr-w'));
       return li;
     };
-    const skipRows = k => Array.from({ length: 4 - k }, () => emptySlot('is-skip', `not retrieved · K = ${k}`));
+    const skipRows = k => Array.from({ length: 4 - k }, (_, n) => emptySlot('is-skip', n ? '' : `not retrieved · K = ${k}`));   // one label is enough
     const hitRows = () => $$('.rag-pr-row[data-c]', rowsBox);
     function slotRows(k) {
       rowsBox.replaceChildren(...Array.from({ length: k }, (_, n) => emptySlot('is-wait', `chunk ${n + 1} of ${k}`)), ...skipRows(k));

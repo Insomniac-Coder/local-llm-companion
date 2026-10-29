@@ -627,7 +627,7 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .control-list li { padding-top: 14px; border-top: 2px solid var(--ink); font-size: 18.5px; line-height: 1.45; color: var(--ink-2); }
 
 /* BUILD:rag START */
-/* 14 RAG pipeline and ChromaDB ingestion */
+/* 12 RAG pipeline and ChromaDB ingestion */
 .rag-head { align-items: flex-end; }
 .rag-ring { display: flex; align-items: center; gap: 14px; max-width: 380px; font: 400 13px/1.5 var(--mono); color: var(--muted); }
 .rag-ring svg { width: 60px; height: 60px; flex: none; }
