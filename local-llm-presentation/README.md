@@ -1,8 +1,7 @@
 # The Next Word Is Ours
 
 An interactive slide deck for the AI Council, proposing that we run our own private AI: open-weight language
-models with our own harness and RAG. **Twenty slides, about twenty minutes, in four parts** (work in progress: slide
-15's interactive diagram is still being finished):
+models with our own harness and RAG. **Twenty slides, about twenty minutes, in four parts**:
 
 1. **What an LLM is**: what it is and how large; how it learns; how it answers; temperature and top-K (a live
    instrument panel with a hallucination-risk gauge); memory, without and with a saved thread; why a frozen model

@@ -1851,8 +1851,8 @@
   $('#agReplay').addEventListener('click', () => agPlay(agKey));
 
   // edges: one arrow down to each agent and one back up, drawn from the layout (canvas px)
-  const SVGNS = 'http://www.w3.org/2000/svg';
-  const agSvgEl = (tag, cls) => { const n = document.createElementNS(SVGNS, tag); n.setAttribute('class', cls); return n; };
+  const AG_SVGNS = 'http://www.w3.org/2000/svg';
+  const agSvgEl = (tag, cls) => { const n = document.createElementNS(AG_SVGNS, tag); n.setAttribute('class', cls); return n; };
   const agEdges = {};
   ['in', 'out', 'rag-down', 'rag-up', 'infra-down', 'infra-up', 'gen-down', 'gen-up'].forEach(k => {
     const g = agSvgEl('g', 'ag-e ag-c-' + (k.includes('-') ? k.split('-')[0] : 'io'));
