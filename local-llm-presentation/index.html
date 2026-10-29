@@ -135,12 +135,12 @@
           <li><button type="button" class="step is-on" data-step="1" aria-current="step"><span class="step-n">1</span><span class="step-t">Your text is cut into tokens</span><span class="wk-tag">tokens</span></button></li>
           <li><button type="button" class="step" data-step="2"><span class="step-n">2</span><span class="step-t">Each token becomes a list of numbers</span><span class="wk-tag">embeddings</span></button></li>
           <li><button type="button" class="step" data-step="3"><span class="step-n">3</span><span class="step-t">Words look at each other</span><span class="wk-tag">attention</span></button></li>
-          <li><button type="button" class="step" data-step="4"><span class="step-n">4</span><span class="step-t">Layer after layer</span><span class="wk-tag">attention + feed-forward, 48 times</span></button></li>
+          <li><button type="button" class="step" data-step="4"><span class="step-n">4</span><span class="step-t">Layer after layer</span><span class="wk-tag">attention + experts, 36 times</span></button></li>
           <li><button type="button" class="step" data-step="5"><span class="step-n">5</span><span class="step-t">A score for every possible next token</span><span class="wk-tag">logits · softmax</span></button></li>
           <li><button type="button" class="step" data-step="6"><span class="step-n">6</span><span class="step-t">One token is picked</span><span class="wk-tag">temperature · top-K</span></button></li>
           <li><button type="button" class="step" data-step="7"><span class="step-n">7</span><span class="step-t">Add it, and run it all again</span><span class="wk-tag">prefill · decode · KV cache</span></button></li>
         </ol>
-        <p class="wk-model">Sizes shown are those of <b>Gemma&nbsp;3&nbsp;12B</b>, the model our system runs.</p>
+        <p class="wk-model">Sizes shown are those of <b>gpt&#8209;oss&#8209;120b</b>, the model behind our RAG and Infra agents.</p>
       </div>
 
       <div class="stage-panel card" id="wkStage" aria-live="polite">
@@ -164,7 +164,7 @@
               <span class="wk-ids-note">← token IDs (illustrative)</span>
             </div>
             <div class="wk-tiles">
-              <div class="wk-tile"><p class="wk-big">≈ 262,000</p><p>tokens in the vocabulary, each with its own ID</p></div>
+              <div class="wk-tile"><p class="wk-big">201,088</p><p>tokens in the vocabulary, each with its own ID</p></div>
               <div class="wk-tile"><p class="wk-big">100 tokens</p><p>≈ 75 English words. Usage limits and prices are counted in tokens.</p></div>
               <div class="wk-tile"><p class="wk-big">6 tokens</p><p>for these five words: the rarer “Summarise” is cut in two</p></div>
             </div>
@@ -181,15 +181,15 @@
               <p class="wk-lab">Embedding table</p>
               <svg class="wk-table" id="wkTable" aria-hidden="true"></svg>
               <p class="wk-rowtag"><span class="wk-rowchip">contract</span><span class="wk-rowid">ID 5,172</span></p>
-              <p class="wk-tdim">≈ 262,000 rows × 3,840 numbers, learned in training</p>
+              <p class="wk-tdim">201,088 rows × 2,880 numbers, learned in training</p>
             </div>
             <svg class="wk-link" id="wkLink" aria-hidden="true"></svg>
             <div class="wk-ez wk-ez-b">
-              <p class="wk-lab">Its row: 3,840 numbers</p>
+              <p class="wk-lab">Its row: 2,880 numbers</p>
               <div class="wk-vec" data-v="contract"><p class="wk-vname">contract</p><div class="wk-cells"></div><svg class="wk-code" aria-hidden="true"></svg></div>
               <div class="wk-vec" data-v="agreement"><p class="wk-vname">agreement *</p><div class="wk-cells"></div></div>
               <div class="wk-vec" data-v="picnic"><p class="wk-vname">picnic</p><div class="wk-cells"></div></div>
-              <p class="wk-foot">Illustrative: the first 5 of 3,840. *&nbsp;“agreement” is not in the prompt. It is shown because its numbers come out almost the same as “contract”.</p>
+              <p class="wk-foot">Illustrative: the first 5 of 2,880. *&nbsp;“agreement” is not in the prompt. It is shown because its numbers come out almost the same as “contract”.</p>
             </div>
             <div class="wk-ez wk-ez-c">
               <p class="wk-lab">Map of meaning, illustrative</p>
@@ -200,7 +200,7 @@
           </div>
           <div class="wk-notes">
             <p><b>Position</b> is tracked too, so “dog bites man” and “man bites dog” come out different.</p>
-            <p><b>Not the RAG kind:</b> these live inside the model, one per token. RAG (slide 12) uses a separate model that turns a whole passage into one list of 384 numbers, for search.</p>
+            <p><b>Not the RAG kind:</b> these live inside the model, one per token. RAG uses a separate model that turns a whole passage into one list of 384 numbers, for search.</p>
           </div>
         </div>
 
@@ -228,11 +228,11 @@
         <!-- 4 · layers -->
         <div class="frame-v" data-frame="4">
           <p class="wk-kick">Step 4 of 7</p>
-          <p class="wk-desc">Attention and a <b>feed-forward</b> block make one layer, repeated 48 times. Each layer refines every token's numbers, and much of what the model learned in training is stored in the feed-forward weights.</p>
+          <p class="wk-desc">Attention and a <b>feed-forward</b> block make one layer, repeated 36 times. Much of what the model learned is stored in the feed-forward weights, here split into 128 <b>experts</b>; each token uses just 4.</p>
           <div class="wk-dia wk-d4">
             <svg class="wk-stack" id="wkStack" aria-hidden="true"></svg>
-            <p class="wk-lnum" style="top:0">layer 48</p>
-            <p class="wk-lnum" style="top:168px">layer 24</p>
+            <p class="wk-lnum" style="top:0">layer 36</p>
+            <p class="wk-lnum" style="top:168px">layer 18</p>
             <p class="wk-lnum" style="top:330px">layer 1</p>
             <div class="wk-rise" id="wkRise" aria-hidden="true"></div>
             <div class="wk-lr">
@@ -240,12 +240,12 @@
               <div class="wk-zoom">
                 <div class="wk-blk"><p class="wk-blk-t">Attention</p><p class="wk-blk-d">mixes in context from other words</p></div>
                 <span class="wk-blk-arr" aria-hidden="true">→</span>
-                <div class="wk-blk"><p class="wk-blk-t">Feed-forward</p><p class="wk-blk-d">applies what training stored</p></div>
+                <div class="wk-blk"><p class="wk-blk-t">Feed-forward</p><p class="wk-blk-d">4 of 128 experts, chosen for each token</p></div>
               </div>
               <p class="wk-lab wk-glab">What “bank” means so far</p>
               <div class="wk-gauge"><span class="wk-g-l" id="wkGL">river</span><span class="wk-g-track"><i class="wk-g-fill" id="wkGFill"></i><i class="wk-g-dot" id="wkGDot"></i></span><span class="wk-g-r" id="wkGR">money</span></div>
-              <p class="wk-g-read" aria-live="off"><span id="wkLayerNow">layer 48 of 48</span><span class="wk-g-sent" id="wkGSent"></span></p>
-              <div class="wk-l48"><p class="wk-big">48 layers</p><p>Every token passes through all of them, every time.</p></div>
+              <p class="wk-g-read" aria-live="off"><span id="wkLayerNow">layer 36 of 36</span><span class="wk-g-sent" id="wkGSent"></span></p>
+              <div class="wk-l48"><p class="wk-big">36 layers</p><p>Every token passes through all of them, every time.</p></div>
             </div>
           </div>
           <p class="wk-cap">Illustrative: the numbers never spell out a meaning, but it sharpens like this as a token rises through the layers.</p>
@@ -265,7 +265,7 @@
               <div class="bar-row" style="--r:3"><span class="bar-label">"Sure"</span><span class="wk-logit">6.80</span><span class="wk-arr">→</span><span class="bar-track"><span class="bar-fill" style="--w:.11"></span></span><span class="bar-val">11%</span></div>
               <div class="bar-row" style="--r:4"><span class="bar-label">"Summary"</span><span class="wk-logit">5.79</span><span class="wk-arr">→</span><span class="bar-track"><span class="bar-fill" style="--w:.04"></span></span><span class="bar-val">4%</span></div>
             </div>
-            <div class="wk-tail"><svg class="wk-tail-svg" id="wkTail" aria-hidden="true"></svg><p class="caption">…and about 262,000 other tokens, each with a tiny chance. Most get almost zero.</p></div>
+            <div class="wk-tail"><svg class="wk-tail-svg" id="wkTail" aria-hidden="true"></svg><p class="caption">…and about 201,000 other tokens, each with a tiny chance. Most get almost zero.</p></div>
           </div>
           <p class="wk-cap">Scores are illustrative. A handful stand out; the five shown and the long tail add up to exactly 100%.</p>
         </div>
@@ -280,7 +280,7 @@
             <p class="wk-odds-rest">Summary 4% · all others 6%</p>
             <div class="wk-pickrow">
               <div class="pick"><span class="tk-chip dim">"Here"</span><span class="tk-chip dim">"The"</span><span class="tk-chip picked">"This"</span><span class="tk-chip dim">"Sure"</span></div>
-              <a class="wk-xref" href="#controls"><span class="callout-title">Try both dials · slide 6 →</span></a>
+              <a class="wk-xref" href="#controls"><span class="callout-title">Try both dials · next slide →</span></a>
             </div>
             <div class="wk-dials">
               <div class="wk-dial"><p class="wk-dial-t">Temperature</p>
@@ -309,28 +309,26 @@
               <p class="wk-kv-b wk-kv-dec" aria-live="off"><span>decode · one token per trip</span> <span class="wk-trip" id="wkTrip"></span></p>
             </div>
             <div class="wk-ctx">
-              <div><p class="wk-lab">Context window</p><p class="wk-ctx-n"><b>128,000 tokens</b> ≈ 96,000 words</p></div>
+              <div><p class="wk-lab">Context window</p><p class="wk-ctx-n"><b>131,072 tokens</b> ≈ 98,000 words</p></div>
               <div class="wk-ctx-box"><span>system prompt</span><span>documents</span><span>conversation</span><span>answer</span><span class="wk-ctx-free">all must fit</span></div>
             </div>
             <div class="wk-speed">
               <div class="wk-sp-chart" id="wkSpeed">
                 <p class="wk-lab">Speed, in tokens per second</p>
                 <div class="wk-sp" style="--v:5"><span>people read</span><span class="wk-sp-t"><i></i></span><b>≈ 5</b></div>
-                <div class="wk-sp" style="--v:13"><span>processor only *</span><span class="wk-sp-t"><i></i></span><b>≈ 13</b></div>
                 <div class="wk-sp wk-sp-range" style="--a:30;--v:100"><span>good private setup</span><span class="wk-sp-t"><i></i></span><b>30 to 100+</b></div>
-                <div class="wk-sp wk-sp-ours" style="--v:91"><span>laptop graphics card *</span><span class="wk-sp-t"><i></i></span><b>≈ 91</b></div>
               </div>
               <div class="wk-trips"><p class="wk-big">≈ 650 trips</p><p>through the whole model for a 500‑word answer. That is why answers stream in word by word.</p></div>
             </div>
           </div>
-          <p class="wk-cap">* Measured on our test laptop (RTX 5070 Ti Laptop GPU, 12&nbsp;GB), September 2026. It also reads an 8,100-token document (about 12 pages) in under three seconds.</p>
+          <p class="wk-cap">gpt&#8209;oss&#8209;120b fits on one 80&nbsp;GB GPU: its expert weights take about 4.25&nbsp;bits each.</p>
         </div>
       </div>
     </div>
     <details class="eng-note"><summary>Engineer's note</summary>
-      <p>This is the transformer, with Gemma&nbsp;3&nbsp;12B's published configuration: a SentencePiece vocabulary of about 262,000 entries, model width 3,840, 48 decoder layers and a 128K-token context. The embedding table alone (about 262,000 × 3,840) is roughly a billion of the 12 billion parameters.</p>
-      <p>Each layer is attention plus a gated feed-forward block, with residual connections and RMSNorm. Attention is causal and grouped-query; position comes from rotary embeddings (RoPE) on queries and keys, not a vector added to the input. Five sliding-window layers (1,024 tokens) for every global layer keep the KV cache small at long context.</p>
-      <p>Inference has two phases: <b>prefill</b> processes the whole prompt in parallel (compute-bound, thousands of tokens per second on a GPU; our test laptop read 8,100 tokens in under three seconds) and <b>decode</b> generates one token per forward pass (memory-bandwidth-bound: every step reads all active weights). Keys and values of earlier tokens are kept in a <b>KV cache</b> so they are not recomputed. A useful ceiling for decode speed is memory bandwidth ÷ bytes of active weights, which is why quantization and mixture-of-experts models speed up generation.</p>
+      <p>This is the transformer, with gpt&#8209;oss&#8209;120b's published configuration: an <code>o200k_harmony</code> vocabulary of 201,088 tokens, model width 2,880, 36 decoder layers and a 128K-token (131,072) context. It is a mixture of experts: each layer's feed-forward block holds 128 experts and a router sends every token to 4 of them, so of its 117 billion parameters only about 5.1 billion work on any one token.</p>
+      <p>Each layer is attention plus that expert block, with residual connections and RMSNorm. Attention is causal and grouped-query (64 query heads share 8 key-value heads); position comes from rotary embeddings (RoPE) on queries and keys, not a vector added to the input. Layers alternate between full-context attention and a 128-token sliding window, which keeps the KV cache small at long context.</p>
+      <p>Inference has two phases: <b>prefill</b> processes the whole prompt in parallel (compute-bound, thousands of tokens per second on a GPU) and <b>decode</b> generates one token per forward pass (memory-bandwidth-bound: every step reads all active weights). Keys and values of earlier tokens are kept in a <b>KV cache</b> so they are not recomputed. A useful ceiling for decode speed is memory bandwidth ÷ bytes of active weights, which is why quantisation and mixture-of-experts models speed up generation. gpt&#8209;oss&#8209;120b stores its expert weights in MXFP4, about 4.25 bits each, so the whole model fits on one 80&nbsp;GB GPU.</p>
       <p>Output: the last position's final hidden state times the output matrix gives one logit per vocabulary entry; softmax(logits ÷ temperature) makes the probabilities; top-K or top-p sampling picks one.</p>
     </details>
   </div></div>

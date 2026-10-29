@@ -504,7 +504,7 @@
       wkSvg('path', { class: 'wk-tarrow', d: `M137 ${y}H146` }),
       wkSvg('path', { class: 'wk-tarrow-h', d: `M152 ${y}l-7 -4.5v9z` }));
   }
-  const WK_VECS = {   // first five of 3,840 numbers, illustrative; "agreement" deliberately close to "contract"
+  const WK_VECS = {   // first five of 2,880 numbers, illustrative; "agreement" deliberately close to "contract"
     contract: [0.12, -0.48, 0.91, 0.03, -0.27],
     agreement: [0.11, -0.45, 0.88, 0.05, -0.25],
     picnic: [-0.62, 0.30, -0.05, 0.77, 0.41],
@@ -652,14 +652,15 @@
   }));
   renderAttention();
 
-  // step 4: 48 layers; the "bank" vector rises through them and its meaning sharpens (towards the sentence chosen in step 3)
-  const WK_L = 48, WK_LP = 7, WK_ZOOM = 40;
+  // step 4: 36 layers (gpt-oss-120b); the "bank" vector rises through them and its meaning sharpens (towards the sentence chosen in step 3)
+  const WK_L = 36, WK_LP = 336 / WK_L, WK_ZOOM = 30, WK_LH = 6;   // the stack keeps its height whatever the layer count
   const stack = $('#wkStack'), rise = $('#wkRise'), gDot = $('#wkGDot'), gFill = $('#wkGFill'), layerNow = $('#wkLayerNow');
   const layerY = i => 336 - i * WK_LP;                       // top of layer i (1 = bottom) inside the stack
   const layers = [];
   {
-    for (let i = 1; i <= WK_L; i++) layers.push(wkSvg('rect', { class: 'wk-layer' + (i === WK_ZOOM ? ' is-zoom' : ''), x: 0, y: layerY(i) + 1.25, width: 250, height: 4.5, rx: 2.25 }));
-    const zy = layerY(WK_ZOOM) + 3.5;
+    const pad = (WK_LP - WK_LH) / 2;
+    for (let i = 1; i <= WK_L; i++) layers.push(wkSvg('rect', { class: 'wk-layer' + (i === WK_ZOOM ? ' is-zoom' : ''), x: 0, y: layerY(i) + pad, width: 250, height: WK_LH, rx: WK_LH / 2 }));
+    const zy = layerY(WK_ZOOM) + WK_LP / 2;
     stack.setAttribute('viewBox', '0 0 300 336');
     stack.replaceChildren(...layers,
       wkSvg('path', { class: 'wk-zline', d: `M256 ${zy}L316 21` }),
@@ -675,7 +676,7 @@
     stack.parentElement.style.setProperty('--wk-tint', tint);
     const at = 1 + p * (WK_L - 1);
     layers.forEach((r, i) => r.classList.toggle('is-done', i + 1 <= at + 0.01));
-    rise.style.transform = `translateY(${(6 + layerY(at) + 3.5 - 8).toFixed(1)}px)`;
+    rise.style.transform = `translateY(${(6 + layerY(at) + WK_LP / 2 - 8).toFixed(1)}px)`;
     [...rise.children].forEach((c, k) => {
       const t = clamp((p - WK_CELL_ORDER[k] * 0.06) / 0.4);
       c.style.background = mixC('var(--line-2)', tint, t);

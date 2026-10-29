@@ -382,7 +382,7 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .attn-meaning { position: absolute; left: 0; right: 0; top: 306px; font-size: 19px; color: var(--ink-2); }
 .attn-meaning b { background: var(--hl1); padding: 0 4px; border-radius: 4px; color: #0b1a2c; }
 
-/* step 4: 48 layers, a token's numbers rising through them, one layer zoomed in, the meaning gauge */
+/* step 4: 36 layers, a token's numbers rising through them, one layer zoomed in, the meaning gauge */
 .wk-stack { position: absolute; left: 80px; top: 6px; width: 300px; height: 336px; overflow: visible; }
 .wk-layer { fill: var(--line); }
 .wk-layer.is-done { fill: color-mix(in srgb, var(--wk-tint, var(--ours)) 30%, var(--line)); }
@@ -481,7 +481,10 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .wk-ctx-box span:nth-child(2) { background: color-mix(in srgb, var(--hl2) 70%, var(--paper)); }
 .wk-ctx-box span:nth-child(4) { background: color-mix(in srgb, var(--ours) 22%, var(--paper)); }
 .wk-ctx-box .wk-ctx-free { margin-left: auto; background: none; color: var(--muted); padding-right: 6px; }
-.wk-speed { position: absolute; left: 0; right: 0; bottom: 0; display: grid; grid-template-columns: 1fr 292px; gap: 22px; align-items: end; }
+.wk-speed { position: absolute; left: 0; right: 0; bottom: 0; display: grid; grid-template-columns: 1fr 292px; gap: 22px; align-items: stretch; }
+/* the speed chart sits in a card that matches the trips card beside it */
+.wk-sp-chart { display: grid; align-content: center; padding: 15px 18px 16px; border-radius: 14px; background: var(--wash); }
+.wk-sp-chart .wk-sp-t { background: var(--paper); }
 .wk-sp-chart .wk-lab { margin-bottom: 8px; }
 .wk-sp { display: grid; grid-template-columns: 200px 1fr 96px; gap: 12px; align-items: center; height: 27px; font: 400 14px/1.2 var(--mono); color: var(--ink-2); }
 .wk-sp b { font-weight: 600; color: var(--ink); font-variant-numeric: tabular-nums; }
