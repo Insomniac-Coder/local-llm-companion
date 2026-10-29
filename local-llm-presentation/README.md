@@ -1,12 +1,12 @@
 # The Next Word Is Ours
 
 An interactive slide deck for the AI Council, proposing that we run our own private AI: open-weight language
-models with our own harness and RAG. **Sixteen slides, about fifteen minutes, in three parts**:
+models with our own harness and RAG. **Fifteen slides, about fifteen minutes, in three parts**:
 
 1. **What an LLM is**: what it is and how large; how it learns; why a trained model is frozen and needs RAG; how
    it answers; temperature and top-K (a live instrument panel with a hallucination-risk gauge); memory, without and
    with a saved thread; forty terms; ten myths.
-2. **The benefits of AI**: renting versus owning; how AI helps us, department by department.
+2. **The benefits of AI**: how AI helps us, department by department.
 3. **What we have built**: the harness rings, then one slide per ring: our documents (the RAG pipeline and
    ChromaDB ingestion), tools (a LangGraph supervisor routing to RAG, Infra and General agents), rules (human in the
    loop: a run that pauses at a checkpoint for approval) and the audit log (LangSmith traces showing the agent and

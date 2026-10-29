@@ -1104,7 +1104,7 @@
   }));
   updateMythCount();
 
-  /* ------------------------------------------------------------------ 11: how AI helps us: departments */
+  /* ------------------------------------------------------------------ 10: how AI helps us: departments */
   const DEPTS = [
     { name: 'Engineering', uses: ['A coding assistant that knows our private repositories', 'Explains old code before anyone changes it', 'Drafts tests, reviews and documentation'],
       keep: 'Less time digging through old code, more time building.', q: 'Where do we check refund limits in the billing service?',
@@ -1172,7 +1172,7 @@
   selectDept(0, false);
   hooks.value = () => typeAnswer(DEPTS[deptIdx], true);
 
-  /* ------------------------------------------------------------------ 12: harness rings (layers light up in turn) */
+  /* ------------------------------------------------------------------ 11: harness rings (layers light up in turn) */
   const RINGS = [['audit', 'Audit log'], ['guard', 'Rules'], ['perm', 'Access rights'], ['tools', 'Tools'], ['rag', 'Our documents']];
   function ringsSvg(onKeys) {
     const c = 180, gap = 26, core = 40, capH = 8.5;
@@ -1711,8 +1711,8 @@
   /* BUILD:agents START */
   /* ------------------------------------------------------------------ 15: multi-agent orchestration */
   // A LangGraph supervisor classifies each request by type, sends it down the matching branch, takes the agent's
-  // result back and decides again: another agent, or finish. Four example requests, the same ones slides 15 and 16
-  // reuse; the two-hop "staging feels slow" run (the one slide 16 traces) plays on arrival.
+  // result back and decides again: another agent, or finish. Four example requests, the same ones slides 14 and 15
+  // reuse; the two-hop "staging feels slow" run (the one slide 15 traces) plays on arrival.
   const AG_NAME = { rag: 'RAG agent', infra: 'Infra agent', gen: 'General agent' };
   const AG_NODE = { rag: 'rag_agent', infra: 'infra_agent', gen: 'general_agent' };
   const AG_TYPE = { rag: 'Knowledge question', infra: 'Infrastructure task', gen: 'Anything else' };
@@ -2159,7 +2159,7 @@
 
   /* BUILD:observe START */
   /* ------------------------------------------------------------------ 17: LangSmith observability */
-  // Five recent runs, one for each kind of task on slide 14, traced the way LangSmith shows them (illustrative).
+  // Five recent runs, one for each kind of task on slide 13, traced the way LangSmith shows them (illustrative).
   // The run picker says which agents each task used, the route line spells out the hops, every step carries its
   // agent's colour, and supervisor steps say where they routed. The two-hop "staging feels slow" run streams in on
   // arrival; its failed twin shows the metrics tool timing out after 10 s and a retry succeeding.
@@ -2199,7 +2199,7 @@
             input: 'get_metrics(env="staging", service="checkout")', error: 'TimeoutError: the metrics API did not answer within 10 s',
             diag: '<b>The slow step was the metrics API, not the model.</b> It timed out after 10 s; the automatic retry answered in 0.35 s. Fix or alert on the API before blaming the model.', meta: 'read-only · runs without approval · attempt <b>1 of 3</b>' }
         : { name: 'get_metrics', type: 'tool', agent: 'infra', depth: 2, t0: 1.00, t1: 1.35,
-            input: 'get_metrics(env="staging", service="checkout")', output: '{ "p95_ms": 2400, "cpu": 0.92, "replicas": 2 }', meta: 'read-only · runs without approval (slide 15)' },
+            input: 'get_metrics(env="staging", service="checkout")', output: '{ "p95_ms": 2400, "cpu": 0.92, "replicas": 2 }', meta: 'read-only · runs without approval (slide 14)' },
       ...(fail ? [{ name: 'get_metrics · retry', type: 'tool', agent: 'infra', depth: 2, t0: 11.02, t1: 11.37,
             input: 'get_metrics(env="staging", service="checkout")', output: '{ "p95_ms": 2400, "cpu": 0.92, "replicas": 2 }', meta: 'read-only · attempt <b>2 of 3</b> · succeeded' }] : []),
       { name: 'read metrics', type: 'llm', agent: 'infra', depth: 2, t0: t(1.37), t1: t(2.08), ...obsLlm('gpt-oss-120b', 0.2, 486, 54),
@@ -2241,7 +2241,7 @@
       // the run stops at interrupt() and resumes with the admin's decision; the minutes in between are not latency
       { name: 'admin approval', type: 'human', agent: 'infra', depth: 2, t0: 0.88, t1: 0.92,
         input: 'interrupt({ "action": "restart_service", "env": "staging", "service": "billing" })', output: '{ "decision": "approve", "by": "admin" }',
-        meta: 'paused at checkpoint <b>3</b> · an <b>admin</b> approved 46 s later · the wait is left out of the timings (slide 15)' },
+        meta: 'paused at checkpoint <b>3</b> · an <b>admin</b> approved 46 s later · the wait is left out of the timings (slide 14)' },
       { name: 'restart_service', type: 'tool', agent: 'infra', depth: 2, t0: 0.94, t1: 2.38,
         input: 'restart_service(env="staging", service="billing")', output: '{ "status": "restarted", "ready": "2/2" }', meta: 'staging change · ran after an admin approved' },
       { name: 'confirm', type: 'llm', agent: 'infra', depth: 2, t0: 2.40, t1: 2.82, ...obsLlm('gpt-oss-20b', 0.2, 204, 32),
@@ -2617,7 +2617,7 @@
   /* 8 terms: number the chips so they cascade in reading order */
   chain('terms', prev => { prev?.(); $$('#glTerms .term-chip').forEach((c, k) => c.style.setProperty('--pz-k', k)); });
 
-  /* 11 value: the department panel arrives after the two numbers have counted up, then starts typing */
+  /* 10 value: the department panel arrives after the two numbers have counted up, then starts typing */
   let valueRun = 0;
   chain('value', prev => {
     const me = ++valueRun;
@@ -2625,7 +2625,7 @@
     setTimeout(() => { if (me === valueRun && isActive('value')) prev?.(); }, 900);
   });
 
-  /* 12 harness: each ring links to the slide that opens it up, without changing how the rings look */
+  /* 11 harness: each ring links to the slide that opens it up, without changing how the rings look */
   const RING_TO = { rag: 'rag', perm: 'rag', tools: 'agents', guard: 'hitl', audit: 'observe' };
   const ringHint = el('p', 'pz-ring-hint rv');
   ringHint.style.setProperty('--d', 3);

@@ -577,22 +577,7 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .myth-hint { margin-top: auto; font: 500 14px/1 var(--mono); color: var(--muted); }
 .myth-real { font-size: 15px; line-height: 1.45; color: #0b1a2c; }
 
-/* 10 rent or own: table */
-.table-wrap { overflow: hidden; }
-.cmp { width: 100%; border-collapse: collapse; font-size: 18px; }
-.cmp th, .cmp td { text-align: left; vertical-align: middle; padding: 12px 24px; border-bottom: 1px solid var(--line); line-height: 1.35; }
-.cmp tbody tr:last-child > * { border-bottom: 0; }
-.cmp thead th { font: 600 14px/1.3 var(--mono); letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); background: var(--wash); }
-.cmp thead th.ours { color: var(--ours-ink); }
-.cmp thead th.ours::before { content: ""; display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: var(--ours); margin-right: 10px; vertical-align: 1px; }
-.cmp tbody th { font-weight: 600; width: 22%; color: var(--ink); }
-.cmp td { color: var(--muted); width: 39%; }
-.cmp td:last-child { color: var(--ink); background: color-mix(in srgb, var(--ours-soft) 35%, transparent); }
-.cmp tr.em th { color: var(--ours-ink); }
-.cmp tr.em td:last-child { font-weight: 600; }
-.fair { font-size: 18px; color: var(--ink-2); max-width: 110ch; }
-
-/* 11 how AI helps us: evidence beside the departments */
+/* 10 how AI helps us: evidence beside the departments */
 .pays { display: grid; grid-template-columns: 380px 1fr; gap: 48px; align-items: start; }
 .ev-list { display: grid; gap: 24px; align-content: start; }
 .ev { display: grid; gap: 8px; align-content: start; padding-top: 16px; border-top: 3px solid var(--ink); }
@@ -617,7 +602,7 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .src { font: 400 14px/1 var(--mono); color: #0b1a2c; padding: 7px 12px; border-radius: 999px; background: var(--hl3); animation: pop 0.3s ease-out backwards; }
 .src::before { content: "Source · "; opacity: 0.6; }
 
-/* 12 harness */
+/* 11 harness */
 .harness-intro { display: grid; grid-template-columns: 1fr 360px; gap: 56px; align-items: center; }
 .hi-text { display: grid; gap: 18px; }
 .hi-text h2 { max-width: 20ch; }
@@ -1237,8 +1222,6 @@ html[data-tone="dark"] .bar-fill { background: #34d399; }
 .flow .gl-detail h3 { font-size: 34px; }
 .flow .three p { font-size: 22px; }
 .flow .stage-panel { min-height: 440px; }
-.flow .table-wrap { overflow-x: auto; }
-.flow .cmp { min-width: 640px; font-size: 15px; }
 .flow .bar-row { grid-template-columns: 96px 1fr 44px; gap: 8px; font-size: 14px; }
 .flow .rings-static { display: none; }
 .flow .s-head-row { flex-direction: column; align-items: flex-start; }
@@ -1466,38 +1449,7 @@ html[data-tone="dark"] .bar-fill { background: #34d399; }
   100% { opacity: 1; transform: none; }
 }
 
-/* ---------------------------------------------------------------- 10 compare: rows slide in, our column brightens */
-.deck #compare .cmp td:last-child { position: relative; isolation: isolate; }
-.deck #compare .cmp td:last-child::before { content: ""; position: absolute; inset: 0; z-index: -1; pointer-events: none; background: var(--ours-soft); opacity: 0; }
-.deck #compare .cmp thead th.ours::before { transform-origin: 50% 50%; }
-@media (prefers-reduced-motion: no-preference) {
-  .deck #compare.on .cmp tr { animation: pz-row 0.6s cubic-bezier(0.2, 0.7, 0.2, 1) backwards; }
-  .deck #compare.on .cmp thead tr { animation-delay: 0.45s; }
-  .deck #compare.on .cmp tbody tr:nth-child(1) { animation-delay: 0.55s; }
-  .deck #compare.on .cmp tbody tr:nth-child(2) { animation-delay: 0.61s; }
-  .deck #compare.on .cmp tbody tr:nth-child(3) { animation-delay: 0.67s; }
-  .deck #compare.on .cmp tbody tr:nth-child(4) { animation-delay: 0.73s; }
-  .deck #compare.on .cmp tbody tr:nth-child(5) { animation-delay: 0.79s; }
-  .deck #compare.on .cmp tbody tr:nth-child(6) { animation-delay: 0.85s; }
-  .deck #compare.on .cmp tbody tr:nth-child(7) { animation-delay: 0.91s; }
-  .deck #compare.on .cmp tbody tr:nth-child(8) { animation-delay: 0.97s; }
-  .deck #compare.on .cmp tbody tr:nth-child(9) { animation-delay: 1.03s; }
-  .deck #compare.on .cmp td:last-child::before { animation: pz-flash 1.3s ease-in-out backwards; }
-  .deck #compare.on .cmp tbody tr:nth-child(1) td:last-child::before { animation-delay: 1.3s; }
-  .deck #compare.on .cmp tbody tr:nth-child(2) td:last-child::before { animation-delay: 1.36s; }
-  .deck #compare.on .cmp tbody tr:nth-child(3) td:last-child::before { animation-delay: 1.42s; }
-  .deck #compare.on .cmp tbody tr:nth-child(4) td:last-child::before { animation-delay: 1.48s; }
-  .deck #compare.on .cmp tbody tr:nth-child(5) td:last-child::before { animation-delay: 1.54s; }
-  .deck #compare.on .cmp tbody tr:nth-child(6) td:last-child::before { animation-delay: 1.6s; }
-  .deck #compare.on .cmp tbody tr:nth-child(7) td:last-child::before { animation-delay: 1.66s; }
-  .deck #compare.on .cmp tbody tr:nth-child(8) td:last-child::before { animation-delay: 1.72s; }
-  .deck #compare.on .cmp tbody tr:nth-child(9) td:last-child::before { animation-delay: 1.78s; }
-  .deck #compare.on .cmp thead th.ours::before { animation: pz-ping 1.1s ease-out 1.25s backwards; }
-}
-@keyframes pz-row { from { opacity: 0; transform: translateX(-22px); } }
-@keyframes pz-ping { 0% { transform: scale(1); } 30% { transform: scale(1.8); } 100% { transform: scale(1); } }
-
-/* ---------------------------------------------------------------- 11 value: highlighter under the numbers, panel after the counts */
+/* ---------------------------------------------------------------- 10 value: highlighter under the numbers, panel after the counts */
 .deck #value .ev-num { background-repeat: no-repeat; background-size: 100% 100%; }
 @media (prefers-reduced-motion: no-preference) {
   .deck #value.on .ev-num { animation: pz-mark 0.9s cubic-bezier(0.6, 0, 0.3, 1) backwards; }
@@ -1507,7 +1459,7 @@ html[data-tone="dark"] .bar-fill { background: #34d399; }
   .deck #value.on .dept.rv { transform: none; transition-delay: 0.95s; transition-duration: 0.7s, 0.95s; transition-timing-function: ease, cubic-bezier(0.16, 0.84, 0.24, 1); }
 }
 
-/* ---------------------------------------------------------------- 12 harness: rings open the next four slides */
+/* ---------------------------------------------------------------- 11 harness: rings open the next four slides */
 .deck #harness .harness-intro { position: relative; }
 /* the rings keep painting above the link layer (labels and strokes on top of the hover band); clicks pass through */
 .deck #ringsIntro { position: relative; z-index: 1; pointer-events: none; }
