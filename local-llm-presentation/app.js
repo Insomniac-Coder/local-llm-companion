@@ -725,14 +725,14 @@
         'Travel spend was 18% over budget, mainly because of two unplanned client visits and higher airfares.'],
       ref: [null, null] },
     { q: 'And without those two visits?',
-      a: ['Which visits do you mean? I can’t see any earlier messages.', 'Without those two visits, travel was 3% under budget.'],
+      a: ['Which visits do you mean? I can’t see any earlier messages.', 'Without those two visits, travel would have been 3% under budget.'],
       ref: ['no history', 'used: turn 1'] },
     { q: 'Draft a two-line note to my team about it.',
       a: ['Happy to help. Who is your team, and what should the note say?',
-        'Hi team: travel was 18% over budget last month because of two unplanned client visits. Without them, we were 3% under. Thanks,\u00a0Priya'],
+        'Hi team, travel was 18% over budget last month because of two\u00a0unplanned client visits. Without them, we were 3% under. Thanks,\u00a0Priya'],
       ref: ['no history', 'used: turns 1, 2'] },
     { q: 'Morning! Can you shorten that note to one line?',
-      a: ['Which note do you mean? This looks like a new conversation.', 'Hi team: two unplanned client visits put travel 18% over budget last month.\u00a0Priya'],
+      a: ['Which note do you mean? This looks like a new conversation.', 'Hi team, two unplanned client visits put travel 18% over budget last\u00a0month. Thanks,\u00a0Priya'],
       ref: ['no history', 'used: saved thread'] },
   ];
   const MEM_SYS = 28;
@@ -747,15 +747,18 @@
   const memOk = me => me === memRun && isActive('memory');
   const memRestart = (n, cls) => { n.classList.remove(cls); void n.offsetWidth; n.classList.add(cls); };
 
-  // what the model receives at turn n (1–4): the stateless app sends the system prompt and the newest message only
+  // what the model receives at turn n (1–4): the stateless app sends the system prompt and the newest message only,
+  // so its earlier messages show as one dashed chip that says they are not sent
   function memSent(s, n) {
     const you = k => ({ label: 'Priya ' + k, cls: 'you', tok: memTok(MEM_TURNS[k - 1].q) });
     const ai = k => ({ label: 'AI ' + k, cls: 'ai', tok: memTok(MEM_TURNS[k - 1].a[s]) });
     const list = [{ label: 'System', cls: 'sys', tok: MEM_SYS }];
     if (n === 4) {
       if (s) list.push({ label: 'Yesterday’s thread · 6', cls: 'thread', tok: [1, 2, 3].reduce((t, k) => t + you(k).tok + ai(k).tok, 0) });
-    } else {
-      for (let k = 1; k < n; k++) list.push(...[you(k), ai(k)].map(c => (s ? c : { ...c, cls: 'ghost', tok: 0 })));
+    } else if (s) {
+      for (let k = 1; k < n; k++) list.push(you(k), ai(k));
+    } else if (n > 1) {
+      list.push({ label: `${2 * (n - 1)} earlier · not sent`, cls: 'ghost', tok: 0 });
     }
     list.push(you(n));
     return list;
@@ -766,7 +769,7 @@
 
   function memChip(c, animate) {
     const n = el('span', 'mem-chip ' + c.cls, c.label);
-    if (c.cls === 'ghost') { n.title = 'Shown on screen, not sent to the model'; n.setAttribute('aria-label', c.label + ', not sent'); }
+    if (c.cls === 'ghost') { n.title = 'Shown on screen, not sent to the model'; n.setAttribute('aria-label', c.label.replace(' ·', ' messages,')); }
     if (!animate) n.style.animation = 'none';
     return n;
   }
@@ -910,20 +913,20 @@
     // Priya carries on: yesterday's first two turns fold away to make room, but they are still sent
     s1.chat.querySelector('.mem-receipt')?.remove();
     const old = $$('.mem-turn', s1.chat).filter(g => +g.dataset.t < 3);
-    const wrap = memFoldEl(true);
+    const wrap = memFoldEl(true), pill = wrap.firstChild;
     wrap.classList.add('mem-going');
     wrap.style.height = '0px';
-    wrap.style.opacity = '0';
+    pill.style.opacity = '0';
     s1.chat.prepend(wrap);
     old.forEach(g => { g.style.height = g.offsetHeight + 'px'; g.classList.add('mem-going'); });
     void s1.chat.offsetHeight;
-    wrap.style.height = wrap.firstChild.offsetHeight + 'px';
-    wrap.style.opacity = '1';
+    wrap.style.height = pill.offsetHeight + 'px';
     old.forEach(g => { g.style.height = '0px'; g.style.opacity = '0'; g.style.marginTop = '0px'; });
     await sleep(600); if (!memOk(me)) return null;
     old.forEach(g => g.remove());
     wrap.classList.remove('mem-going');
     wrap.style.height = '';
+    pill.style.opacity = pill.style.animation = '';   // fade in now the wrapper is open
     s1.chat.append(memLine('mem-day', 'Next morning · same thread', true));
     await sleep(350); if (!memOk(me)) return null;
     return memSide.map((side, s) => { const g = memTurnEl(s, 4, false, true); side.chat.append(g); return g; });
