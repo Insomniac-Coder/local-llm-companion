@@ -813,6 +813,504 @@
 
   /* BUILD:rag START */
   /* ------------------------------------------------------------------ 14: RAG pipeline and ChromaDB ingestion */
+  // On arrival the HR policy is cut into chunks, each chunk becomes numbers and flies into the map as a dot; then the
+  // first question runs the path back: its numbers drop a star onto the map, lines reach the K nearest chunks the
+  // asker may see, those chunks lift into the prompt and the answer types with its source. Chips, top-K and the
+  // "change §4.1" button replay the relevant part. Every sequence carries a run number and stops when a newer one
+  // starts or the slide leaves the screen (it then jumps to its finished state).
+  {
+    const NS = 'http://www.w3.org/2000/svg';
+    const ragBody = $('#ragBody'), ragFly = $('#ragFly'), ragSvg = $('#ragSvg');
+    const inRail = $('#ragInRail'), askRail = $('#ragAskRail');
+    const LOCK = '<svg class="rag-lock" viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="10.5" width="14" height="10" rx="2.5"/><path d="M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5"/></svg>';
+    const sgn = v => (v < 0 ? '−' : '') + Math.abs(v).toFixed(2);
+    const rng = seed => () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+    const WEAK = 0.4;   // below this similarity a retrieved chunk only dilutes the prompt
+    // one-line texts are cut at a word, never by CSS, so no hidden text runs on under its neighbours
+    function fit(node, text, quote = false) {
+      node.dataset.full = text;
+      node.dataset.quote = quote ? '1' : '';
+      const wrap = t => (quote ? `“${t}”` : t);
+      node.textContent = wrap(text);
+      if (!node.clientWidth || node.scrollWidth <= node.clientWidth + 0.5) return;
+      const words = text.split(' ');
+      while (words.length > 2) {
+        words.pop();
+        node.textContent = wrap(words.join(' ').replace(/[,;:.]$/, '') + '…');
+        if (node.scrollWidth <= node.clientWidth + 0.5) return;
+      }
+    }
+    const refit = () => $$('#rag [data-full]').forEach(n => fit(n, n.dataset.full, !!n.dataset.quote));
+
+    // The illustrative HR policy, one chunk per section. x, y place each dot on the 480 × 400 map and `side` its
+    // label; positions, label sides and the question stars were solved together so no label touches a line.
+    const CH = [
+      { sec: '§4.1', name: 'Annual leave', tile: '§4.1 Annual', h: 1, x: 164, y: 109, side: 'T',
+        text: d => `Full-time staff get ${d} days of paid annual leave a year, plus public holidays.` },
+      { sec: '§4.2', name: 'Carry-over', tile: '§4.2 Carry-over', h: 2, x: 274, y: 94, side: 'T',
+        text: () => 'Up to 5 unused days can be carried into the next year; they expire on 31 March.' },
+      { sec: '§4.3', name: 'Parental leave', tile: '§4.3 Parental', h: 4, x: 226, y: 298, side: 'B',
+        text: () => '26 weeks paid for the primary carer and 4 weeks for the secondary carer, after six months of service.' },
+      { sec: '§4.4', name: 'Sick leave', tile: '§4.4 Sick', h: 3, x: 116, y: 257, side: 'L',
+        text: () => 'Up to 12 paid days a year; a doctor’s note after 3 days in a row.' },
+      { sec: '§5.1', name: 'Remote work', tile: '§5.1 Remote', h: 5, x: 377, y: 146, side: 'T',
+        text: () => 'Up to 2 days a week with the manager’s agreement.' },
+      { sec: 'HR only', name: 'Payroll bands', tile: 'Payroll bands', h: 0, x: 400, y: 320, side: 'B', hr: true,
+        text: () => 'Salary bands for every grade. Tagged HR only: never returned outside HR.' },
+    ];
+    CH.forEach((c, i) => { const r = rng(4099 + i * 7919); c.vec = Array.from({ length: 24 }, () => Math.round((r() * 2 - 1) * 100) / 100); });
+    CH[0].vec.splice(0, 4, 0.21, -0.07, 0.88, 0.13);
+    const v41b = CH[0].vec.map((v, i) => (i === 0 ? 0.22 : i === 2 ? 0.87 : i % 5 === 3 ? clamp(v + 0.06, -1, 1) : v));   // §4.1 after the edit
+
+    // hits: [chunk, similarity] nearest first among chunks the asker may see; blocked: nearest overall, filtered out
+    const QS = [
+      { q: 'How many days of annual leave do I get?', star: [177, 152], hits: [[0, 0.89], [1, 0.71], [3, 0.43], [2, 0.38]],
+        ans: (k, d) => [`You get ${d} days of paid annual leave a year, plus public holidays.`, [0]] },
+      { q: 'Can I carry unused leave into next year?', star: [263, 140], hits: [[1, 0.91], [0, 0.74], [4, 0.31], [2, 0.27]],
+        ans: (k, d) => (k > 1 ? [`Yes: up to 5 of your ${d} days can be carried into next year; they expire on 31 March.`, [1, 0]]
+          : ['Yes: up to 5 unused days can be carried into next year; they expire on 31 March.', [1]]) },
+      { q: 'What does parental leave look like?', star: [218, 254], hits: [[2, 0.88], [3, 0.49], [0, 0.44], [1, 0.35]],
+        ans: () => ['Primary carers get 26 weeks paid and secondary carers 4 weeks, after six months of service.', [2]] },
+      { q: 'What are the salary bands?', star: [359, 252], blocked: [5, 0.86], hits: [[4, 0.24], [2, 0.21], [1, 0.15], [0, 0.12]],
+        ans: () => ['I can’t share salary bands: they aren’t in any document you may see. Please ask HR.', []] },
+    ];
+
+    let run = 0, qi = 0, K = 3, days = 24, ingested = false, starFor = -1;
+    const vecOf = i => (i === 0 && days === 25 ? v41b : CH[i].vec);
+    const qVec = q => {
+      const Q = QS[q], r = rng(77 + q * 131);
+      const a = vecOf(Q.blocked ? Q.blocked[0] : Q.hits[0][0]), b = vecOf(Q.hits[Q.blocked ? 0 : 1][0]);
+      return a.map((v, i) => clamp(v * 0.82 + b[i] * 0.12 + (r() - 0.5) * 0.16, -1, 1));
+    };
+
+    /* ---------- building blocks */
+    const tilesBox = $('#ragTiles');
+    const tiles = CH.map((c, i) => {
+      const li = el('li', `rag-tile rag-h${c.h}` + (c.hr ? ' is-lock' : ''));
+      const b = el('button', null, c.tile);
+      b.type = 'button';
+      if (c.hr) b.insertAdjacentHTML('beforeend', LOCK);
+      b.setAttribute('aria-label', `${c.name}${c.hr ? ', tagged HR only' : ''}: show this chunk as numbers`);
+      b.addEventListener('click', () => showEmbed(i, true, true, true));
+      li.append(b);
+      return li;
+    });
+    tilesBox.replaceChildren(...tiles);
+
+    const mkCells = box => { box.replaceChildren(...Array.from({ length: 24 }, () => el('i'))); return [...box.children]; };
+    const cellsIn = mkCells($('#ragCellsIn')), cellsQ = mkCells($('#ragCellsQ'));
+    const paintCells = (cells, vec, upto = 24) => cells.forEach((c, i) => c.style.setProperty('--o', vec && i < upto ? (0.1 + 0.9 * (vec[i] + 1) / 2).toFixed(2) : 0.08));
+
+    const svgEl = (tag, attrs = {}, cls) => {
+      const n = document.createElementNS(NS, tag);
+      for (const k in attrs) n.setAttribute(k, attrs[k]);
+      if (cls) n.setAttribute('class', cls);
+      return n;
+    };
+    const gLinks = svgEl('g'), gPts = svgEl('g'), gStar = svgEl('g');
+    ragSvg.append(gLinks, gPts, gStar);
+    const pts = CH.map(c => {
+      const g = svgEl('g', { transform: `translate(${c.x} ${c.y})` }, `rag-pt rag-h${c.h} is-off` + (c.hr ? ' rag-pt-lock' : ''));
+      const pop = svgEl('g', {}, 'rag-pop');
+      pop.append(svgEl('circle', { r: c.hr ? 11 : 9 }, 'rag-dot'));
+      if (c.hr) { const lk = svgEl('g', { transform: 'translate(-6 -6.6) scale(0.5)' }, 'rag-lockg'); lk.innerHTML = '<rect x="5" y="10.5" width="14" height="10" rx="2.5"/><path d="M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5"/>'; pop.append(lk); }
+      // a 38-unit label block beside the dot: the name, then the section (and, when retrieved, the similarity)
+      const [ax, anchor, y0] = c.side === 'L' ? [-16, 'end', -19] : c.side === 'R' ? [16, 'start', -19] : c.side === 'T' ? [0, 'middle', -51] : [0, 'middle', 18];
+      const n = svgEl('text', { x: ax, y: y0 + 14, 'text-anchor': anchor }, 'rag-lab-n');
+      n.textContent = c.name;
+      const s = svgEl('text', { x: ax, y: y0 + 31, 'text-anchor': anchor }, 'rag-lab-s');
+      s.textContent = c.sec;
+      g.append(pop, n, s);
+      gPts.append(g);
+      return { g, pop, s };
+    });
+    const STAR = (() => { let d = ''; for (let k = 0; k < 10; k++) { const r = k % 2 ? 5.4 : 13, a = -Math.PI / 2 + k * Math.PI / 5; d += (k ? 'L' : 'M') + (r * Math.cos(a)).toFixed(2) + ' ' + (r * Math.sin(a)).toFixed(2); } return d + 'Z'; })();
+    const starG = svgEl('g'), starPop = svgEl('g', {}, 'rag-pop');
+    starPop.append(svgEl('path', { d: STAR }, 'rag-star'));
+    starG.append(starPop);
+    starG.style.display = 'none';
+    gStar.append(starG);
+    // a key in the empty bottom-left corner, so a photo of the map still reads
+    const key = svgEl('g', { transform: 'translate(22 381)' }, 'rag-key');
+    key.innerHTML = `<path class="rag-star" transform="scale(0.62)" d="${STAR}"/><text class="rag-lab-s" x="14" y="4.5">question</text>`
+      + '<circle class="rag-dot rag-key-dot" cx="98" cy="0" r="6"/><text class="rag-lab-s" x="110" y="4.5">chunk</text>'
+      + '<line class="rag-link" x1="164" y1="0" x2="186" y2="0" stroke-width="3"/><text class="rag-lab-s" x="194" y="4.5">nearest K</text>';
+    ragSvg.insertBefore(key, gLinks);
+
+    /* ---------- the two lanes */
+    const railSt = rail => $$('.rag-st', rail);
+    function sizeRails() { [inRail, askRail].forEach(r => { const st = railSt(r); r.style.setProperty('--end', st[st.length - 1].offsetTop + 'px'); }); }
+    function stage(rail, key) {   // key = the station now working; null = the lane has finished
+      const st = railSt(rail);
+      const idx = key == null ? st.length : st.findIndex(s => s.dataset.st === key);
+      st.forEach((s, j) => { s.classList.toggle('is-on', j === idx); s.classList.toggle('is-done', j < idx); });
+      rail.style.setProperty('--prog', st[Math.min(idx, st.length - 1)].offsetTop + 'px');
+      rail.classList.toggle('is-run', idx < st.length);
+    }
+    function resetRail(rail) { railSt(rail).forEach(s => s.classList.remove('is-on', 'is-done')); rail.style.setProperty('--prog', '0px'); rail.classList.remove('is-run'); }
+
+    /* ---------- motion helpers (canvas px, relative to .rag-body) */
+    const relBox = n => { const b = ragBody.getBoundingClientRect(), r = n.getBoundingClientRect(); return { x: (r.left - b.left) / S, y: (r.top - b.top) / S, w: r.width / S, h: r.height / S }; };
+    const mid = n => { const r = relBox(n); return { x: r.x + r.w / 2, y: r.y + r.h / 2 }; };
+    const endOf = (n, right) => { const r = relBox(n); return { x: right ? r.x + r.w - 4 : r.x + 4, y: r.y + r.h / 2 }; };
+    const mapXY = (x, y) => { const b = ragBody.getBoundingClientRect(), r = ragSvg.getBoundingClientRect(), k = r.width / 480; return { x: (r.left - b.left + x * k) / S, y: (r.top - b.top + y * k) / S }; };
+    function flyTo(node, a, b, ms, lift = 60, delay = 0) {   // along a gentle arc; resolves true when it lands
+      ragFly.append(node);
+      const c = { x: (a.x + b.x) / 2, y: Math.min(a.y, b.y) - lift };
+      const frames = [];
+      for (let k = 0; k <= 16; k++) {
+        const t = k / 16, u = 1 - t;
+        const x = u * u * a.x + 2 * u * t * c.x + t * t * b.x, y = u * u * a.y + 2 * u * t * c.y + t * t * b.y;
+        frames.push({ transform: `translate(${x.toFixed(1)}px, ${y.toFixed(1)}px) scale(${(0.75 + 0.25 * Math.sin(Math.PI * t)).toFixed(2)})`, opacity: t < 0.1 ? t * 10 : 1 });
+      }
+      const an = node.animate(frames, { duration: ms, delay, easing: 'cubic-bezier(.45,.05,.3,1)', fill: 'both' });
+      return an.finished.then(() => { node.remove(); return true; }, () => { node.remove(); return false; });
+    }
+    const cancelFly = () => { ragFly.getAnimations({ subtree: true }).forEach(a => a.cancel()); ragFly.replaceChildren(); };
+    const pop = n => n.animate([{ transform: 'scale(0)' }, { transform: 'scale(1.35)', offset: 0.6 }, { transform: 'scale(1)' }], { duration: 420, easing: 'ease-out' });
+    const nudge = n => n.animate([{ transform: 'none' }, { transform: 'scale(1.03)' }, { transform: 'none' }], { duration: 420, easing: 'ease-in-out' });
+    function ripple(parent, x, y) {
+      const c = svgEl('circle', { cx: x, cy: y, r: 13 }, 'rag-ripple rag-pop');
+      parent.prepend(c);
+      c.animate([{ transform: 'scale(1)', opacity: 0.6 }, { transform: 'scale(4.5)', opacity: 0 }], { duration: 900, easing: 'ease-out', fill: 'forwards' }).finished.then(() => c.remove(), () => c.remove());
+    }
+    async function step(me, ms) {   // wait, then say whether this run should carry on
+      if (ms) await sleep(ms);
+      if (me !== run) return false;
+      if (!isActive('rag')) { run++; renderFinal(); return false; }
+      return true;
+    }
+
+    /* ---------- ingest */
+    let embRun = 0;
+    async function showEmbed(i, animate, slow = true, keep = false) {   // the chunk as text, then as numbers (keep: leave it marked)
+      const me = ++embRun, v = vecOf(i);
+      const nums = $('#ragNums');
+      fit($('#ragQuote'), CH[i].text(days), true);
+      const final = () => { nums.textContent = `[${v.slice(0, 4).map(sgn).join(', ')}, … ]`; paintCells(cellsIn, v); };
+      if (animate) tiles.forEach((t, j) => t.classList.toggle('is-cur', j === i));
+      if (!animate || reduced) { final(); return; }
+      if (!slow) { final(); return; }
+      nums.textContent = '[';
+      paintCells(cellsIn, null);
+      for (let k = 0; k < 4; k++) {
+        await sleep(150);
+        if (me !== embRun) return;
+        nums.append(el('span', 'new', (k ? ', ' : '') + sgn(v[k])));
+        paintCells(cellsIn, v, (k + 1) * 6);
+      }
+      nums.append(', … ]');
+      await sleep(700);
+      if (me === embRun && !keep) tiles[i].classList.remove('is-cur');
+    }
+    function setCount(n) { $('#ragCount').textContent = n === 1 ? '1 chunk' : `${n} chunks`; }
+    function syncDoc() {
+      $('#ragDocMeta').textContent = days === 25 ? 'edited' : '6 sections';
+      $('#ragDoc').classList.toggle('is-new', days === 25);
+      tiles[0].classList.toggle('is-new', days === 25);
+      const u = $('#ragUpd');
+      u.textContent = days === 25 ? 'Undo: back to 24 days' : 'Change §4.1 to 25 days';
+      u.setAttribute('aria-pressed', String(days === 25));
+    }
+    function renderIngest() {
+      embRun++;
+      tilesBox.classList.remove('is-pre');
+      tiles.forEach(t => t.classList.remove('is-cur'));
+      pts.forEach(p => p.g.classList.remove('is-off'));
+      setCount(6);
+      syncDoc();
+      showEmbed(0, false);
+      stage(inRail, null);
+      inRail.classList.remove('is-run');
+      ingested = true;
+    }
+    async function playIngest(me) {
+      ingested = false;
+      embRun++;
+      pts.forEach(p => p.g.classList.add('is-off'));
+      setCount(0);
+      tilesBox.classList.add('is-pre');
+      tiles.forEach(t => t.classList.remove('is-cur'));
+      $('#ragQuote').textContent = '';
+      $('#ragNums').textContent = '';
+      paintCells(cellsIn, null);
+      resetRail(inRail);
+      if (!(await step(me, 500))) return false;
+      stage(inRail, 'doc');
+      nudge($('#ragDoc'));
+      if (!(await step(me, 420))) return false;
+      // the document splits: each chunk card grows out of the document card
+      stage(inRail, 'chunk');
+      const d = mid($('#ragDoc'));
+      tilesBox.classList.remove('is-pre');
+      tiles.forEach((t, n) => {
+        const m = mid(t);
+        t.animate([{ transform: `translate(${d.x - m.x}px, ${d.y - m.y}px) scale(0.3)`, opacity: 0 }, { transform: 'none', opacity: 1 }],
+          { duration: 560, delay: n * 70, easing: 'cubic-bezier(.2,.7,.2,1)', fill: 'backwards' });
+      });
+      if (!(await step(me, 720))) return false;
+      // each chunk becomes numbers, then flies into the store as a dot
+      stage(inRail, 'embed');
+      let landed = 0, last = null;
+      for (let i = 0; i < CH.length; i++) {
+        showEmbed(i, true, i === 0);
+        if (!(await step(me, i === 0 ? 850 : 230))) return false;
+        const c = CH[i];
+        last = flyTo(el('i', `rag-pkt rag-h${c.h}`), endOf($('#ragCellsIn'), true), mapXY(c.x, c.y), 600, 36).then(ok => {
+          if (!ok || me !== run) return;
+          pts[i].g.classList.remove('is-off');
+          pop(pts[i].pop);
+          setCount(++landed);
+        });
+        if (i === 0) stage(inRail, 'store');
+      }
+      await last;
+      if (!(await step(me, 350))) return false;
+      tiles.forEach(t => t.classList.remove('is-cur'));
+      showEmbed(0, false);
+      stage(inRail, null);
+      inRail.classList.remove('is-run');
+      ingested = true;
+      return true;
+    }
+
+    /* ---------- ask */
+    function clearPts() { pts.forEach((p, i) => { p.g.classList.remove('is-hit', 'is-weak', 'is-x'); p.s.textContent = CH[i].sec; }); }
+    function markPts(Q, k) {
+      const hit = new Map(Q.hits.slice(0, k));
+      pts.forEach((p, i) => {
+        const s = hit.get(i), blocked = Q.blocked && Q.blocked[0] === i;
+        p.g.classList.toggle('is-hit', s != null && s >= WEAK);
+        p.g.classList.toggle('is-weak', s != null && s < WEAK);
+        p.g.classList.toggle('is-x', !!blocked);
+        p.s.textContent = blocked ? 'HR only · filtered' : s != null ? `${CH[i].sec} · ${s.toFixed(2)}` : CH[i].sec;
+      });
+    }
+    function placeStar(Q, animate) {
+      starG.setAttribute('transform', `translate(${Q.star[0]} ${Q.star[1]})`);
+      starG.style.display = '';
+      starFor = qi;
+      if (!animate || reduced) return;
+      starPop.animate([{ transform: 'translateY(-30px) scale(0.4)', opacity: 0 }, { transform: 'translateY(2px) scale(1.15)', opacity: 1, offset: 0.7 }, { transform: 'none', opacity: 1 }], { duration: 480, easing: 'ease-out' });
+      ripple(starG, 0, 0);
+    }
+    function drawLinks(Q, k, animate) {
+      gLinks.replaceChildren();
+      const [sx, sy] = Q.star;
+      const list = (Q.blocked ? [{ i: Q.blocked[0], s: Q.blocked[1], x: true }] : []).concat(Q.hits.slice(0, k).map(([i, s]) => ({ i, s })));
+      list.forEach((h, n) => {
+        const c = CH[h.i], dx = c.x - sx, dy = c.y - sy, d = Math.hypot(dx, dy), ux = dx / d, uy = dy / d;
+        const a = [sx + ux * 16, sy + uy * 16], b = [c.x - ux * ((c.hr ? 11 : 9) + 5), c.y - uy * ((c.hr ? 11 : 9) + 5)];
+        const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
+        const ln = svgEl('line', { x1: a[0].toFixed(1), y1: a[1].toFixed(1), x2: b[0].toFixed(1), y2: b[1].toFixed(1) }, h.x ? 'rag-link-x' : 'rag-link' + (h.s < WEAK ? ' is-weak' : ''));
+        gLinks.append(ln);
+        if (h.x) {   // the access filter stops the search here: a cross halfway along
+          const xm = svgEl('g', { transform: `translate(${((a[0] + b[0]) / 2).toFixed(1)} ${((a[1] + b[1]) / 2).toFixed(1)})` });
+          const xin = svgEl('g', {}, 'rag-pop');
+          xin.innerHTML = '<circle class="rag-xmark" r="8"/><path class="rag-xmark-l" d="M-3.2 -3.2L3.2 3.2M3.2 -3.2L-3.2 3.2"/>';
+          xm.append(xin);
+          gLinks.append(xm);
+          if (animate && !reduced) { ln.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 300, fill: 'backwards' }); xin.animate([{ transform: 'scale(0)' }, { transform: 'scale(1.3)', offset: 0.6 }, { transform: 'scale(1)' }], { duration: 420, delay: 200, fill: 'backwards' }); }
+          return;
+        }
+        ln.setAttribute('stroke-width', (1.5 + h.s * 3).toFixed(1));
+        ln.style.strokeDasharray = len.toFixed(1);
+        if (animate && !reduced) ln.animate([{ strokeDashoffset: len }, { strokeDashoffset: 0 }], { duration: 440, delay: (n + (Q.blocked ? 0.6 : 0)) * 130, easing: 'cubic-bezier(.3,.7,.2,1)', fill: 'backwards' });
+      });
+    }
+    function setFind(Q, k) {
+      const f = $('#ragFind');
+      f.replaceChildren(el('span', null, `top ${k}`), el('span', 'rag-tag', 'access: all staff'));
+      if (Q.blocked) f.append(el('span', 'rag-tag is-x', '1 filtered'));
+    }
+    const rowsBox = $('#ragRows');
+    // the prompt keeps one slot per retrieved chunk (K of them), so nothing in the lane moves while a run fills it
+    function slotRows(k) {
+      rowsBox.replaceChildren(...Array.from({ length: k }, (_, n) => {
+        const li = el('li', 'rag-pr-row is-wait');
+        li.dataset.slot = `chunk ${n + 1} of ${k}`;
+        li.append(el('span', 'rag-pr-ref', '\u00a0'), el('span', 'rag-pr-txt', '\u00a0'), el('span', 'rag-pr-w'));
+        return li;
+      }));
+    }
+    function buildRows(Q, k, wait) {
+      rowsBox.replaceChildren(...Q.hits.slice(0, k).map(([i, s], n) => {
+        const c = CH[i], weak = s < WEAK;
+        const li = el('li', `rag-pr-row rag-h${c.h}` + (weak ? ' is-weak' : '') + (wait ? ' is-wait' : ''));
+        li.dataset.c = i;
+        li.dataset.slot = `chunk ${n + 1} of ${k}`;
+        li.append(el('span', 'rag-pr-ref', `${c.sec} · ${s.toFixed(2)}`), el('span', 'rag-pr-txt'), el('span', 'rag-pr-w', weak ? 'weak' : ''));
+        return li;
+      }));
+      $$('.rag-pr-row', rowsBox).forEach(li => fit($('.rag-pr-txt', li), CH[+li.dataset.c].text(days)));
+      $('#ragPrQ').textContent = Q.q;
+    }
+    const ansEl = $('#ragAns'), caret = $('#ragCaret'), srcBox = $('#ragSrcs');
+    async function typeAns(me, Q, animate) {
+      const [text, src] = Q.ans(K, days);
+      srcBox.replaceChildren();
+      const done = () => {
+        caret.hidden = true;
+        ansEl.textContent = text;
+        srcBox.replaceChildren(src.length ? el('span', 'src', `HR Policy 2026 ${src.map(i => CH[i].sec).join(', ')}`) : el('span', 'rag-nosrc', 'No permitted source'));
+        ansEl.parentElement.classList.remove('is-empty');
+      };
+      if (!animate || reduced) { done(); return true; }
+      ansEl.textContent = '';
+      ansEl.parentElement.classList.remove('is-empty');
+      caret.hidden = false;
+      for (const t of tokenize(text)) {
+        if (me !== run) return false;
+        ansEl.textContent += t;
+        await sleep(24);
+      }
+      if (me !== run) return false;
+      done();
+      return true;
+    }
+    function clearAnswer() { ansEl.textContent = ''; caret.hidden = true; srcBox.replaceChildren(); ansEl.parentElement.classList.add('is-empty'); }
+    function clearAsk() {
+      gLinks.replaceChildren();
+      starG.style.display = 'none';
+      starFor = -1;
+      clearPts();
+      fit($('#ragQText'), '');
+      paintCells(cellsQ, null);
+      $('#ragFind').replaceChildren();
+      slotRows(K);
+      $('#ragPrQ').textContent = '';
+      clearAnswer();
+      resetRail(askRail);
+    }
+    function renderAsk() {
+      const Q = QS[qi];
+      fit($('#ragQText'), Q.q, true);
+      paintCells(cellsQ, qVec(qi));
+      placeStar(Q, false);
+      drawLinks(Q, K, false);
+      markPts(Q, K);
+      setFind(Q, K);
+      buildRows(Q, K, false);
+      typeAns(run, Q, false);
+      stage(askRail, null);
+      askRail.classList.remove('is-run');
+    }
+    function renderFinal() { cancelFly(); renderIngest(); renderAsk(); }
+
+    async function playAsk(me, fromSearch) {
+      const Q = QS[qi];
+      if (!fromSearch) {
+        clearAsk();
+        stage(askRail, 'q');
+        const qt = $('#ragQText');
+        fit(qt, Q.q, true);
+        qt.animate([{ opacity: 0, transform: 'translateX(-8px)' }, { opacity: 1, transform: 'none' }], { duration: 360, easing: 'ease-out' });
+        if (!(await step(me, 520))) return false;
+        stage(askRail, 'emb');
+        const v = qVec(qi);
+        for (let k = 1; k <= 6; k++) { paintCells(cellsQ, v, k * 4); if (!(await step(me, 55))) return false; }
+        if (!(await step(me, 220))) return false;
+        stage(askRail, 'search');
+        const ok = await flyTo(el('i', 'rag-pkt is-q'), endOf($('#ragCellsQ'), false), mapXY(...Q.star), 640, 36);
+        if (!ok || !(await step(me, 0))) return false;
+        placeStar(Q, true);
+        if (!(await step(me, 320))) return false;
+      } else {
+        gLinks.replaceChildren();
+        clearPts();
+        slotRows(K);
+        clearAnswer();
+        stage(askRail, 'search');
+        ripple(starG, 0, 0);
+        if (!(await step(me, 200))) return false;
+      }
+      drawLinks(Q, K, true);
+      markPts(Q, K);
+      setFind(Q, K);
+      if (!(await step(me, 460 + (K + (Q.blocked ? 1 : 0)) * 130))) return false;
+      // the chosen chunks lift out of the map into the prompt
+      stage(askRail, 'prompt');
+      buildRows(Q, K, true);
+      const rows = [...rowsBox.children];
+      rows.forEach((row, n) => {
+        const c = CH[+row.dataset.c], a = mapXY(c.x, c.y), rb = relBox(row);
+        flyTo(el('span', `rag-lift rag-h${c.h}`, c.sec), { x: a.x - 22, y: a.y - 12 }, { x: rb.x + 8, y: rb.y + 2 }, 620, 50, n * 120)
+          .then(landedOk => { if (landedOk && me === run) { row.classList.remove('is-wait'); row.classList.add('is-fill'); } });
+      });
+      if (!(await step(me, 640 + rows.length * 120 + 160))) return false;
+      rows.forEach(r => { if (r.classList.contains('is-wait')) r.classList.replace('is-wait', 'is-fill'); });
+      stage(askRail, 'model');
+      if (!(await step(me, 800))) return false;
+      stage(askRail, 'ans');
+      if (!(await typeAns(me, Q, true))) return false;
+      stage(askRail, null);
+      askRail.classList.remove('is-run');
+      return true;
+    }
+
+    /* ---------- controls */
+    const chips = $$('.rag-chip'), kBtns = $$('.rag-k .seg-btn');
+    const syncChips = () => chips.forEach(b => { const on = +b.dataset.q === qi; b.classList.toggle('is-on', on); b.setAttribute('aria-pressed', String(on)); });
+    const syncK = () => kBtns.forEach(b => { const on = +b.dataset.k === K; b.classList.toggle('is-on', on); b.setAttribute('aria-pressed', String(on)); });
+    function begin() { const me = ++run; cancelFly(); if (!ingested) renderIngest(); return me; }
+    chips.forEach(b => b.addEventListener('click', () => {
+      qi = +b.dataset.q;
+      syncChips();
+      const me = begin();
+      if (reduced) { renderAsk(); return; }
+      playAsk(me, false);
+    }));
+    kBtns.forEach(b => b.addEventListener('click', () => {
+      K = +b.dataset.k;
+      syncK();
+      const me = begin();
+      if (reduced) { renderAsk(); return; }
+      playAsk(me, starFor === qi);
+    }));
+    $('#ragUpd').addEventListener('click', async () => {
+      days = days === 24 ? 25 : 24;
+      qi = 0;
+      syncChips();
+      const me = begin();
+      syncDoc();
+      $('#ragUpdNote').textContent = days === 25 ? 'Upserted by id: §4.1 replaced in place. No retraining.' : 'Upserted again: back to 24 days. No retraining.';
+      if (reduced) { renderIngest(); renderAsk(); return; }
+      clearAsk();
+      // only the changed chunk goes through the lane again, and lands on the same id
+      stage(inRail, 'doc');
+      nudge($('#ragDoc'));
+      if (!(await step(me, 450))) return;
+      stage(inRail, 'chunk');
+      if (!(await step(me, 350))) return;
+      stage(inRail, 'embed');
+      showEmbed(0, true);
+      if (!(await step(me, 1000))) return;
+      stage(inRail, 'store');
+      const ok = await flyTo(el('i', 'rag-pkt rag-h1'), endOf($('#ragCellsIn'), true), mapXY(CH[0].x, CH[0].y), 600, 36);
+      if (!ok || !(await step(me, 0))) return;
+      ripple(pts[0].g, 0, 0);
+      pop(pts[0].pop);
+      if (!(await step(me, 450))) return;
+      tiles[0].classList.remove('is-cur');
+      stage(inRail, null);
+      inRail.classList.remove('is-run');
+      await playAsk(me, false);
+    });
+
+    hooks.rag = () => {
+      sizeRails();
+      if (reduced) { run++; renderFinal(); return; }
+      const me = ++run;
+      cancelFly();
+      clearAsk();
+      (async () => { if (await playIngest(me)) await playAsk(me, false); })();
+    };
+    let ragResize = 0;
+    addEventListener('resize', () => { clearTimeout(ragResize); ragResize = setTimeout(() => { sizeRails(); refit(); }, 160); });
+    sizeRails();
+    renderFinal();
+    document.fonts?.ready.then(() => { sizeRails(); refit(); });
+  }
   /* BUILD:rag END */
 
   /* BUILD:agents START */

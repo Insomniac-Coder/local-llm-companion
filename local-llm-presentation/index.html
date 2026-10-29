@@ -402,10 +402,142 @@
 <!-- ================================================================ 14 · RAG AND CHROMADB -->
 <section class="slide" id="rag" data-label="12 · Our documents: RAG">
   <div class="frame"><div class="pad">
-    <header class="s-head">
-      <p class="eyebrow rv"><span class="ch">12</span> Our documents: RAG</p>
-      <h2 data-gen>Our documents: RAG</h2>
+    <header class="s-head s-head-row rag-head">
+      <div>
+        <p class="eyebrow rv"><span class="ch">12</span> Our documents: RAG</p>
+        <h2 data-gen>From our documents to a cited answer</h2>
+      </div>
+      <p class="rag-ring rv" style="--d:2">
+        <svg viewBox="0 0 64 64" aria-hidden="true">
+          <circle class="rag-ring-c" cx="32" cy="32" r="30"/><circle class="rag-ring-c" cx="32" cy="32" r="25"/>
+          <circle class="rag-ring-c on" cx="32" cy="32" r="20"/><circle class="rag-ring-c" cx="32" cy="32" r="15"/>
+          <circle class="rag-ring-c on" cx="32" cy="32" r="10"/><circle class="rag-ring-core" cx="32" cy="32" r="5.5"/>
+        </svg>
+        <span>The harness (11), opened: <b>our documents</b>, with <b>access rights</b> applied at search time</span>
+      </p>
     </header>
+
+    <div class="rag-main">
+      <div class="rag-asks rv" style="--d:2">
+        <p class="rag-asker">Pick a question</p>
+        <div class="rag-chips" role="group" aria-label="Questions to ask">
+          <button type="button" class="chip rag-chip is-on" data-q="0" aria-pressed="true">How many days of annual leave do I get?</button>
+          <button type="button" class="chip rag-chip" data-q="1" aria-pressed="false">Can I carry unused leave into next year?</button>
+          <button type="button" class="chip rag-chip" data-q="2" aria-pressed="false">What does parental leave look like?</button>
+          <button type="button" class="chip rag-chip" data-q="3" aria-pressed="false">What are the salary bands?<svg class="rag-lock" viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="10.5" width="14" height="10" rx="2.5"/><path d="M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5"/></svg></button>
+        </div>
+      </div>
+
+      <div class="rag-body" id="ragBody">
+        <section class="rag-lane rag-in card rv" style="--d:3" aria-label="Ingest, once per document">
+          <p class="rag-lane-t"><b>Ingest</b> once per document</p>
+          <ol class="rag-rail" id="ragInRail">
+            <li class="rag-st" data-st="doc">
+              <span class="rag-node" aria-hidden="true">1</span>
+              <div class="rag-st-b rag-row">
+                <p class="rag-st-n">Document</p>
+                <div class="rag-doc" id="ragDoc">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 2.8h8.2L19 7.6v13.6H6z"/><path d="M14 2.8v5h5"/><path d="M9 12h7M9 15h7M9 18h4.5"/></svg>
+                  <span class="rag-doc-t">HR Policy 2026</span>
+                  <span class="rag-doc-m" id="ragDocMeta">6 sections</span>
+                </div>
+              </div>
+            </li>
+            <li class="rag-st" data-st="chunk">
+              <span class="rag-node" aria-hidden="true">2</span>
+              <div class="rag-st-b">
+                <p class="rag-st-n">Chunk <span class="rag-tag">~200 tokens</span><span class="rag-tag">15% overlap</span></p>
+                <ul class="rag-tiles" id="ragTiles" aria-label="Chunks: click one to see it as numbers"></ul>
+                <p class="rag-note">Overlap keeps sentences whole. Too small loses context; too large blurs the match.</p>
+              </div>
+            </li>
+            <li class="rag-st" data-st="embed">
+              <span class="rag-node" aria-hidden="true">3</span>
+              <div class="rag-st-b">
+                <p class="rag-st-n">Embed <span class="rag-st-x">384 numbers per chunk</span></p>
+                <p class="rag-quote" id="ragQuote"></p>
+                <p class="rag-nums" id="ragNums" aria-live="polite"></p>
+                <div class="rag-cells" id="ragCellsIn" aria-hidden="true"></div>
+              </div>
+            </li>
+            <li class="rag-st" data-st="store">
+              <span class="rag-node" aria-hidden="true">4</span>
+              <div class="rag-st-b">
+                <p class="rag-st-n">Store in ChromaDB <span class="rag-tag rag-count" id="ragCount">6 chunks</span></p>
+                <p class="rag-note">id · vector · text · source · access</p>
+                <div class="rag-upd">
+                  <button type="button" class="btn btn-small" id="ragUpd" aria-pressed="false">Change §4.1 to 25 days</button>
+                  <p class="rag-note" id="ragUpdNote" aria-live="polite">Re-ingest: the next answer reflects it. No retraining.</p>
+                </div>
+              </div>
+            </li>
+          </ol>
+        </section>
+
+        <figure class="rag-map card rv" style="--d:4">
+          <figcaption class="rag-map-h">
+            <p class="rag-map-t">ChromaDB <span>map of meaning</span></p>
+            <div class="seg rag-k" role="group" aria-label="Top-K: how many chunks to retrieve">
+              <span class="rag-k-l">Top-K</span>
+              <button type="button" class="seg-btn" data-k="1" aria-pressed="false">1</button>
+              <button type="button" class="seg-btn" data-k="2" aria-pressed="false">2</button>
+              <button type="button" class="seg-btn is-on" data-k="3" aria-pressed="true">3</button>
+              <button type="button" class="seg-btn" data-k="4" aria-pressed="false">4</button>
+            </div>
+          </figcaption>
+          <svg class="rag-svg" id="ragSvg" viewBox="0 0 480 400" role="img" aria-label="A two-dimensional sketch of the vector space: each chunk of the HR policy is a dot, close dots mean close meanings, and the question lands as a star beside the chunks that answer it"></svg>
+          <p class="rag-map-f"><span class="rag-kf">Like top-K for words (04), now for chunks: too few may miss the answer; too many dilute the prompt.</span><span>Illustrative: real vectors have 384 dimensions, not two.</span></p>
+        </figure>
+
+        <section class="rag-lane rag-ask card rv" style="--d:5" aria-label="Ask, every question">
+          <p class="rag-lane-t"><b>Ask</b> every question<span class="rag-who"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4.5 20.5c1.2-4 4-6 7.5-6s6.3 2 7.5 6"/></svg>asked by a Sales employee</span></p>
+          <ol class="rag-rail" id="ragAskRail">
+            <li class="rag-st" data-st="q">
+              <span class="rag-node" aria-hidden="true">1</span>
+              <div class="rag-st-b rag-row"><p class="rag-st-n">Question</p><p class="rag-qtext" id="ragQText"></p></div>
+            </li>
+            <li class="rag-st" data-st="emb">
+              <span class="rag-node" aria-hidden="true">2</span>
+              <div class="rag-st-b rag-row"><p class="rag-st-n">Embed</p><div class="rag-cells rag-cells-q" id="ragCellsQ" aria-hidden="true"></div><span class="rag-st-x">same model</span></div>
+            </li>
+            <li class="rag-st" data-st="search">
+              <span class="rag-node" aria-hidden="true">3</span>
+              <div class="rag-st-b rag-row"><p class="rag-st-n">Search</p><p class="rag-find" id="ragFind" aria-live="polite"></p></div>
+            </li>
+            <li class="rag-st" data-st="prompt">
+              <span class="rag-node" aria-hidden="true">4</span>
+              <div class="rag-st-b">
+                <p class="rag-st-n">Prompt <span class="rag-st-x">everything the model will see</span></p>
+                <div class="rag-prompt">
+                  <p class="rag-pr-l"><span class="rag-pr-k">Rule</span>Answer only from these sources and cite them. If they don’t cover it, say so.</p>
+                  <ol class="rag-pr-rows" id="ragRows"></ol>
+                  <p class="rag-pr-l"><span class="rag-pr-k">Question</span><span id="ragPrQ"></span></p>
+                </div>
+              </div>
+            </li>
+            <li class="rag-st" data-st="model">
+              <span class="rag-node" aria-hidden="true">5</span>
+              <div class="rag-st-b rag-row"><p class="rag-st-n">Private model</p><span class="rag-st-x">on our own servers</span><span class="rag-think" aria-hidden="true"><i></i><i></i><i></i></span></div>
+            </li>
+            <li class="rag-st" data-st="ans">
+              <span class="rag-node" aria-hidden="true">6</span>
+              <div class="rag-st-b">
+                <div class="rag-row"><p class="rag-st-n">Cited answer</p><div class="rag-srcs" id="ragSrcs" aria-live="polite"></div></div>
+                <div class="bubble bubble-a rag-ans is-empty" aria-live="polite"><span id="ragAns"></span><span class="gen-caret" id="ragCaret" aria-hidden="true" hidden></span></div>
+              </div>
+            </li>
+          </ol>
+        </section>
+        <div class="rag-fly" id="ragFly" aria-hidden="true"></div>
+      </div>
+    </div>
+
+    <details class="eng-note"><summary>Engineer's note</summary>
+      <p><b>Chunking.</b> Split on headings and paragraphs with a recursive splitter (LangChain's <code>RecursiveCharacterTextSplitter</code>; <code>MarkdownHeaderTextSplitter</code> keeps section titles as metadata), usually 300–800 tokens with 10–20% overlap. Chroma's default embedding model, all-MiniLM-L6-v2, reads only the first 256 word pieces of a text, so with it we keep chunks near 200 tokens; models with longer inputs (EmbeddingGemma up to 2,048 tokens, nomic-embed-text up to 8,192) take the larger sizes. Store the section title, source and page with every chunk so answers can cite them.</p>
+      <p><b>Embeddings.</b> all-MiniLM-L6-v2 turns any text into 384 numbers and runs comfortably on a CPU; EmbeddingGemma and nomic-embed-text (768 numbers each) are stronger options. All of them run on our own servers. Documents and questions must go through the same model; switching models means re-embedding the collection.</p>
+      <p><b>ChromaDB.</b> Open source (Apache 2.0). Runs inside the application with <code>PersistentClient</code> (saved to disk) or as its own server on our machines (<code>chroma run</code>, <code>HttpClient</code>). A collection holds ids, embeddings, documents (the chunk text) and metadata, searched through an HNSW index; we set the collection's space to cosine (the default is squared L2), and the scores shown are 1 − cosine distance. Access control is a metadata filter applied inside the search: <code>query(query_texts=[q], n_results=3, where={"access": {"$in": groups}})</code>, with the groups taken from the person's sign-in, never from the model. When a document changes, <code>upsert</code> its chunks by id and delete the ones that no longer exist; nothing is retrained.</p>
+      <p><b>Getting it right.</b> Hybrid search (keyword BM25 alongside the vectors, merged with reciprocal rank fusion) and a reranker (a cross-encoder that rescores the top 20 to 50) raise precision. Measure retrieval with a test set of real questions and the chunk that answers each: hit rate at K is the share whose right chunk is in the top K. LangChain's <code>Chroma</code> vector store wraps the same collection as the retriever our RAG agent uses (next slide).</p>
+    </details>
   </div></div>
 </section>
 <!-- BUILD:rag END -->
