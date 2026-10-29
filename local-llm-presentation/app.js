@@ -2134,8 +2134,7 @@
     hitlState = 'idle';
     hitlReplicas = 4;
     hitlSteps.forEach((_, i) => hitlMark(i));
-    hitlReach(0);
-    hitlTrack.style.removeProperty('--k');
+    hitlReach(0);   // a stale --k is harmless: --p stays at or below 3/7 until the next decision sets or clears it
     $('#hitlDecideLabel').textContent = 'A person decides';
     $('#hitlDecideNote').textContent = 'approve, edit, reject';
     $('#hitlExecNote').textContent = 'apply the change';
@@ -2209,7 +2208,7 @@
     hitlCard.classList.add('decided');
     $('#hitlExecNote').textContent = reject ? 'skipped' : `scaled 2 → ${n}`;
     hitlMark(3, 'done');
-    if (reject) hitlTrack.style.setProperty('--k', 4 / (hitlSteps.length - 1));
+    if (reject) hitlTrack.style.setProperty('--k', 4 / (hitlSteps.length - 1)); else hitlTrack.style.removeProperty('--k');
     for (let k = 0; k < 4; k++) {
       await hitlPause(k ? 650 : 250);
       if (me !== hitlRun) return;
