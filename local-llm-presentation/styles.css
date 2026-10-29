@@ -804,7 +804,7 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .ag-chips { display: flex; gap: 8px; flex: 1; min-width: 0; }
 .ag-chip { display: inline-flex; align-items: center; gap: 8px; padding: 7px 14px; border-radius: 999px; border: 1.5px solid var(--line-2); background: var(--paper); color: var(--ink-2); font: 500 15.5px/1.2 var(--sans); cursor: pointer; white-space: nowrap; transition: border-color 0.2s, box-shadow 0.2s, color 0.2s, background-color 0.2s; }
 .ag-chip:hover { border-color: var(--ink); color: var(--ink); }
-.ag-chip.is-on { border-color: var(--ink); color: var(--ink); box-shadow: 0 1px 4px rgba(11, 26, 44, 0.16); }
+.ag-chip.is-on { background: var(--ink); border-color: var(--ink); color: var(--on-ink); box-shadow: 0 1px 4px rgba(11, 26, 44, 0.16); }
 .ag-chip-dots { display: inline-flex; gap: 3px; }
 .ag-chip-dots i { width: 9px; height: 9px; border-radius: 50%; background: var(--ac); }
 
@@ -867,7 +867,7 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 
 .ag-agents { position: relative; z-index: 1; list-style: none; padding: 0; margin: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
 .ag-node { padding: 13px 14px 14px; border-radius: 16px; background: var(--paper); border: 1.5px solid var(--line); border-top: 4px solid var(--ac); box-shadow: var(--shadow); transition: transform 0.35s cubic-bezier(0.2, 0.7, 0.2, 1), box-shadow 0.35s, border-color 0.35s; }
-.ag-node.is-on { transform: translateY(-5px); border-color: var(--ac); box-shadow: 0 0 0 4px color-mix(in srgb, var(--ac) 22%, transparent), 0 14px 32px color-mix(in srgb, var(--ac) 30%, transparent); }
+.ag-node.is-on { transform: translateY(-2px); border-color: var(--ac); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ac) 22%, transparent), 0 14px 32px color-mix(in srgb, var(--ac) 30%, transparent); }
 .ag-node.is-wait { border-style: dashed; border-top-style: solid; animation: ag-hold 1.6s ease-in-out infinite; }
 @keyframes ag-hold { 0%, 100% { box-shadow: 0 0 0 4px color-mix(in srgb, var(--ac) 14%, transparent), var(--shadow); } 50% { box-shadow: 0 0 0 7px color-mix(in srgb, var(--ac) 28%, transparent), var(--shadow); } }
 .ag-node-head { display: flex; align-items: center; gap: 10px; }
@@ -879,19 +879,20 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .ag-tools span.is-hot { background: var(--as); color: var(--at); box-shadow: 0 0 0 2px var(--ac); }
 
 /* the run: shared state and step log */
-.ag-side { padding: 16px 17px 15px; display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.ag-side { padding: 16px 17px 15px; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
 .ag-sec { display: grid; gap: 8px; min-width: 0; }
 .ag-side-k { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; font: 600 13px/1.3 var(--mono); letter-spacing: 0.12em; text-transform: uppercase; color: var(--ours-ink); }
 .ag-side-k span { font-weight: 400; letter-spacing: 0.02em; text-transform: none; color: var(--muted); }
-.ag-state { display: grid; gap: 1px; padding: 8px 12px; border-radius: 12px; background: var(--wash); font: 400 14px/1.6 var(--mono); }
+.ag-state { display: grid; gap: 1px; padding: 8px 12px; border-radius: 12px; background: var(--wash); font: 400 14px/1.5 var(--mono); }
 .ag-state > div { display: grid; grid-template-columns: 84px minmax(0, 1fr); gap: 10px; }
 .ag-state dt { color: var(--muted); }
 .ag-state dd { min-width: 0; color: var(--ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; border-radius: 4px; }
+.ag-state dd[data-k="request"] { white-space: normal; overflow: visible; text-overflow: clip; height: 3em; }
 .ag-state dd.flash { animation: ag-flash 1.1s ease-out; }
 @keyframes ag-flash { 0%, 30% { background: var(--hl1); } 100% { background: transparent; } }
 .ag-state .ag-k { color: var(--at); font-weight: 500; }
 .ag-state .ag-q { color: var(--ink-2); }
-.ag-log { list-style: none; padding: 0; margin: 0; display: grid; gap: 6px; align-content: start; min-height: 129px; }
+.ag-log { list-style: none; padding: 0; margin: 0; display: grid; gap: 4px; align-content: start; min-height: 121px; }
 .ag-log li { display: grid; grid-template-columns: 24px minmax(0, 1fr); gap: 10px; align-items: start; font-size: 16px; line-height: 1.3; color: var(--ink-2); animation: pop 0.3s ease-out backwards; }
 .ag-n { width: 22px; height: 22px; margin-top: -1px; border-radius: 50%; display: grid; place-items: center; font: 600 12.5px/1 var(--mono); color: #fff; background: var(--ac); }
 .ag-log b { color: var(--at); font-weight: 600; }
@@ -903,12 +904,12 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .ag-why { display: grid; grid-template-columns: 296px minmax(0, 1fr); gap: 16px; align-items: stretch; }
 .ag-why-head { display: grid; gap: 7px; align-content: start; padding-top: 2px; }
 .ag-why-head h3 { font-size: 22px; line-height: 1.15; white-space: nowrap; }
-.ag-why-head p { font-size: 15.5px; line-height: 1.45; color: var(--ink-2); }
+.ag-why-head p { font-size: 15.5px; line-height: 1.45; color: var(--ink-2); text-wrap: pretty; }
 .ag-why-list { list-style: none; padding: 0; margin: 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; }
 .ag-why-list li { display: grid; gap: 6px; align-content: start; padding: 13px 16px 14px; border-radius: 14px; background: var(--paper); border: 1px solid var(--line); border-top: 3px solid var(--ink); }
 .ag-why-t { display: flex; align-items: center; gap: 9px; font: 600 18px/1.2 var(--sans); color: var(--ink); }
 .ag-why-t svg { width: 22px; height: 22px; flex: none; fill: none; stroke: var(--ours); stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }
-.ag-why-list li > p:not(.ag-why-t) { font-size: 16px; line-height: 1.42; color: var(--ink-2); }
+.ag-why-list li > p:not(.ag-why-t) { font-size: 16px; line-height: 1.42; color: var(--ink-2); text-wrap: pretty; }
 
 /* phones: one column, rules beside their agent, no edges */
 .flow .ag-main, .flow .ag-io, .flow .ag-rules, .flow .ag-agents, .flow .ag-why, .flow .ag-why-list { grid-template-columns: 1fr; }
@@ -1171,7 +1172,7 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
   display: grid; grid-template-columns: minmax(0, 1fr) minmax(120px, 360px) minmax(0, 1fr); align-items: center; gap: 24px;
   padding: 0 20px 0 28px;
   background: rgba(245, 247, 250, 0.94); -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px);
-  border-top: 1px solid #dce2ea; color: #0b1a2c; transition: background-color 0.5s, border-color 0.5s, color 0.5s;
+  border-top: 1px solid #dce2ea; color: #0b1a2c; transition: background-color 0.45s 0.3s, border-color 0.45s 0.3s, color 0s linear 0.52s;
 }
 .flow .bar { display: none; }
 html[data-tone="dark"] .bar { background: rgba(11, 26, 44, 0.94); border-top-color: #1f3654; color: #f2f5f9; }
@@ -1240,6 +1241,8 @@ html[data-tone="dark"] .bar-fill { background: #34d399; }
 .flow #hostSeg { flex-wrap: wrap; white-space: normal; }
 
 /* BUILD:polish START */
+/* no paragraph ends with one word alone on its last line */
+.deck .frame :is(p, li, dd) { text-wrap: pretty; }
 /* deck-wide polish: per-slide motion and finish.
    Rules: motion lives inside (prefers-reduced-motion: no-preference) and under .deck; it animates only transform,
    opacity, filter and SVG stroke; every entrance is keyed to .slide.on, so it replays on each visit and stops when

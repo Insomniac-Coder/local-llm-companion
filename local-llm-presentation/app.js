@@ -157,6 +157,8 @@
     animating = !instant && !reduced;
     setTimeout(() => { animating = false; }, 820);
     if (!same) enter(i);
+    const a = document.activeElement;
+    if (a && a !== document.body && a.closest?.('.slide') && !slides[i].contains(a)) a.blur();
     updateBar();
     closeDrawer();
     try { history.replaceState(null, '', '#' + slides[i].id); } catch { /* sandboxed: fine */ }
@@ -164,7 +166,7 @@
 
   function updateBar() {
     const n = slides.length;
-    $('#barLabel').textContent = slides[cur].dataset.label || '';
+    $('#barLabel').textContent = (slides[cur].dataset.label || '').replace(/^\d+\s*·\s*/, '');
     $('#barCount').textContent = `${String(cur + 1).padStart(2, '0')} / ${n}`;
     $('#barFill').style.setProperty('--p', cur / (n - 1));
     $('#prevBtn').disabled = cur === 0;
@@ -223,10 +225,13 @@
   }, { passive: false });
 
   addEventListener('keydown', e => {
-    if (e.key === 'Escape') { closeDrawer(); return; }
+    if (e.key === 'Escape') { closeDrawer(); if (e.target.matches?.('input, select, textarea')) e.target.blur(); return; }
     if (!isDeck() || e.altKey || e.ctrlKey || e.metaKey) return;
     const t = e.target;
-    if (t.closest?.('textarea, select, [contenteditable], input:not([type="range"]):not([type="checkbox"])')) return;
+    if (t.closest?.('textarea, select, [contenteditable], input:not([type="range"]):not([type="checkbox"])')) {
+      if (e.key === 'PageDown' || e.key === 'PageUp') { e.preventDefault(); if (!animating) go(cur + (e.key === 'PageDown' ? 1 : -1)); }
+      return;
+    }
     const onRange = t.matches?.('input[type="range"]');
     const onButton = t.closest?.('button, a, label');
     let d = 0;
@@ -986,7 +991,7 @@
   /* ------------------------------------------------------------------ 8: glossary */
   const CATS = { basics: 'Basics', build: 'Building with AI', run: 'Running a model', risk: 'Risks and safety' };
   const TERMS = [
-    ['Token', 'basics', 1, 'The unit a model reads and writes: a common word, or a piece of a rarer one. Usage limits and prices are counted in tokens.', 'Syllables, for a machine.', 'Tokenizers are learned from data, usually by byte-pair encoding. Vocabularies run from about 32,000 to over 200,000 tokens. English averages about 0.75 words per token; many other languages, and code, need more tokens for the same meaning.'],
+    ['Token', 'basics', 1, 'The unit a model reads and writes: a common word, or a piece of a rarer one. Usage limits and prices are counted in tokens.', 'Syllables, for a machine.', 'Tokenisers are learned from data, usually by byte-pair encoding. Vocabularies run from about 32,000 to over 200,000 tokens. English averages about 0.75 words per token; many other languages, and code, need more tokens for the same meaning.'],
     ['Parameters', 'basics', 1, 'The billions of numbers inside a model that were adjusted during training. Together they hold everything it learned.', 'The strength of the connections in a brain.', 'Also called weights. An 8B model has 8 billion of them. Memory needed ≈ parameters × bytes per parameter: 2 bytes at 16-bit, about 0.5 at 4-bit.'],
     ['Context window', 'basics', 1, 'How much text the model can consider at once: the instructions, the conversation so far and any documents supplied, measured in tokens.', 'A desk. Only what fits on the desk gets used.', 'Ranges from about 8,000 to over 1,000,000 tokens. Longer contexts need more memory (the KV cache), and models often miss facts buried in the middle of very long inputs, which is one reason RAG sends only the relevant passages.'],
     ['Prompt and system prompt', 'basics', 0, 'The prompt is what a person sends. The system prompt is standing instructions set by whoever runs the tool: role, rules, tone and format.', 'The briefing a new employee gets on day one, then the day’s requests.', 'In a harness, the system prompt also describes the available tools and how to call them. It is one of the most important levers we control; with a subscription service most of it belongs to the vendor.'],
@@ -997,7 +1002,7 @@
     ['Reasoning model', 'basics', 0, 'A model trained to work through a problem step by step before answering. Slower, but much better at maths, code and planning.', 'Showing your working in an exam.', 'Examples: OpenAI’s o-series and its open-weight gpt-oss, Mistral’s Magistral. The thinking costs extra tokens, so answers take longer and use more compute.'],
     ['RAG', 'build', 1, 'Retrieval-augmented generation. Before answering, the system searches our documents for the relevant passages and gives them to the model with the question, so it answers from them and can cite them.', 'An open-book exam instead of answering from memory.', 'Split documents into passages, embed them, store them in an index; at question time search (vector plus keyword), rerank, and put the best passages into the prompt. Updating knowledge means updating the index: no retraining.'],
     ['Embeddings', 'build', 0, 'A way to turn a piece of text into a list of numbers that captures its meaning, so software can find passages that mean the same thing even when the words differ.', 'Map coordinates for meaning: similar ideas sit close together.', 'Made by a separate, small embedding model, typically 384 to 4,096 numbers per passage. Closeness is measured by the angle between two lists (cosine similarity).'],
-    ['Vector database', 'build', 0, 'A database that stores embeddings and quickly finds the ones closest to a question. It is the search engine behind RAG.', 'A library catalogue organised by topic instead of title.', 'Options include PostgreSQL with pgvector, Qdrant, Milvus and OpenSearch. Store each passage’s access rights next to it, so search only returns what the asker may see.'],
+    ['Vector database', 'build', 0, 'A database that stores embeddings and quickly finds the ones closest to a question. It is the search engine behind RAG.', 'A library catalogue organised by topic instead of title.', 'Options include ChromaDB (our proof of concept), PostgreSQL with pgvector, Qdrant, Milvus and OpenSearch. Store each passage’s access rights next to it, so search only returns what the asker may see.'],
     ['Fine-tuning', 'build', 1, 'Further training an existing model on our own examples, to change its behaviour, tone or output format.', 'On-the-job training for a graduate who already has a degree.', 'Good for style, format and narrow tasks such as sorting tickets. Poor at reliably adding facts, and whatever it learns is frozen on the day training ends. Needs hundreds to thousands of high-quality examples.'],
     ['LoRA', 'build', 0, 'A cheap way to fine-tune. Instead of changing every parameter, a small add-on is trained: hours on one GPU instead of weeks on many.', 'Clip-on lenses instead of new glasses.', 'Low-Rank Adaptation trains small extra matrices, typically well under 1% of the model’s size. QLoRA does the same on a 4-bit model to save memory. Different adapters can be swapped in per task on one base model.'],
     ['Harness', 'build', 1, 'All the software around a model that turns it into a useful tool: instructions, memory, access to documents and tools, permissions and logging.', 'The model is the engine; the harness is the rest of the car.', 'Examples: the ChatGPT app and Claude Code. The harness decides what goes into the context window at every step, so it drives quality as much as the model does.'],
@@ -1005,13 +1010,13 @@
     ['Tool calling', 'build', 0, 'The model’s ability to ask the harness to run something, such as a search, a database query or a calculation, and then use the result.', 'Asking a colleague to check the system while you draft the reply.', 'Also called function calling. The model writes a structured request that matches a tool’s description; the harness checks it and runs it. The model itself never executes anything.'],
     ['MCP', 'build', 0, 'Model Context Protocol: an open standard for connecting AI tools to data sources and apps, so a connector is built once and works with many models.', 'USB for AI: one plug shape for many devices.', 'Introduced by Anthropic in November 2024 and since adopted widely, including by OpenAI and Google. An MCP server exposes tools and data; the harness is the client.'],
     ['Open-weight model', 'run', 1, 'A model whose trained parameters are published for anyone to download and run on their own hardware.', 'Getting the recipe, not just the meal.', 'Examples: Llama (Meta), Gemma (Google), Mistral, gpt-oss (OpenAI), Phi (Microsoft). Not the same as open source: training data and code are usually not released, and licences range from fully permissive (Apache 2.0) to custom terms with conditions.'],
-    ['Quantization', 'run', 0, 'Storing each parameter with fewer bits, for example 4 instead of 16, so the model needs about a quarter of the memory for a small loss in quality.', 'A high-quality MP3 of a studio recording.', 'Common formats: GGUF (llama.cpp), AWQ and GPTQ (GPU servers), FP8. 4-bit keeps most of the quality for everyday work; 2 or 3 bits start to hurt noticeably.'],
+    ['Quantisation', 'run', 0, 'Storing each parameter with fewer bits, for example 4 instead of 16, so the model needs about a quarter of the memory for a small loss in quality.', 'A high-quality MP3 of a studio recording.', 'Common formats: GGUF (llama.cpp), AWQ and GPTQ (GPU servers), FP8. 4-bit keeps most of the quality for everyday work; 2 or 3 bits start to hurt noticeably.'],
     ['GPU and VRAM', 'run', 0, 'The graphics processor does the maths; its own memory (VRAM) has to hold the model. VRAM size decides which models a machine can run.', 'The size of the workbench decides how big a job you can take on.', 'Consumer cards have 8 to 32 GB, data-centre cards 48 GB and up. A model that does not fit spills into system memory at a large speed cost. Serving software: llama.cpp for single machines, vLLM or SGLang for many users.'],
     ['Tokens per second', 'run', 0, 'How fast a model writes. People read at about 5 tokens per second; a good private setup writes 30 to 100 or more.', 'Words per minute, for a machine.', 'Two numbers matter: prompt processing (reading, often thousands of tokens per second) and generation (writing). Generation speed is limited mainly by memory bandwidth.'],
     ['Mixture of experts', 'run', 0, 'A model split into many specialist sub-networks, with only a few switched on for each token. Big-model knowledge at small-model speed.', 'A hospital full of specialists, where each patient sees only two or three.', 'Llama 4 Maverick: 400B parameters, 17B active per token. gpt-oss-120b: 117B total, about 5B active. All experts still have to fit in memory.'],
     ['Distillation', 'run', 0, 'Training a smaller model to imitate a bigger one. Many of the best small models are made this way.', 'An apprentice learning from a master.', 'The student learns from the teacher’s outputs. Google’s Gemma 3 models, for example, were trained by distillation from a larger teacher model.'],
     ['Top-K', 'basics', 0, 'A setting that lets the model choose the next word only from its K most likely candidates, cutting every unlikely word out before it picks.', 'A shortlist: only the top five candidates get an interview.', 'Applied after temperature: keep the K most probable tokens, rescale them to add up to 100%, then pick. Top-p keeps the smallest set whose chances add up to p instead. In RAG, “top-K” also means how many passages the retriever returns.'],
-    ['Memory', 'basics', 1, 'How a chat system keeps track of a conversation. The model itself remembers nothing between calls; the software sends the earlier messages back with every new question.', 'A colleague with no memory, handed the meeting notes before every reply.', 'Short-term memory is the message thread, saved under a thread ID (in LangGraph, by a checkpointer) and trimmed or summarised as it grows. Long-term memory is a separate store of facts the harness looks up. Every resent message costs tokens.'],
+    ['Memory', 'basics', 1, 'How a chat system keeps track of a conversation. The model itself remembers nothing between calls; the software sends the earlier messages back with every new question.', 'A colleague with no memory, handed the meeting notes before every reply.', 'Short-term memory is the message thread, saved under a thread ID (in LangGraph, by a checkpointer) and trimmed or summarised as it grows. Long-term memory is a separate store of facts the harness looks up. Every re-sent message costs tokens.'],
     ['Chunking', 'build', 0, 'Cutting long documents into short passages before they are stored for search, so the system can find and quote exactly the part that answers a question.', 'Cutting a book into index cards.', 'Typical chunks are a few hundred tokens, overlapping by 10–20% so no sentence is cut in half. Too small loses context; too large dilutes the match. Splitting on headings and paragraphs beats fixed lengths.'],
     ['ChromaDB', 'build', 0, 'An open-source vector database. It stores each chunk with its embedding and details such as source and page, and finds the chunks closest in meaning to a question.', 'A filing cabinet sorted by meaning instead of by name.', 'Runs inside the application or as its own server on our machines. Collections hold ids, embeddings, text and metadata; a query returns the nearest neighbours, optionally filtered by metadata such as department or access level.'],
     ['LangChain', 'build', 0, 'An open-source toolkit for building applications on language models: model connectors, prompts, retrievers and tools that snap together.', 'A box of standard parts for building with AI.', 'Gives one interface over many model servers, including private ones with an OpenAI-compatible API, plus document loaders, text splitters, vector-store retrievers (ChromaDB among them) and tool definitions.'],
@@ -1121,7 +1126,7 @@
     { name: 'HR', uses: ['Answers policy questions instantly, quoting the exact clause', 'An onboarding guide for new joiners', 'Drafts job descriptions in our house style'],
       keep: 'People get answers at once, without waiting for HR.', q: 'How many weeks of parental leave do I get?',
       a: 'Under the current HR policy, the primary carer gets 26 weeks of paid leave and the secondary carer 4 weeks, once you have completed six months of service.',
-      src: ['HR Policy 2026, section 4.2'] },
+      src: ['HR Policy 2026 §4.3'] },
     { name: 'Sales', uses: ['First drafts of proposals from our past winning bids', 'Instant answers to product questions for the sales team', 'Call summaries and follow-up emails'],
       keep: 'More time with clients, less time on first drafts.', q: 'Draft an opening line for a proposal to a logistics client.',
       a: 'Logistics runs on timing. Our platform gives your dispatch team one live view of every order, so a delay is spotted hours earlier, not when a customer calls.',
@@ -1169,7 +1174,21 @@
     t.addEventListener('click', () => selectDept(i));
     return t;
   }));
+  // the card keeps the height of its tallest department, so it never grows while an answer types out
+  function sizeDeptPanel() {
+    const panel = $('#deptPanel');
+    if (!panel.offsetWidth) return;
+    const keep = deptIdx;
+    panel.style.minHeight = '';
+    let h = 0;
+    DEPTS.forEach((d, i) => { selectDept(i, false); h = Math.max(h, panel.offsetHeight); });
+    panel.style.minHeight = h + 'px';
+    selectDept(keep, false);
+  }
   selectDept(0, false);
+  sizeDeptPanel();
+  document.fonts?.ready.then(sizeDeptPanel);
+  addEventListener('resize', () => setTimeout(sizeDeptPanel, 200));
   hooks.value = () => typeAnswer(DEPTS[deptIdx], true);
 
   /* ------------------------------------------------------------------ 11: harness rings (layers light up in turn) */
@@ -1731,7 +1750,7 @@
       answer: 'CPU-bound: p95 2.4 s, CPU 92%. Runbook: scale out above 85% CPU for 10 min.', cite: 'Scaling §2',
       hops: [
         { a: 'infra', tool: 'metrics', did: '<b>Infra agent</b> · get_metrics: p95 2.4 s, CPU 92%', calls: ['get_metrics(staging, checkout)'] },
-        { a: 'rag', pre: 'Still needs the runbook: ', log: 'needs the runbook', tool: 'chroma', did: '<b>RAG agent</b> · ChromaDB: Scaling §2, Staging §1', sources: ['Scaling §2', 'Staging §1'] },
+        { a: 'rag', pre: 'Needs the runbook: ', log: 'needs the runbook', tool: 'chroma', did: '<b>RAG agent</b> · ChromaDB: Scaling §2, Staging §1', sources: ['Scaling §2', 'Staging §1'] },
       ] },
   ];
   const AG_STOP = Symbol('stop'), AG_AWAY = Symbol('away');
@@ -1790,8 +1809,8 @@
     set('out', ans.x + ans.w - 44, top - 3, ans.y + ans.h + 3);
     for (const a of ['rag', 'infra', 'gen']) {
       const n = agBox(agNodes[a]);
-      set(a + '-down', n.x + 30, bot + 3, n.y - 3);
-      set(a + '-up', n.x + n.w - 30, n.y - 3, bot + 3);
+      set(a + '-down', n.x + 30, bot + 3, n.y - 6);
+      set(a + '-up', n.x + n.w - 30, n.y - 6, bot + 3);
     }
   }
   addEventListener('resize', () => setTimeout(agDraw, 200));
@@ -1973,11 +1992,12 @@
         if (!isActive('agents')) throw AG_AWAY;
       }
     } catch (err) {
-      if (err === AG_AWAY && me === agRun) agFinal(run);   // left the slide mid-run: show how it ends
-      else if (err !== AG_STOP && err !== AG_AWAY) throw err;
+      if (err !== AG_STOP && err !== AG_AWAY) throw err;   // left the slide mid-run: it restarts on the way back
     }
   }
-  agFinal(AG_RUNS[3]);
+  // the slide only ever arrives showing a run's opening state; the run itself starts once the slide has settled
+  const agOpen = run => { ++agRun; agPkt.classList.remove('on'); agBeats(run)[0].go(false); };
+  if (reduced) agFinal(AG_RUNS[3]); else agOpen(AG_RUNS[3]);
   agMark();
   // On a phone this slide is taller than the deck's 35% visibility threshold can ever reach, so it also enters
   // (headline and run) once a sixth of it is on screen.
@@ -1991,8 +2011,10 @@
   }
   hooks.agents = () => {
     agDraw();
-    if (reduced) { agFinal(AG_RUNS.find(r => r.key === agKey)); return; }
-    const me = ++agRun;   // a fresh run once the slide has settled
+    const run = AG_RUNS.find(r => r.key === agKey);
+    if (reduced) { agFinal(run); return; }
+    agOpen(run);
+    const me = agRun;
     setTimeout(() => { if (me === agRun && isActive('agents')) agPlay(agKey); }, 900);
   };
   /* BUILD:agents END */
@@ -2639,12 +2661,13 @@
     if (!target) return;
     // ring geometry mirrors ringsSvg(): radius 174 − 26 per ring, the model's core is 40
     const r = 174 - i * 26, inner = i < RINGS.length - 1 ? r - 26 : 40;
-    const a = svgEl('a', { href: '#' + target.id, 'aria-label': `${name}: go to ${target.dataset.label}` });
+    const goal = target.dataset.label.replace(/^\d+\s*·\s*/, '');
+    const a = svgEl('a', { href: '#' + target.id, 'aria-label': `${name}: go to ${goal}` });
     a.append(svgEl('circle', { class: 'pz-band', cx: 180, cy: 180, r: (r + inner) / 2, 'stroke-width': r - inner }));
     const show = () => {
       ringHint.innerHTML = HINT_ICON;
       const s = el('span');
-      s.append(el('b', null, name), ` → ${target.dataset.label}`);
+      s.append(el('b', null, name), ` → ${goal}`);
       ringHint.append(s);
     };
     a.addEventListener('pointerenter', show);
@@ -2686,7 +2709,7 @@
     const track = el('span', 'pz-seg-bar');
     track.append(el('span', 'pz-seg-fill'));
     b.append(track);
-    b.addEventListener('click', () => go(p.jump));
+    b.addEventListener('click', e => { go(p.jump); if (e.detail) b.blur(); });
     b.addEventListener('pointerenter', () => { peek = k; paintParts(); });
     b.addEventListener('pointerleave', () => { peek = -1; paintParts(); });
     b.addEventListener('focus', () => { peek = k; paintParts(); });
@@ -2752,7 +2775,7 @@
   // an item is a plain #link: the deck's own link handler moves to the slide; this only closes the list
   nav.addEventListener('click', e => {
     if (e.target.closest('[data-pz-close]')) closeNav();
-    else if (e.target.closest('.pz-nav-item')) closeNav(true);
+    else if (e.target.closest('.pz-nav-item')) { closeNav(true); if (e.detail) document.activeElement?.blur(); }
   });
   const partStarts = PZ_PARTS.map(p => navItems.findIndex(a => +a.dataset.i === p.from));
   addEventListener('keydown', e => {
