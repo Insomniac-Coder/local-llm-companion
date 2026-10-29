@@ -487,7 +487,7 @@
   loopText.textContent = LOOP.join('');
 
   /* BUILD:controls START */
-  /* ------------------------------------------------------------------ 5: temperature and top-K */
+  /* ------------------------------------------------------------------ 6: temperature and top-K */
   // Chances = softmax(score ÷ T); top-K then keeps the K most likely words and rescales them to add up to 100%.
   // The last three words are the "hallucinations": plausible-sounding, wrong. On arrival a short demo sweeps the
   // dials from Facts to Brainstorm to Chat, drawing 12 answers on the way; touching anything hands over control.
@@ -714,7 +714,7 @@
   /* BUILD:controls END */
 
   /* BUILD:memory START */
-  /* ------------------------------------------------------------------ 6: memory: without and with */
+  /* ------------------------------------------------------------------ 7: memory: without and with */
   // Two chat apps get the same messages from Priya. The stateless one sends the model only the newest message; the
   // one with memory sends the whole thread every turn and saves it under its thread_id after every step. "Come back
   // tomorrow" closes both apps: only the saved thread comes back. Token counts are illustrative: the deck's
@@ -1815,9 +1815,9 @@
       answer: 'Managed laptops only, and access ends on the contract end date.', cite: 'Security §3.2, §3.4',
       hops: [{ a: 'rag', tool: 'chroma', did: '<b>RAG agent</b> · ChromaDB: Security §3.2, §3.4', sources: ['Security §3.2', 'Security §3.4'] }] },
     { key: 'restart', label: 'Restart billing', req: 'Restart the billing service on staging',
-      answer: 'Done: billing on staging restarted and healthy, with 2 of 2 replicas ready.',
-      hops: [{ a: 'infra', tool: 'restart', did: '<b>Infra agent</b> · restart_service: 2 of 2 ready', calls: ['restart_service(staging, billing)'] }],
-      note: 'A staging change runs, then tells us. On production it would wait for a person: next slide.' },
+      answer: 'Done: an admin approved, and billing on staging restarted with 2 of 2 replicas ready.',
+      hops: [{ a: 'infra', tool: 'restart', did: '<b>Infra agent</b> · restart_service: 2 of 2 ready', calls: ['restart_service(staging, billing)'],
+        gate: { ask: 'An admin must approve this restart on staging.', wait: '<b>Infra agent</b> · restart waits for an admin', ok: '<b>Admin</b> · approved · the run resumes' } }] },
     { key: 'farewell', label: 'Farewell note', req: 'Write a farewell note for Ravi from the team', why: ' (drafting)',
       answer: 'Ravi, thank you for four brilliant years. We will miss your calm in every release week.',
       hops: [{ a: 'gen', tool: 'draft', did: '<b>General agent</b> · drafts the note, no tools' }] },
@@ -1830,7 +1830,7 @@
   ];
   const AG_STOP = Symbol('stop'), AG_AWAY = Symbol('away');
   const agDia = $('#agDia'), agSvg = $('#agEdges'), agSup = $('#agSup'), agRead = $('#agRead'), agLog = $('#agLog');
-  const agReqBox = $('#agReqBox'), agAnsBox = $('#agAnsBox'), agAns = $('#agAns'), agRulesBox = $('#agents .ag-rules');
+  const agReqBox = $('#agReqBox'), agAnsBox = $('#agAnsBox'), agAns = $('#agAns'), agAnsTag = $('.ag-tag', agAnsBox), agRulesBox = $('#agents .ag-rules');
   const agNodes = Object.fromEntries($$('.ag-node', agDia).map(n => [n.dataset.a, n]));
   const agRules = Object.fromEntries($$('.ag-rule', agDia).map(n => [n.dataset.a, n]));
   const agState = Object.fromEntries($$('#agState dd').map(d => [d.dataset.k, d]));
@@ -1942,6 +1942,25 @@
     Object.entries(agRules).forEach(([k, r]) => r.classList.toggle('is-lit', k === a));
     agRulesBox.classList.toggle('has-lit', !!a);
   };
+  // a change waits at a checkpoint until an admin approves it: the presenter clicks, as the admin would
+  function agApproval(ask, me) {
+    agAnsTag.textContent = 'Approval';
+    agAnsBox.classList.add('is-wait');
+    const btn = el('button', 'btn btn-small ag-approve', 'Approve as admin');
+    btn.type = 'button';
+    agAns.replaceChildren(el('span', null, ask), btn);
+    return new Promise((res, rej) => {
+      const end = () => { clearInterval(poll); agAnsTag.textContent = 'Answer'; agAnsBox.classList.remove('is-wait'); };
+      const poll = setInterval(() => {
+        if (me !== agRun) { end(); rej(AG_STOP); } else if (!isActive('agents')) { end(); rej(AG_AWAY); }
+      }, 150);
+      btn.addEventListener('click', () => {
+        end();
+        agAns.innerHTML = '<span class="ag-wait">comes back through the supervisor</span>';
+        res();
+      }, { once: true });
+    });
+  }
   const agHot = (a, tool, on) => { const t = tool && $(`[data-tool="${tool}"]`, agNodes[a]); if (t) t.classList.toggle('is-hot', on); };
 
   // a run is a list of beats; played live they wait and animate, played instantly they give the final state
@@ -1952,13 +1971,14 @@
     B.push({ ms: 340, go: live => {
       agLog.replaceChildren();
       Object.values(agEdges).forEach(e => e.g.classList.remove('is-run', 'is-done'));
-      Object.values(agNodes).forEach(n => n.classList.remove('is-on'));
+      Object.values(agNodes).forEach(n => n.classList.remove('is-on', 'is-wait'));
       $$('.ag-tools span', agDia).forEach(s => s.classList.remove('is-hot'));
       agLight(null);
       agSup.classList.remove('is-on');
       $('#agReq').textContent = run.req;
       agAns.innerHTML = '<span class="ag-wait">comes back through the supervisor</span>';
-      agAnsBox.classList.remove('is-done');
+      agAnsTag.textContent = 'Answer';
+      agAnsBox.classList.remove('is-done', 'is-wait');
       agSay('Reads each request and picks the agent for it', false);
       agSet('request', `"${run.req}"`, live);
       agSet('next', '<span class="ag-q">null</span>', false);
@@ -1981,6 +2001,15 @@
       B.push({ edge: h.a + '-down', ms: 0, pre: () => { agSup.classList.remove('is-on'); agSet('status', agStr('running ' + AG_NODE[h.a]), true); },
         go: () => { agNodes[h.a].classList.add('is-on'); } });
       B.push({ ms: 300, go: () => { agHot(h.a, h.tool, true); } });
+      if (h.gate) B.push({ ms: 400, go: async (live, me) => {
+        agLogLine(h.a, h.gate.wait);
+        agSet('status', agStr('waiting for admin'), live);
+        agNodes[h.a].classList.add('is-wait');
+        if (live) await agApproval(h.gate.ask, me);
+        agNodes[h.a].classList.remove('is-wait');
+        agLogLine('adm', h.gate.ok);
+        agSet('status', agStr('running ' + AG_NODE[h.a]), live);
+      } });
       B.push({ ms: 950, go: live => {
         if (h.calls) { st.calls.push(...h.calls); agSet('tool_calls', agList(st.calls, false), live); }
         if (h.sources) { st.sources.push(...h.sources); agSet('sources', agList(st.sources), live); }
@@ -2228,7 +2257,7 @@
   // The run picker says which agents each task used, the route line spells out the hops, every step carries its
   // agent's colour, and supervisor steps say where they routed. The two-hop "staging feels slow" run streams in on
   // arrival; its failed twin shows the metrics tool timing out after 10 s and a retry succeeding.
-  const OBS_TYPE = { chain: 'Chain', llm: 'LLM', tool: 'Tool', ret: 'Retriever' };
+  const OBS_TYPE = { chain: 'Chain', llm: 'LLM', tool: 'Tool', ret: 'Retriever', human: 'Approval' };
   const OBS_AGENT = { sup: 'Supervisor', infra: 'Infra agent', rag: 'RAG agent', gen: 'General agent' };
   const OBS_SHORT = { sup: 'Supervisor', infra: 'Infra', rag: 'RAG', gen: 'General' };
   // the model the harness chose for an LLM step: a small fast one for routing and short replies, a larger one for
@@ -2238,9 +2267,9 @@
   const OBS_EMBED = 'MiniLM-L6-v2';
   const OBS_PICK = 'messages: the request\nchoose one of: rag_agent · infra_agent · general_agent · FINISH';
   const OBS_SLOW_REQ = 'Staging feels slow: check it and tell me what the runbook says';
-  const OBS_SLOW_ANSWER = 'CPU-bound: p95 2.4 s, CPU 92% on 2 replicas. Runbook: scale out above 85% CPU for 10 min; staging may scale without approval.';
+  const OBS_SLOW_ANSWER = 'CPU-bound: p95 2.4 s, CPU 92% on 2 replicas. Runbook: scale out above 85% CPU for 10 min; on staging an admin approves the change.';
   const OBS_CHUNKS = {
-    slow: [['0.91', 'Scaling §2', 'Scale out above 85% CPU for 10 min'], ['0.84', 'Staging §1', 'Staging may scale without approval'],
+    slow: [['0.91', 'Scaling §2', 'Scale out above 85% CPU for 10 min'], ['0.84', 'Staging §1', 'An admin approves staging changes'],
       ['0.77', 'Alerts §3', 'p95 over 2 s for 5 min pages on-call'], ['0.62', 'Postmortem', 'Slow checkout: an under-sized cache']],
     vpn: [['0.89', 'Security §3.2', 'Contractor VPN: managed laptops only'], ['0.81', 'Security §3.4', 'Access ends on the contract end date'],
       ['0.66', 'Onboarding §2', 'Managers request contractor access'], ['0.58', 'IT FAQ', 'Setting up the VPN client']],
@@ -2258,7 +2287,7 @@
       { name: 'infra_agent', type: 'chain', agent: 'infra', depth: 1, t0: 0.42, t1: t(2.10),
         input: `"${OBS_SLOW_REQ}"`, output: 'p95 2.4 s, CPU 92%, 2 replicas: looks CPU-bound', meta: '2 model calls · 1 tool call · <b>950</b> tokens' },
       { name: 'choose a tool', type: 'llm', agent: 'infra', depth: 2, t0: 0.44, t1: 0.98, ...obsLlm('gpt-oss-120b', 0, 372, 38),
-        input: 'system: You are the Infra agent. Use only the listed tools.\ntools: get_metrics, get_logs, restart_service (staging only)', output: 'call get_metrics(env="staging", service="checkout")' },
+        input: 'system: You are the Infra agent. Use only the listed tools.\ntools: get_metrics, get_logs, restart_service (staging only, after an admin approves)', output: 'call get_metrics(env="staging", service="checkout")' },
       fail
         ? { name: 'get_metrics', type: 'tool', agent: 'infra', depth: 2, t0: 1.00, t1: 11.00, err: true,
             input: 'get_metrics(env="staging", service="checkout")', error: 'TimeoutError: the metrics API did not answer within 10 s',
@@ -2271,11 +2300,11 @@
         input: 'tool result: { "p95_ms": 2400, "cpu": 0.92, "replicas": 2 }\nquestion: is staging healthy?', output: 'Staging checkout: p95 2.4 s, CPU 92% on 2 replicas. Looks CPU-bound.' },
       obsSup('rag_agent', 'knowledge question (the runbook)', t(2.10), t(2.48), 290, 266),
       { name: 'rag_agent', type: 'chain', agent: 'rag', depth: 1, t0: t(2.48), t1: t(4.16),
-        input: `"${OBS_SLOW_REQ}"`, output: 'Scale out: CPU is above 85% for over 10 minutes [Scaling §2]; staging may scale without approval [Staging §1].', meta: '1 search · 1 model call · <b>1,420</b> tokens' },
+        input: `"${OBS_SLOW_REQ}"`, output: 'Scale out: CPU is above 85% for over 10 minutes [Scaling §2]; on staging an admin approves it [Staging §1].', meta: '1 search · 1 model call · <b>1,420</b> tokens' },
       { name: 'chromadb.query', type: 'ret', agent: 'rag', depth: 2, t0: t(2.52), t1: t(2.56), chunks: 'slow',
         input: 'query: "staging slow, high CPU: what does the runbook say?"\nwhere: { access: "engineering" } · k: 4', model: OBS_EMBED, meta: 'embedding <b>all-MiniLM-L6-v2</b> · collection <b>runbooks</b> · 4 of 1,812 chunks' },
       { name: 'answer with sources', type: 'llm', agent: 'rag', depth: 2, t0: t(2.60), t1: t(4.12), ...obsLlm('gpt-oss-120b', 0.2, 1236, 184),
-        input: 'system: Answer only from the passages and cite them.\n+ 4 passages (980 tokens) + the question', output: 'Scale out: CPU has been above 85% for more than 10 minutes [Scaling §2], and staging can be scaled without approval [Staging §1].' },
+        input: 'system: Answer only from the passages and cite them.\n+ 4 passages (980 tokens) + the question', output: 'Scale out: CPU has been above 85% for more than 10 minutes [Scaling §2], and on staging an admin approves the change [Staging §1].' },
       obsSup('finish', '', t(4.16), t(4.37), 180, 150),
     ];
     return { spans, pick: fail ? 4 : spans.findIndex(s => s.chunks) };
@@ -2298,16 +2327,20 @@
   function obsRestart() {
     const req = 'Restart the billing service on staging';
     const spans = [
-      obsRoot(req, 'Done: billing on staging restarted at 10:12 and is healthy again, with 2 of 2 replicas ready.', 3.02, 'user <b>developer</b> · department <b>engineering</b> · thread <b>infra-0409</b>'),
+      obsRoot(req, 'Done: an admin approved, and billing on staging restarted at 10:12 with 2 of 2 replicas ready.', 3.06, 'user <b>developer</b> · department <b>engineering</b> · thread <b>infra-0409</b>'),
       obsSup('infra_agent', 'infrastructure task', 0, 0.34, 288, 258),
-      { name: 'infra_agent', type: 'chain', agent: 'infra', depth: 1, t0: 0.34, t1: 2.78, input: `"${req}"`, output: 'Billing on staging restarted; 2 of 2 replicas ready.', meta: '2 model calls · 1 tool call · <b>638</b> tokens' },
+      { name: 'infra_agent', type: 'chain', agent: 'infra', depth: 1, t0: 0.34, t1: 2.84, input: `"${req}"`, output: 'Billing on staging restarted; 2 of 2 replicas ready.', meta: '2 model calls · 1 approval · 1 tool call · <b>638</b> tokens' },
       { name: 'choose a tool', type: 'llm', agent: 'infra', depth: 2, t0: 0.36, t1: 0.86, ...obsLlm('gpt-oss-120b', 0, 364, 38),
-        input: 'system: You are the Infra agent. Use only the listed tools.\ntools: get_metrics, get_logs, restart_service (staging only)', output: 'call restart_service(env="staging", service="billing")' },
-      { name: 'restart_service', type: 'tool', agent: 'infra', depth: 2, t0: 0.88, t1: 2.32,
-        input: 'restart_service(env="staging", service="billing")', output: '{ "status": "restarted", "ready": "2/2" }', meta: 'staging change · runs, then notifies (slide 16)' },
-      { name: 'confirm', type: 'llm', agent: 'infra', depth: 2, t0: 2.34, t1: 2.76, ...obsLlm('gpt-oss-20b', 0.2, 204, 32),
+        input: 'system: You are the Infra agent. Use only the listed tools.\ntools: get_metrics, get_logs, restart_service (staging only, after an admin approves)', output: 'call restart_service(env="staging", service="billing")' },
+      // the run stops at interrupt() and resumes with the admin's decision; the minutes in between are not latency
+      { name: 'admin approval', type: 'human', agent: 'infra', depth: 2, t0: 0.88, t1: 0.92,
+        input: 'interrupt({ "action": "restart_service", "env": "staging", "service": "billing" })', output: '{ "decision": "approve", "by": "admin" }',
+        meta: 'paused at checkpoint <b>3</b> · an <b>admin</b> approved 46 s later · the wait is left out of the timings (slide 16)' },
+      { name: 'restart_service', type: 'tool', agent: 'infra', depth: 2, t0: 0.94, t1: 2.38,
+        input: 'restart_service(env="staging", service="billing")', output: '{ "status": "restarted", "ready": "2/2" }', meta: 'staging change · ran after an admin approved' },
+      { name: 'confirm', type: 'llm', agent: 'infra', depth: 2, t0: 2.40, t1: 2.82, ...obsLlm('gpt-oss-20b', 0.2, 204, 32),
         input: 'tool result: { "status": "restarted", "ready": "2/2" }', output: 'Billing on staging restarted; 2 of 2 replicas ready.' },
-      obsSup('finish', '', 2.78, 2.98, 160, 136),
+      obsSup('finish', '', 2.84, 3.04, 160, 136),
     ];
     return { spans, pick: 4 };
   }
@@ -2639,10 +2672,10 @@
     if (m) { const n = el('span', null, m[1]); n.dataset.count = m[1]; t.replaceWith(n, m[2]); }
   }
 
-  /* 4 work: the prompt splits into its six tokens one after another */
+  /* 5 work: the prompt splits into its six tokens one after another */
   $$('#work .frame-v[data-frame="1"] .tk-chip').forEach((c, k) => c.style.setProperty('--pz-k', k));
 
-  /* 7 frozen: frost crystallises in the empty corner while the points freeze into place */
+  /* 4 frozen: frost crystallises in the empty corner while the points freeze into place */
   const frost = (() => {
     const frame = frameOf('frozen');
     if (!frame) return null;

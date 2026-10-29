@@ -106,7 +106,22 @@
   </div></div>
 </section>
 
-<!-- ================================================================ 4 · WORK -->
+<!-- ================================================================ 4 · FROZEN -->
+<section class="slide dark" id="frozen" data-label="The part most people miss">
+  <div class="frame"><div class="pad statement">
+    <p class="eyebrow rv">The part most people miss</p>
+    <h2 class="statement-title" data-gen>After training, the model is frozen.</h2>
+    <div class="three four">
+      <p class="rv" style="--d:3">It does <b>not</b> learn from your conversations.</p>
+      <p class="rv" style="--d:4">Its knowledge <b>stops</b> at a cut-off date.</p>
+      <p class="rv" style="--d:5">It has <b>never seen</b> our contracts, code or policies.</p>
+      <p class="rv" style="--d:6">It never looks anything up: missing a fact, it <b>invents</b> a plausible one. That is a hallucination.</p>
+    </div>
+    <p class="statement-foot rv" style="--d:7">The fix is not a bigger model. Hand it the right documents at the moment a question is asked, and make it cite them. That is called <b>RAG</b>, and it is the heart of this proposal.</p>
+  </div></div>
+</section>
+
+<!-- ================================================================ 5 · WORK -->
 <section class="slide" id="work" data-label="03 · How it answers">
   <div class="frame"><div class="pad">
     <header class="s-head">
@@ -177,7 +192,7 @@
 </section>
 
 <!-- BUILD:controls START -->
-<!-- ================================================================ 5 · CONTROLS -->
+<!-- ================================================================ 6 · CONTROLS -->
 <section class="slide" id="controls" data-label="04 · Temperature and top-K">
   <div class="frame"><div class="pad">
     <header class="s-head">
@@ -244,7 +259,7 @@
 <!-- BUILD:controls END -->
 
 <!-- BUILD:memory START -->
-<!-- ================================================================ 6 · MEMORY -->
+<!-- ================================================================ 7 · MEMORY -->
 <section class="slide" id="memory" data-label="05 · Memory">
   <div class="frame"><div class="pad mem-pad">
     <header class="s-head">
@@ -319,21 +334,6 @@
   </div></div>
 </section>
 <!-- BUILD:memory END -->
-
-<!-- ================================================================ 7 · FROZEN -->
-<section class="slide dark" id="frozen" data-label="The part most people miss">
-  <div class="frame"><div class="pad statement">
-    <p class="eyebrow rv">The part most people miss</p>
-    <h2 class="statement-title" data-gen>After training, the model is frozen.</h2>
-    <div class="three four">
-      <p class="rv" style="--d:3">It does <b>not</b> learn from your conversations.</p>
-      <p class="rv" style="--d:4">Its knowledge <b>stops</b> at a cut-off date.</p>
-      <p class="rv" style="--d:5">It has <b>never seen</b> our contracts, code or policies.</p>
-      <p class="rv" style="--d:6">It never looks anything up: missing a fact, it <b>invents</b> a plausible one. That is a hallucination.</p>
-    </div>
-    <p class="statement-foot rv" style="--d:7">The fix is not a bigger model. Hand it the right documents at the moment a question is asked, and make it cite them. That is called <b>RAG</b>, and it is the heart of this proposal.</p>
-  </div></div>
-</section>
 
 <!-- ================================================================ 8 · VOCABULARY -->
 <section class="slide" id="terms" data-label="06 · The vocabulary">
@@ -747,7 +747,7 @@
         <li><p class="ag-why-t"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7 3v5.5c0 4.5-3 7.8-7 9.5-4-1.7-7-5-7-9.5V6z"/><path d="M8.8 12.2l2.2 2.2 4.4-4.6"/></svg>Reliability</p><p>Retries, timeouts, fallbacks and resumable runs: one failure no longer breaks everything.</p></li>
       </ul>
     </div>
-    <details class="eng-note"><summary>Engineer's note</summary><p>The proof of concept is a LangGraph <code>StateGraph(State)</code>. The state is typed: <code>messages</code>, a list merged by the <code>add_messages</code> reducer, and <code>next</code>, the agent to run. The supervisor node calls our private model (<code>gpt-oss-20b</code>) with structured output, so it can only answer <code>rag</code>, <code>infra</code>, <code>general</code> or <code>FINISH</code>; <code>add_conditional_edges</code> routes on <code>next</code>, and every agent has an edge back to the supervisor, which is what makes the loop. LangChain's <code>ChatOpenAI(base_url=…)</code> points every node at the OpenAI-compatible API of our own model server.</p><p>Each sub-agent is a prebuilt ReAct agent (<code>create_react_agent</code>; <code>create_agent</code> in LangChain 1.0). The RAG agent's tool is a ChromaDB retriever with <code>all-MiniLM-L6-v2</code> embeddings; the Infra agent's tools wrap approved runbooks and APIs (<code>get_metrics</code>, <code>get_logs</code>, <code>restart_service</code>); the General agent has none. A checkpointer saves the state after every step under a <code>thread_id</code>, which gives memory and resumable runs; <code>recursion_limit</code> stops a run that loops too long; an <code>interrupt</code> before infra write actions on production hands the decision to a person (next slide); and LangSmith traces every node (two slides on). Models and figures shown are illustrative.</p></details>
+    <details class="eng-note"><summary>Engineer's note</summary><p>The proof of concept is a LangGraph <code>StateGraph(State)</code>. The state is typed: <code>messages</code>, a list merged by the <code>add_messages</code> reducer, and <code>next</code>, the agent to run. The supervisor node calls our private model (<code>gpt-oss-20b</code>) with structured output, so it can only answer <code>rag</code>, <code>infra</code>, <code>general</code> or <code>FINISH</code>; <code>add_conditional_edges</code> routes on <code>next</code>, and every agent has an edge back to the supervisor, which is what makes the loop. LangChain's <code>ChatOpenAI(base_url=…)</code> points every node at the OpenAI-compatible API of our own model server.</p><p>Each sub-agent is a prebuilt ReAct agent (<code>create_react_agent</code>; <code>create_agent</code> in LangChain 1.0). The RAG agent's tool is a ChromaDB retriever with <code>all-MiniLM-L6-v2</code> embeddings; the Infra agent's tools wrap approved runbooks and APIs (<code>get_metrics</code>, <code>get_logs</code>, <code>restart_service</code>); the General agent has none. A checkpointer saves the state after every step under a <code>thread_id</code>, which gives memory and resumable runs; <code>recursion_limit</code> stops a run that loops too long; an <code>interrupt</code> before every infra write action hands the decision to a person: an admin on staging, the on-call engineer on production (next slide); and LangSmith traces every node (two slides on). Models and figures shown are illustrative.</p></details>
   </div></div>
 </section>
 <!-- BUILD:agents END -->
@@ -813,8 +813,8 @@
           <p class="callout-title" id="hitlPolicyTitle">Which actions wait for a person</p>
           <ul>
             <li class="hitl-auto"><b>Runs on its own</b><span>Reading metrics, logs and documents</span></li>
-            <li class="hitl-notify"><b>Runs, then tells us</b><span>Changes on staging</span></li>
-            <li class="hitl-hold"><b>Waits for a person</b><span>Production changes, deletions, payments, emails outside the company</span></li>
+            <li class="hitl-admin"><b>Waits for an admin</b><span>Changes on staging, such as a restart</span></li>
+            <li class="hitl-hold"><b>Waits for an owner</b><span>Production changes, deletions, payments, emails outside the company</span></li>
           </ul>
           <p class="caption">Who may approve is itself an access right, checked like any other.</p>
         </section>

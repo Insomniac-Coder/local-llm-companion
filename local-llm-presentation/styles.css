@@ -219,7 +219,7 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .stage-stat b { display: block; font: 700 36px/1.1 var(--display); letter-spacing: -0.03em; margin-bottom: 4px; }
 .stage .stage-result { color: var(--muted); font-size: 17px; }
 
-/* 4 work: stepper */
+/* 5 work: stepper */
 .stepper { display: grid; grid-template-columns: 560px 1fr; gap: 32px; flex: 1; min-height: 0; }
 .steps { list-style: none; padding: 0; display: grid; gap: 6px; align-content: start; }
 .step {
@@ -269,7 +269,7 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .loop-text .new { animation: tok-in 0.8s ease-out; border-radius: 0.12em; }
 
 /* BUILD:controls START */
-/* 5 temperature and top-K: an instrument panel. Dials on the left, the live odds in the centre (a cut line slides
+/* 6 temperature and top-K: an instrument panel. Dials on the left, the live odds in the centre (a cut line slides
    between rank K and K + 1), the hallucination-risk gauge on the right, twelve sampled answers along the bottom. */
 #controls { --ctl-amber: #d97706; --ctl-amber-ink: #b45309; --ctl-warn-ink: #b42318; --ctl-step: 28px; --ctl-gap: 30px; }
 #controls .pad { gap: 26px; }
@@ -404,7 +404,7 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 /* BUILD:controls END */
 
 /* BUILD:memory START */
-/* 6 memory: without and with. Two mirrored chat apps get the same messages; only the right one resends the thread. */
+/* 7 memory: without and with. Two mirrored chat apps get the same messages; only the right one resends the thread. */
 .mem-pad { gap: 28px; }
 .mem-stage { display: grid; grid-template-columns: minmax(0, 1fr) 196px minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); gap: 24px; height: 528px; }
 .mem-pane { display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
@@ -516,7 +516,7 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .flow .mem-msg { max-width: 92%; }
 /* BUILD:memory END */
 
-/* 7 statement slide */
+/* 4 statement slide (frozen) */
 .pad.statement { justify-content: center; gap: 44px; }
 .statement-title { font-size: 104px; font-weight: 700; line-height: 0.98; letter-spacing: -0.035em; max-width: 12ch; }
 .three { display: grid; grid-template-columns: repeat(3, 1fr); gap: 40px; }
@@ -848,6 +848,7 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .ag-c-rag { --ac: #059669; --at: #047857; --as: #d3f4e6; }
 .ag-c-gen { --ac: #db2777; --at: #9d174d; --as: #fce7f3; }
 .ag-c-io { --ac: #059669; --at: #047857; --as: #d3f4e6; }
+.ag-c-adm { --ac: #475569; --at: #1e293b; --as: #e2e8f0; }   /* a person approving, not an agent */
 
 .ag-main { display: grid; grid-template-columns: 962px minmax(0, 1fr); gap: 22px; align-items: stretch; }
 .ag-board { overflow: hidden; display: flex; flex-direction: column; }
@@ -880,6 +881,12 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .ag-ans.is-done { background: var(--ours-soft); border-color: color-mix(in srgb, var(--ours) 45%, transparent); }
 .ag-ans.is-done .ag-tag { color: var(--ours-ink); }
 .ag-wait { color: var(--muted); }
+/* paused at a checkpoint: the request for approval comes back to the person, with the button beside the text */
+.ag-ans.is-wait { position: relative; padding-right: 178px; background: #fff7e6; border-color: color-mix(in srgb, #d97706 45%, transparent); animation: pop 0.3s ease-out; }
+.ag-ans.is-wait .ag-tag { color: #92400e; }
+.ag-approve { position: absolute; right: 14px; top: 50%; transform: translateY(-50%); background: var(--ours); border-color: var(--ours); color: #fff; white-space: nowrap; animation: ag-ask 1.6s ease-in-out infinite; }
+.ag-approve:hover { background: var(--ours-ink); border-color: var(--ours-ink); }
+@keyframes ag-ask { 0%, 100% { box-shadow: 0 0 0 0 rgba(5, 150, 105, 0.35); } 50% { box-shadow: 0 0 0 6px rgba(5, 150, 105, 0); } }
 .ag-cite { display: inline-block; margin-left: 6px; font: 500 13px/1 var(--mono); padding: 4px 8px; border-radius: 6px; background: var(--hl3); color: #0b1a2c; vertical-align: 1px; animation: pop 0.3s ease-out backwards; }
 .ag-ans .new { animation: tok-in 0.8s ease-out; border-radius: 0.12em; }
 
@@ -914,6 +921,8 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .ag-agents { position: relative; z-index: 1; list-style: none; padding: 0; margin: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
 .ag-node { padding: 13px 14px 14px; border-radius: 16px; background: var(--paper); border: 1.5px solid var(--line); border-top: 4px solid var(--ac); box-shadow: var(--shadow); transition: transform 0.35s cubic-bezier(0.2, 0.7, 0.2, 1), box-shadow 0.35s, border-color 0.35s; }
 .ag-node.is-on { transform: translateY(-5px); border-color: var(--ac); box-shadow: 0 0 0 4px color-mix(in srgb, var(--ac) 22%, transparent), 0 14px 32px color-mix(in srgb, var(--ac) 30%, transparent); }
+.ag-node.is-wait { border-style: dashed; border-top-style: solid; animation: ag-hold 1.6s ease-in-out infinite; }
+@keyframes ag-hold { 0%, 100% { box-shadow: 0 0 0 4px color-mix(in srgb, var(--ac) 14%, transparent), var(--shadow); } 50% { box-shadow: 0 0 0 7px color-mix(in srgb, var(--ac) 28%, transparent), var(--shadow); } }
 .ag-node-head { display: flex; align-items: center; gap: 10px; }
 .ag-node-head b { font: 600 19px/1.2 var(--sans); color: var(--ink); white-space: nowrap; }
 .ag-dot { flex: none; width: 12px; height: 12px; border-radius: 50%; background: var(--ac); box-shadow: 0 0 0 3px var(--as); }
@@ -1067,7 +1076,7 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .hitl-policy li { display: grid; grid-template-columns: 172px 1fr; gap: 12px; align-items: baseline; font-size: 15.5px; line-height: 1.4; color: var(--ink-2); }
 .hitl-policy b { font: 600 13px/1.2 var(--mono); letter-spacing: 0.02em; padding: 5px 9px; border-radius: 999px; justify-self: start; white-space: nowrap; color: #0b1a2c; }
 .hitl-auto b { background: var(--ours-soft); }
-.hitl-notify b { background: var(--hl3); }
+.hitl-admin b { background: var(--hl3); }
 .hitl-hold b { background: #fde2b0; }
 .flow .hitl-steps { grid-template-columns: repeat(4, 1fr); row-gap: 18px; }
 .flow .hitl-track::before, .flow .hitl-fill { display: none; }
@@ -1137,6 +1146,7 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .t-chain { --tc: #0369a1; --tf: #bae6fd; }
 .t-llm { --tc: #6d28d9; --tf: #ddd6fe; }
 .t-tool { --tc: #92400e; --tf: #fde68a; }
+.t-human { --tc: #334155; --tf: #cbd5e1; }
 .t-ret { --tc: #047857; --tf: #a7f3d0; }
 .obs-type { color: var(--tc); background: var(--tf); }
 .obs-span.err .obs-type { color: #b42318; background: #fecdca; }
@@ -1487,7 +1497,7 @@ html[data-tone="dark"] .bar-fill { background: #34d399; }
   .deck #learn.on .stage > :nth-child(4) { animation-delay: calc(var(--pz-s) + 0.38s); }
 }
 
-/* ---------------------------------------------------------------- 4 work: the six steps arrive in order, tokens split */
+/* ---------------------------------------------------------------- 5 work: the six steps arrive in order, tokens split */
 @media (prefers-reduced-motion: no-preference) {
   .deck #work.on #steps > li { animation: pz-rise 0.6s cubic-bezier(0.2, 0.7, 0.2, 1) backwards; }
   .deck #work.on #steps > li:nth-child(1) { animation-delay: 0.42s; }
@@ -1500,7 +1510,7 @@ html[data-tone="dark"] .bar-fill { background: #34d399; }
   .deck #work.on.pz-in .frame-v.is-on .tok-row .tk-chip { animation-delay: calc(0.95s + var(--pz-k, 0) * 110ms); }
 }
 
-/* ---------------------------------------------------------------- 7 frozen: frost forms, the points freeze, RAG glows */
+/* ---------------------------------------------------------------- 4 frozen: frost forms, the points freeze, RAG glows */
 .pz-frost { position: absolute; top: 0; right: 0; width: 660px; height: 400px; z-index: -1; pointer-events: none; overflow: visible; }
 .pz-frost .pz-fr { fill: none; stroke: #bae6fd; stroke-linecap: round; }
 .pz-frost .pz-spark { fill: #e0f2fe; opacity: 0; transform-box: fill-box; transform-origin: center; }
