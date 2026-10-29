@@ -1104,124 +1104,30 @@
   }));
   updateMythCount();
 
-  /* ------------------------------------------------------------------ 11: cost calculator (rupees): on-premises or AWS */
-  // AWS on-demand Linux prices, Mumbai (ap-south-1), from AWS's published price list of 25 September 2026.
-  const AWS_TYPES = [
-    { id: 'g7e.2xlarge', gpu: '1 × RTX PRO 6000, 96 GB', usd: 5.49303 },   // same GPU memory as the on-prem example
-    { id: 'g6e.2xlarge', gpu: '1 × L40S, 48 GB', usd: 2.69266 },
-    { id: 'p5.4xlarge', gpu: '1 × H100, 80 GB', usd: 8.256 },
-    { id: 'g6e.12xlarge', gpu: '4 × L40S, 192 GB', usd: 12.60131 },
-  ];
-  const cIn = { seats: $('#cSeats'), price: $('#cPrice'), hw: $('#cHw'), run: $('#cRun'), awsType: $('#awsType'), awsHours: $('#awsHours'), awsRun: $('#awsRun') };
-  cIn.awsType.replaceChildren(...AWS_TYPES.map((t, i) => { const o = el('option', null, `${t.id} · ${t.gpu}`); o.value = i; return o; }));
-  const calcSvg = $('#calcChart');
-  let host = 'onprem';
-  const moneyHtml = r => `${inr(r)} <small>(${usd(r)})</small>`;
-  const niceStep = v => { const p = Math.pow(10, Math.floor(Math.log10(v))); const m = v / p; return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10) * p; };
-  function renderCalc() {
-    const seats = +cIn.seats.value, price = +cIn.price.value, hw = +cIn.hw.value, run = +cIn.run.value;
-    const type = AWS_TYPES[+cIn.awsType.value], hours = +cIn.awsHours.value, awsOther = +cIn.awsRun.value;
-    const hourInr = type.usd * INR_PER_USD;
-    $('#cSeatsOut').textContent = fmt(seats) + ' people';
-    $('#cPriceOut').innerHTML = moneyHtml(price);
-    $('#cHwOut').innerHTML = moneyHtml(hw);
-    $('#cRunOut').innerHTML = moneyHtml(run);
-    $('#awsRateOut').innerHTML = `₹${fmt(hourInr)} an hour <small>($${type.usd.toFixed(2)})</small>`;
-    $('#awsHoursOut').innerHTML = `${hours} h <small>${hours >= 700 ? 'always on' : hours <= 260 ? 'office hours' : ''}</small>`;
-    $('#awsRunOut').innerHTML = moneyHtml(awsOther);
-
-    const M = 36;
-    const cloudM = seats * price;
-    const awsRent = hourInr * hours, awsM = awsRent + awsOther;
-    const cloud36 = cloudM * M, prem36 = hw + run * M, aws36 = awsM * M;
-    const aws = host === 'aws';
-    const ours36 = aws ? aws36 : prem36;
-    const be = cloudM > run ? hw / (cloudM - run) : Infinity;
-    $('#cCloud3').innerHTML = moneyHtml(cloud36);
-    $('#cOursLabel').textContent = aws ? 'AWS server, 3 years' : 'On-premises, 3 years';
-    $('#cOurs3').innerHTML = moneyHtml(ours36);
-    if (aws) {
-      $('#cBreakLabel').textContent = 'Cheaper than subscriptions?';
-      $('#cBreak').innerHTML = awsM < cloudM ? 'Yes <small>(from month 1)</small>' : 'No <small>(at these settings)</small>';
-    } else {
-      $('#cBreakLabel').textContent = 'Pays for itself';
-      $('#cBreak').innerHTML = be <= M ? `Month ${Math.max(1, Math.ceil(be))}` : be === Infinity ? 'Never <small>(at these settings)</small>' : 'After year 3';
-    }
-    $('#cSave').innerHTML = cloud36 >= ours36
-      ? `${inr(cloud36 - ours36)} saved <small>(${usd(cloud36 - ours36)})</small>`
-      : `${inr(ours36 - cloud36)} more <small>(${usd(ours36 - cloud36)})</small>`;
-    $('#calcCompare').innerHTML = `Over 3 years at these settings: on-premises <b>${both(prem36)}</b>, AWS <b>${both(aws36)}</b>, of which AWS rent is ${both(awsRent)} a month.`;
-    $('#calcLegend').innerHTML =
-      `<span class="key-line key-cloud"></span>Subscriptions <span class="key-line ${aws ? 'key-alt' : 'key-ours'}"></span>On-premises <span class="key-line ${aws ? 'key-ours' : 'key-alt'}"></span>AWS`;
-
-    const W = 620, H = 300, l = 90, r = 96, t = 14, b = 30;
-    const top = Math.max(cloud36, prem36, aws36) * 1.04;
-    const step = niceStep(top / 4);
-    const yMax = step * Math.ceil(top / step);
-    const X = m => l + (m / M) * (W - l - r);
-    const Y = v => t + (1 - v / yMax) * (H - t - b);
-    let s = '';
-    for (let v = 0; v <= yMax + 1; v += step) {
-      s += `<line class="grid-line" x1="${l}" x2="${W - r}" y1="${Y(v)}" y2="${Y(v)}"/>`;
-      s += `<text class="svg-label" x="${l - 8}" y="${Y(v) + 4}" text-anchor="end">${v ? inr(v) : '₹0'}</text>`;
-    }
-    for (const m of [0, 12, 24, 36]) {
-      s += `<text class="svg-label" x="${X(m)}" y="${H - 8}" text-anchor="${m === 0 ? 'start' : m === 36 ? 'end' : 'middle'}">${m === 0 ? 'Today' : 'Year ' + m / 12}</text>`;
-    }
-    if (aws && awsM < cloudM) s += `<polygon class="area-save" points="${X(0)},${Y(0)} ${X(M)},${Y(cloud36)} ${X(M)},${Y(aws36)}"/>`;
-    if (!aws && be < M) s += `<polygon class="area-save" points="${X(be)},${Y(hw + run * be)} ${X(M)},${Y(cloud36)} ${X(M)},${Y(prem36)}"/>`;
-    const premLine = `<line class="${aws ? 'line-alt' : 'line-ours'}" x1="${X(0)}" y1="${Y(hw)}" x2="${X(M)}" y2="${Y(prem36)}"/>`;
-    const awsLine = `<line class="${aws ? 'line-ours' : 'line-alt'}" x1="${X(0)}" y1="${Y(0)}" x2="${X(M)}" y2="${Y(aws36)}"/>`;
-    s += `<line class="line-cloud" x1="${X(0)}" y1="${Y(0)}" x2="${X(M)}" y2="${Y(cloud36)}"/>`;
-    s += aws ? premLine + awsLine : awsLine + premLine;   // the selected option is drawn on top
-    if (!aws && be <= M) {
-      const bx = X(be), by = Y(hw + run * be), anchor = bx > W - r - 150 ? 'end' : 'start';
-      s += `<circle class="be-dot" cx="${bx}" cy="${by}" r="6"/>`;
-      s += `<text class="be-label" x="${bx + (anchor === 'start' ? 12 : -12)}" y="${by - 12}" text-anchor="${anchor}">Pays for itself · month ${Math.max(1, Math.ceil(be))}</text>`;
-    }
-    // 3-year totals at the end of each line, nudged apart so they never overlap
-    const ends = [
-      { v: cloud36, cls: 'cloud' },
-      { v: prem36, cls: aws ? 'alt' : 'sel' },
-      { v: aws36, cls: aws ? 'sel' : 'alt' },
-    ].map(e => ({ ...e, y: Y(e.v) + 4 })).sort((p, q) => p.y - q.y);
-    for (let i = 1; i < ends.length; i++) ends[i].y = Math.max(ends[i].y, ends[i - 1].y + 15);
-    for (const e of ends) s += `<text class="end-label ${e.cls}" x="${W - r + 8}" y="${e.y}">${inr(e.v)}</text>`;
-    calcSvg.innerHTML = s;
-  }
-  Object.values(cIn).forEach(i => i.addEventListener('input', renderCalc));
-  $$('#hostSeg .seg-btn').forEach(bt => bt.addEventListener('click', () => {
-    host = bt.dataset.host;
-    $$('#hostSeg .seg-btn').forEach(x => { x.classList.toggle('is-on', x === bt); x.setAttribute('aria-pressed', String(x === bt)); });
-    $$('.host-fields').forEach(f => { f.hidden = f.dataset.host !== host; });
-    renderCalc();
-  }));
-  renderCalc();
-
-  /* ------------------------------------------------------------------ 12: departments */
+  /* ------------------------------------------------------------------ 11: how AI helps us: departments */
   const DEPTS = [
     { name: 'Engineering', uses: ['A coding assistant that knows our private repositories', 'Explains old code before anyone changes it', 'Drafts tests, reviews and documentation'],
-      keep: 'Our source code never leaves our network.', q: 'Where do we check refund limits in the billing service?',
+      keep: 'Less time digging through old code, more time building.', q: 'Where do we check refund limits in the billing service?',
       a: 'Refund limits are checked in the billing service’s refund validation module, before any payment call is made. The limit itself comes from the finance settings table, so changing it needs no code change.',
       src: ['billing-service › refunds › validate', 'Finance settings runbook'] },
     { name: 'Customer support', uses: ['Drafts replies from our knowledge base, with sources', 'Summarises long ticket threads in seconds', 'Spots recurring problems across hundreds of tickets'],
-      keep: 'Customer details stay inside our systems.', q: 'A customer on the Pro plan says the export button is greyed out. Why?',
+      keep: 'Faster, consistent answers for every customer.', q: 'A customer on the Pro plan says the export button is greyed out. Why?',
       a: 'On the Pro plan, exporting needs the workspace admin role, so this customer is probably a regular member. Suggest they ask their admin to change their role, or to run the export for them.',
       src: ['Knowledge base: Export permissions', 'Plan comparison 2026'] },
     { name: 'Legal and compliance', uses: ['First-pass review of contracts against our standard terms', 'Finds clauses across hundreds of agreements at once', 'Summarises new regulations and what they change for us'],
-      keep: 'Contracts and legal advice stay confidential.', q: 'Which supplier contracts renew automatically next quarter?',
+      keep: 'Hours of reading become minutes of checking.', q: 'Which supplier contracts renew automatically next quarter?',
       a: 'Three supplier agreements renew automatically next quarter. Two of them need 60 days’ notice to cancel, and the earliest notice deadline is five weeks from today.',
       src: ['Contract register', 'Supplier agreements folder'] },
     { name: 'HR', uses: ['Answers policy questions instantly, quoting the exact clause', 'An onboarding guide for new joiners', 'Drafts job descriptions in our house style'],
-      keep: 'Employee records never go to an outside provider.', q: 'How many weeks of parental leave do I get?',
+      keep: 'People get answers at once, without waiting for HR.', q: 'How many weeks of parental leave do I get?',
       a: 'Under the current HR policy, the primary carer gets 26 weeks of paid leave and the secondary carer 4 weeks, once you have completed six months of service.',
       src: ['HR Policy 2026, section 4.2'] },
     { name: 'Sales', uses: ['First drafts of proposals from our past winning bids', 'Instant answers to product questions for the sales team', 'Call summaries and follow-up emails'],
-      keep: 'Pricing and pipeline data stay private.', q: 'Draft an opening line for a proposal to a logistics client.',
+      keep: 'More time with clients, less time on first drafts.', q: 'Draft an opening line for a proposal to a logistics client.',
       a: 'Logistics runs on timing. Our platform gives your dispatch team one live view of every order, so a delay is spotted hours earlier, not when a customer calls.',
       src: ['Winning bid: freight client 2025', 'Product one-pager'] },
-    { name: 'Finance and operations', uses: ['Summarises monthly reports and explains variances', 'Reads invoices and purchase orders without sending them outside', 'Answers “where is the policy on…” questions'],
-      keep: 'Financial data stays on our own servers.', q: 'Why was travel spend over budget last month?',
+    { name: 'Finance and operations', uses: ['Summarises monthly reports and explains variances', 'Reads invoices and purchase orders and flags mismatches', 'Answers “where is the policy on…” questions'],
+      keep: 'Variances explained in minutes, not days.', q: 'Why was travel spend over budget last month?',
       a: 'Travel was 18% over budget, mainly because of two unplanned client visits and higher airfares. Leaving those two visits out, spending was 3% under budget.',
       src: ['Monthly management accounts', 'Travel expense report'] },
   ];
@@ -1266,7 +1172,7 @@
   selectDept(0, false);
   hooks.value = () => typeAnswer(DEPTS[deptIdx], true);
 
-  /* ------------------------------------------------------------------ 13: harness rings (layers light up in turn) */
+  /* ------------------------------------------------------------------ 12: harness rings (layers light up in turn) */
   const RINGS = [['audit', 'Audit log'], ['guard', 'Rules'], ['perm', 'Access rights'], ['tools', 'Tools'], ['rag', 'Our documents']];
   function ringsSvg(onKeys) {
     const c = 180, gap = 26, core = 40, capH = 8.5;
@@ -1805,8 +1711,8 @@
   /* BUILD:agents START */
   /* ------------------------------------------------------------------ 15: multi-agent orchestration */
   // A LangGraph supervisor classifies each request by type, sends it down the matching branch, takes the agent's
-  // result back and decides again: another agent, or finish. Four example requests, the same ones slides 16 and 17
-  // reuse; the two-hop "staging feels slow" run (the one slide 17 traces) plays on arrival.
+  // result back and decides again: another agent, or finish. Four example requests, the same ones slides 15 and 16
+  // reuse; the two-hop "staging feels slow" run (the one slide 16 traces) plays on arrival.
   const AG_NAME = { rag: 'RAG agent', infra: 'Infra agent', gen: 'General agent' };
   const AG_NODE = { rag: 'rag_agent', infra: 'infra_agent', gen: 'general_agent' };
   const AG_TYPE = { rag: 'Knowledge question', infra: 'Infrastructure task', gen: 'Anything else' };
@@ -2253,7 +2159,7 @@
 
   /* BUILD:observe START */
   /* ------------------------------------------------------------------ 17: LangSmith observability */
-  // Five recent runs, one for each kind of task on slide 15, traced the way LangSmith shows them (illustrative).
+  // Five recent runs, one for each kind of task on slide 14, traced the way LangSmith shows them (illustrative).
   // The run picker says which agents each task used, the route line spells out the hops, every step carries its
   // agent's colour, and supervisor steps say where they routed. The two-hop "staging feels slow" run streams in on
   // arrival; its failed twin shows the metrics tool timing out after 10 s and a retry succeeding.
@@ -2293,7 +2199,7 @@
             input: 'get_metrics(env="staging", service="checkout")', error: 'TimeoutError: the metrics API did not answer within 10 s',
             diag: '<b>The slow step was the metrics API, not the model.</b> It timed out after 10 s; the automatic retry answered in 0.35 s. Fix or alert on the API before blaming the model.', meta: 'read-only · runs without approval · attempt <b>1 of 3</b>' }
         : { name: 'get_metrics', type: 'tool', agent: 'infra', depth: 2, t0: 1.00, t1: 1.35,
-            input: 'get_metrics(env="staging", service="checkout")', output: '{ "p95_ms": 2400, "cpu": 0.92, "replicas": 2 }', meta: 'read-only · runs without approval (slide 16)' },
+            input: 'get_metrics(env="staging", service="checkout")', output: '{ "p95_ms": 2400, "cpu": 0.92, "replicas": 2 }', meta: 'read-only · runs without approval (slide 15)' },
       ...(fail ? [{ name: 'get_metrics · retry', type: 'tool', agent: 'infra', depth: 2, t0: 11.02, t1: 11.37,
             input: 'get_metrics(env="staging", service="checkout")', output: '{ "p95_ms": 2400, "cpu": 0.92, "replicas": 2 }', meta: 'read-only · attempt <b>2 of 3</b> · succeeded' }] : []),
       { name: 'read metrics', type: 'llm', agent: 'infra', depth: 2, t0: t(1.37), t1: t(2.08), ...obsLlm('gpt-oss-120b', 0.2, 486, 54),
@@ -2335,7 +2241,7 @@
       // the run stops at interrupt() and resumes with the admin's decision; the minutes in between are not latency
       { name: 'admin approval', type: 'human', agent: 'infra', depth: 2, t0: 0.88, t1: 0.92,
         input: 'interrupt({ "action": "restart_service", "env": "staging", "service": "billing" })', output: '{ "decision": "approve", "by": "admin" }',
-        meta: 'paused at checkpoint <b>3</b> · an <b>admin</b> approved 46 s later · the wait is left out of the timings (slide 16)' },
+        meta: 'paused at checkpoint <b>3</b> · an <b>admin</b> approved 46 s later · the wait is left out of the timings (slide 15)' },
       { name: 'restart_service', type: 'tool', agent: 'infra', depth: 2, t0: 0.94, t1: 2.38,
         input: 'restart_service(env="staging", service="billing")', output: '{ "status": "restarted", "ready": "2/2" }', meta: 'staging change · ran after an admin approved' },
       { name: 'confirm', type: 'llm', agent: 'infra', depth: 2, t0: 2.40, t1: 2.82, ...obsLlm('gpt-oss-20b', 0.2, 204, 32),
@@ -2513,61 +2419,6 @@
   obsStream('slow');
   hooks.observe = () => { obsCost(); obsStream(obsKey); };
   /* BUILD:observe END */
-
-  /* ------------------------------------------------------------------ 19: four routes */
-  const PATHS = [
-    { title: 'A · Use an open-weight model as it is',
-      desc: 'Download a strong open model, run it on our own server and give people a private chat window. Everything stays private, but the model only knows what it learned in training. It knows nothing about our company.',
-      time: 'Days', good: 'Drafting, summarising, translation, general coding help',
-      watch: 'Cannot answer anything about our own documents, policies or data', take: [1, 1, 1, 0], get: [0, 0, 0, 4] },
-    { title: 'B · Open-weight model + RAG',
-      desc: 'Route A, plus a search layer over our documents. For every question the harness finds the relevant passages, gives them to the model and has it answer from them, with sources. Change a document and the next answer reflects it.',
-      time: '4–8 weeks to a pilot', good: 'Questions about our policies, products, contracts and code, with sources',
-      watch: 'Only as good as our documents and the search behind them; needs tuning and an owner', take: [2, 2, 2, 2], get: [5, 5, 5, 5] },
-    { title: 'C · Fine-tune an open-weight model',
-      desc: 'Take an open model and keep training it on our own examples, so its behaviour, tone or format matches what we want. Useful for narrow, repeated jobs. It does not reliably learn facts, and what it learns freezes the day training ends.',
-      time: '2–4 months a round, repeated when things change', good: 'A fixed style or format; narrow tasks such as sorting tickets',
-      watch: 'Knowledge frozen at training time, no sources, and every policy change means retraining', take: [3, 3, 4, 5], get: [2, 1, 0, 5] },
-    { title: 'D · Train our own model from scratch',
-      desc: 'Build a new model from nothing: gather trillions of words of text, rent thousands of GPUs for months and hire a research team to run it. This is what OpenAI, Anthropic, Google and Meta do.',
-      time: 'A year or more', good: 'Companies whose product is the model itself',
-      watch: 'Needs far more text than we own; the result would almost certainly be worse than free open-weight models', take: [5, 5, 5, 5], get: [2, 1, 0, 5] },
-  ];
-  const TAKE = ['Cost', 'Time', 'Team needed', 'Data preparation'];
-  const GET = ['Knows our documents', 'Stays up to date', 'Shows its sources', 'Control'];
-  const pathCards = $$('.path-card');
-  const meters = $('#pathMeters');
-  const meterGroup = (title, cls, labels) => {
-    const g = el('div', 'meter-group ' + cls);
-    g.append(el('p', 'meter-group-title', title));
-    labels.forEach(lb => {
-      const row = el('div', 'mrow');
-      row.setAttribute('role', 'img');
-      const segs = el('span', 'segs');
-      for (let k = 0; k < 5; k++) { const s = el('i'); s.style.setProperty('--k', k); segs.append(s); }
-      row.append(el('span', null, lb), segs);
-      g.append(row);
-    });
-    return g;
-  };
-  meters.append(meterGroup('What it takes', 'take', TAKE), meterGroup('What we get', 'get', GET));
-  function selectPath(i) {
-    const p = PATHS[i];
-    pathCards.forEach((c, j) => { c.classList.toggle('is-on', j === i); c.setAttribute('aria-selected', String(j === i)); });
-    $('#pathTitle').textContent = p.title;
-    $('#pathDesc').textContent = p.desc;
-    $('#pathTime').textContent = p.time;
-    $('#pathGood').textContent = p.good;
-    $('#pathWatch').textContent = p.watch;
-    [['.take', p.take, TAKE], ['.get', p.get, GET]].forEach(([sel, vals, labels]) => {
-      $$(sel + ' .mrow', meters).forEach((row, r) => {
-        row.setAttribute('aria-label', `${labels[r]}: ${vals[r]} out of 5`);
-        $$('i', row).forEach((s, k) => s.classList.toggle('on', k < vals[r]));
-      });
-    });
-  }
-  pathCards.forEach((c, i) => c.addEventListener('click', () => selectPath(i)));
-  selectPath(1);
 
   /* BUILD:polish START */
   /* ------------------------------------------------------------------ deck-wide polish */
@@ -2766,54 +2617,7 @@
   /* 8 terms: number the chips so they cascade in reading order */
   chain('terms', prev => { prev?.(); $$('#glTerms .term-chip').forEach((c, k) => c.style.setProperty('--pz-k', k)); });
 
-  /* 11 cost: the pay-back label sits where two lines cross; give it a paper plate so no line shows between its words */
-  function plateBreakEven() {
-    const lab = $('.be-label', calcSvg);
-    $('.pz-be-plate', calcSvg)?.remove();
-    if (!lab) return;
-    const b = lab.getBBox();
-    if (!b.width) return;
-    lab.before(svgEl('rect', { class: 'pz-be-plate', x: (b.x - 7).toFixed(1), y: (b.y - 3).toFixed(1), width: (b.width + 14).toFixed(1), height: (b.height + 6).toFixed(1), rx: 6 }));
-  }
-  new MutationObserver(recs => { if (recs.some(r => [...r.addedNodes].some(n => !n.classList?.contains('pz-be-plate')))) plateBreakEven(); })
-    .observe(calcSvg, { childList: true });
-  plateBreakEven();
-  document.fonts?.ready.then(plateBreakEven);
-
-  /* 11 cost: the three lines draw themselves, then the savings area and the pay-back point appear */
-  let costRun = 0;
-  function drawCostIn() {
-    const me = ++costRun;
-    const plan = [['.line-cloud', '.end-label.cloud'], ['.line-ours', '.end-label.sel'], ['.line-alt', '.end-label.alt']]
-      .map(([ls, es], k) => ({ ln: $(ls, calcSvg), end: $(es, calcSvg), start: 620 + k * 170, dur: 900 }))
-      .filter(p => p.ln);
-    plan.forEach(p => {
-      p.a = ['x1', 'y1', 'x2', 'y2'].map(n => +p.ln.getAttribute(n));
-      p.ln.setAttribute('x2', p.a[0]);
-      p.ln.setAttribute('y2', p.a[1]);
-      p.end?.animate({ opacity: [0, 1] }, { duration: 400, delay: p.start + p.dur - 120, easing: 'ease-out', fill: 'backwards' });
-    });
-    $$('.area-save', calcSvg).forEach(n => n.animate({ opacity: [0, getComputedStyle(n).opacity] }, { duration: 600, delay: 1650, easing: 'ease-out', fill: 'backwards' }));
-    $$('.be-dot, .pz-be-plate, .be-label', calcSvg).forEach((n, k) => n.animate({ opacity: [0, 1] }, { duration: 420, delay: 1720 + k * 80, easing: 'ease-out', fill: 'backwards' }));
-    const t0 = performance.now();
-    const ease = k => (k < 0.5 ? 4 * k * k * k : 1 - Math.pow(-2 * k + 2, 3) / 2);
-    const tick = now => {
-      const live = me === costRun && isActive('cost');
-      let done = true;
-      for (const p of plan) {
-        if (!p.ln.isConnected) continue;
-        const k = live ? clamp((now - t0 - p.start) / p.dur) : 1;
-        if (k < 1) done = false;
-        p.ln.setAttribute('x2', (p.a[0] + (p.a[2] - p.a[0]) * ease(k)).toFixed(2));
-        p.ln.setAttribute('y2', (p.a[1] + (p.a[3] - p.a[1]) * ease(k)).toFixed(2));
-      }
-      if (!done) requestAnimationFrame(tick);
-    };
-    requestAnimationFrame(tick);
-  }
-  chain('cost', prev => { prev?.(); if (motionOn()) drawCostIn(); });
-
-  /* 12 value: the department panel arrives after the two numbers have counted up, then starts typing */
+  /* 11 value: the department panel arrives after the two numbers have counted up, then starts typing */
   let valueRun = 0;
   chain('value', prev => {
     const me = ++valueRun;
@@ -2821,7 +2625,7 @@
     setTimeout(() => { if (me === valueRun && isActive('value')) prev?.(); }, 900);
   });
 
-  /* 13 harness: each ring links to the slide that opens it up, without changing how the rings look */
+  /* 12 harness: each ring links to the slide that opens it up, without changing how the rings look */
   const RING_TO = { rag: 'rag', perm: 'rag', tools: 'agents', guard: 'hitl', audit: 'observe' };
   const ringHint = el('p', 'pz-ring-hint rv');
   ringHint.style.setProperty('--d', 3);
@@ -2853,29 +2657,7 @@
   $('#harness .hi-text')?.append(ringHint);
   restHint();
 
-  /* 19 routes: number the meter rows so they fill top to bottom */
-  $$('#pathMeters .mrow').forEach((r, k) => r.style.setProperty('--pz-r', k));
-
-  /* 20 plan: the closing line is split into tokens that write themselves with the highlighter rhythm */
-  {
-    const line = $('#plan .close-line');
-    if (line) {
-      let i = 0;
-      const frag = document.createDocumentFragment();
-      for (const t of tokenize(line.textContent)) {
-        const lead = t.match(/^\s*/)[0];
-        if (lead) frag.append(lead);
-        if (lead === t) continue;
-        const s = el('span', 'tk', t.slice(lead.length));
-        s.style.setProperty('--i', i);
-        s.style.setProperty('--hl', HL[i++ % HL.length]);
-        frag.append(s);
-      }
-      line.replaceChildren(frag);
-    }
-  }
-
-  /* bottom bar: the four parts of the talk on the progress track, read from the title slide's agenda */
+  /* bottom bar: the parts of the talk on the progress track, read from the title slide's agenda */
   const PZ_PARTS = (() => {
     const parts = $$('.hero-agenda a[href^="#"]').map(a => ({
       jump: slides.findIndex(s => s.id === a.getAttribute('href').slice(1)),

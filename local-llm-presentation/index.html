@@ -30,9 +30,8 @@
         <li><a href="#what"><span>1</span>What an LLM is</a></li>
         <li><a href="#compare"><span>2</span>Why our own pays off</a></li>
         <li><a href="#harness"><span>3</span>What we have built</a></li>
-        <li><a href="#paths"><span>4</span>How we would do it</a></li>
       </ol>
-      <p class="hint rv" style="--d:5"><span class="kbd">Scroll</span> or press <span class="kbd">←</span> <span class="kbd">→</span> to move between slides · about 20 minutes</p>
+      <p class="hint rv" style="--d:5"><span class="kbd">Scroll</span> or press <span class="kbd">←</span> <span class="kbd">→</span> to move between slides · about 15 minutes</p>
     </div>
     <figure class="gen-demo card rv" style="--d:2" id="genDemo" aria-label="Animated example of a language model choosing each next word">
       <div class="gen-head">
@@ -247,7 +246,7 @@
         <p class="callout-title">Why this matters for us</p>
         <p>The model never looks anything up: missing a fact, it still writes the most plausible words, a <b>hallucination</b>. The fix is not a bigger model or a lower dial but the right documents (RAG), with a low temperature.</p>
       </div>
-      <a class="ctl-xref" href="#rag"><span class="callout-title">Top-K again · slide 14 →</span><span>Search picks the top K passages.</span></a>
+      <a class="ctl-xref" href="#rag"><span class="callout-title">Top-K again · slide 13 →</span><span>Search picks the top K passages.</span></a>
     </div>
     <details class="eng-note"><summary>Engineer's note</summary>
       <p class="ctl-note">Each candidate's score (logit) <code>z</code> is divided by the temperature before the softmax: <code>p = softmax(z / T)</code>. Below 1 the odds sharpen, above 1 they flatten, and as T → 0 sampling becomes <b>greedy decoding</b>: always the top token. <b>Top-k</b> keeps the k most probable tokens, zeroes the rest and renormalises the survivors to sum to 1.</p>
@@ -405,57 +404,12 @@
   </div></div>
 </section>
 
-<!-- ================================================================ 11 · COST -->
-<section class="slide" id="cost" data-label="09 · What it costs">
-  <div class="frame"><div class="pad">
-    <header class="s-head s-head-row">
-      <div>
-        <p class="eyebrow rv"><span class="ch">09</span> What it costs</p>
-        <h2 data-gen>What would it cost?</h2>
-        <p class="sub rv" style="--d:2">Subscriptions charge for every person, every month. Once our own server is paid for, the thousandth question costs little more than electricity. Rupees, with US dollars in brackets (<span data-rate>₹95.96</span> = $1).</p>
-      </div>
-      <div class="seg seg-lg rv" style="--d:2" role="group" aria-label="Where our own AI runs" id="hostSeg">
-        <button type="button" class="seg-btn is-on" data-host="onprem" aria-pressed="true">On-premises server</button>
-        <button type="button" class="seg-btn" data-host="aws" aria-pressed="false">AWS cloud (Mumbai)</button>
-      </div>
-    </header>
-    <div class="calc card rv" style="--d:3">
-      <div class="calc-inputs">
-        <div class="field"><label for="cSeats">People using AI <output id="cSeatsOut"></output></label><input class="range" id="cSeats" type="range" min="10" max="1000" step="10" value="150"></div>
-        <div class="field"><label for="cPrice">Subscription, per person per month <output id="cPriceOut"></output></label><input class="range" id="cPrice" type="range" min="500" max="10000" step="100" value="2900"></div>
-        <div class="host-fields" data-host="onprem">
-          <div class="field"><label for="cHw">Our server, bought once <output id="cHwOut"></output></label><input class="range" id="cHw" type="range" min="500000" max="15000000" step="100000" value="3000000"><p class="caption">For example 2 × NVIDIA L40S GPUs, 96 GB in total.</p></div>
-          <div class="field"><label for="cRun">Running cost per month <output id="cRunOut"></output></label><input class="range" id="cRun" type="range" min="0" max="1000000" step="25000" value="125000"><p class="caption">Power, maintenance and a share of an engineer's time.</p></div>
-        </div>
-        <div class="host-fields" data-host="aws" hidden>
-          <div class="field"><label for="awsType">AWS server, rented <output id="awsRateOut"></output></label><select id="awsType"></select></div>
-          <div class="field"><label for="awsHours">Hours switched on per month <output id="awsHoursOut"></output></label><input class="range" id="awsHours" type="range" min="100" max="730" step="10" value="730"></div>
-          <div class="field"><label for="awsRun">Other costs per month <output id="awsRunOut"></output></label><input class="range" id="awsRun" type="range" min="0" max="500000" step="10000" value="80000"><p class="caption">A share of an engineer's time, storage and backups.</p></div>
-        </div>
-      </div>
-      <div class="calc-stats" aria-live="polite">
-        <div><p class="caption">Subscriptions, 3 years</p><p class="calc-num" id="cCloud3"></p></div>
-        <div><p class="caption" id="cOursLabel">On-premises, 3 years</p><p class="calc-num ours" id="cOurs3"></p></div>
-        <div><p class="caption" id="cBreakLabel">Pays for itself</p><p class="calc-num" id="cBreak"></p></div>
-        <div><p class="caption">Difference over 3 years</p><p class="calc-num" id="cSave"></p></div>
-      </div>
-      <div class="calc-out">
-        <svg class="calc-chart" id="calcChart" viewBox="0 0 620 300" role="img" aria-label="Cumulative cost over 36 months for subscriptions, an on-premises server and an AWS server"></svg>
-        <div class="legend caption" id="calcLegend"></div>
-        <p class="calc-compare" id="calcCompare"></p>
-      </div>
-    </div>
-    <p class="caption rv" style="--d:4">Running costs only: subscriptions include the vendor's strongest models; hosting our own adds privacy, control and unlimited use.</p>
-    <details class="eng-note"><summary>Engineer's note</summary><p>AWS figures are on-demand Linux prices for the Mumbai region (ap-south-1) from AWS's published price list of 25 September 2026: g7e.2xlarge (1 × RTX PRO 6000 Blackwell, 96 GB) $5.49 an hour, g6e.2xlarge (1 × L40S, 48 GB) $2.69, p5.4xlarge (1 × H100, 80 GB) $8.26, g6e.12xlarge (4 × L40S, 192 GB) $12.60. The g7e.2xlarge is the default because it matches the on-premises example's 96 GB of GPU memory. Savings Plans or Reserved Instances (1 or 3 years) lower the hourly rate; storage and data transfer are billed separately and sit in "other costs". Switching the server off outside office hours (about 220 hours a month) is the biggest lever for the cloud option.</p><p>For the on-premises option, one server with one or two 48–96 GB data-centre GPUs can serve a 30B-class model to dozens of concurrent users with a batching inference server like vLLM. Total cost of ownership should include power and cooling, a support contract, and roughly a quarter to half of one engineer's time. Conversions use <span data-rate>₹95.96</span> per US dollar; change <code>INR_PER_USD</code> in app.js if the rate moves.</p></details>
-  </div></div>
-</section>
-
-<!-- ================================================================ 12 · WHERE IT PAYS OFF -->
-<section class="slide" id="value" data-label="10 · Where it pays off">
+<!-- ================================================================ 11 · HOW AI HELPS US -->
+<section class="slide" id="value" data-label="09 · How AI helps us">
   <div class="frame"><div class="pad">
     <header class="s-head">
-      <p class="eyebrow rv"><span class="ch">10</span> Where it pays off</p>
-      <h2 data-gen>Where our own AI would earn its keep</h2>
+      <p class="eyebrow rv"><span class="ch">09</span> How AI helps us</p>
+      <h2 data-gen>How AI helps us</h2>
     </header>
     <div class="pays">
       <div class="ev-list">
@@ -469,7 +423,7 @@
           <p>faster completion of a programming task by developers using an AI pair programmer.</p>
           <p class="caption">Peng et al., controlled experiment, 2023</p>
         </div>
-        <p class="ev-claim rv" style="--d:4">The strongest case for our own AI is work on our own documents and data: exactly the work we cannot safely send to a subscription service.</p>
+        <p class="ev-claim rv" style="--d:4">AI takes on the first draft, the summary and the search, so our people spend their time on the judgement calls.</p>
       </div>
       <div class="dept rv" style="--d:3">
         <div class="dept-tabs" role="tablist" aria-label="Departments" id="deptTabs"></div>
@@ -492,12 +446,12 @@
   </div></div>
 </section>
 
-<!-- ================================================================ 13 · HARNESS -->
-<section class="slide" id="harness" data-label="11 · Our harness">
+<!-- ================================================================ 12 · HARNESS -->
+<section class="slide" id="harness" data-label="10 · Our harness">
   <div class="frame"><div class="pad">
     <div class="harness-intro">
       <div class="hi-text">
-        <p class="eyebrow rv"><span class="ch">11</span> Our harness</p>
+        <p class="eyebrow rv"><span class="ch">10</span> Our harness</p>
         <h2 data-gen>The model is the engine. The harness is the rest of the car.</h2>
         <p class="lede rv" style="--d:2">A <b>harness</b> is the software around the model. It finds the right documents, checks who is asking, decides which tools the model may use, applies our rules and keeps a record. ChatGPT and Claude are harnesses around their vendors' models. Build our own, and every one of those decisions is ours.</p>
       </div>
@@ -520,11 +474,11 @@
 
 <!-- BUILD:rag START -->
 <!-- ================================================================ 14 · RAG AND CHROMADB -->
-<section class="slide" id="rag" data-label="12 · Our documents: RAG">
+<section class="slide" id="rag" data-label="11 · Our documents: RAG">
   <div class="frame"><div class="pad">
     <header class="s-head s-head-row rag-head">
       <div>
-        <p class="eyebrow rv"><span class="ch">12</span> Our documents: RAG</p>
+        <p class="eyebrow rv"><span class="ch">11</span> Our documents: RAG</p>
         <h2 data-gen>From our documents to a cited answer</h2>
       </div>
       <p class="rag-ring rv" style="--d:2">
@@ -533,7 +487,7 @@
           <circle class="rag-ring-c on" cx="32" cy="32" r="20"/><circle class="rag-ring-c" cx="32" cy="32" r="15"/>
           <circle class="rag-ring-c on" cx="32" cy="32" r="10"/><circle class="rag-ring-core" cx="32" cy="32" r="5.5"/>
         </svg>
-        <span>The harness (11), opened: <b>our documents</b>, with <b>access rights</b> applied at search time</span>
+        <span>The harness (10), opened: <b>our documents</b>, with <b>access rights</b> applied at search time</span>
       </p>
     </header>
 
@@ -664,10 +618,10 @@
 
 <!-- BUILD:agents START -->
 <!-- ================================================================ 15 · MULTI-AGENT -->
-<section class="slide" id="agents" data-label="13 · Multi-agent orchestration">
+<section class="slide" id="agents" data-label="12 · Multi-agent orchestration">
   <div class="frame"><div class="pad">
     <header class="s-head">
-      <p class="eyebrow rv"><span class="ch">13</span> Multi-agent orchestration</p>
+      <p class="eyebrow rv"><span class="ch">12</span> Multi-agent orchestration</p>
       <h2 data-gen>One supervisor, three specialists</h2>
       <p class="sub ag-sub rv" style="--d:2">Our LangGraph proof of concept routes each request to the agent built for it, and loops back to another agent until the job is done.</p>
     </header>
@@ -754,10 +708,10 @@
 
 <!-- BUILD:hitl START -->
 <!-- ================================================================ 16 · HUMAN IN THE LOOP -->
-<section class="slide" id="hitl" data-label="14 · Human in the loop">
+<section class="slide" id="hitl" data-label="13 · Human in the loop">
   <div class="frame"><div class="pad">
     <header class="s-head">
-      <p class="eyebrow rv"><span class="ch">14</span> Human in the loop</p>
+      <p class="eyebrow rv"><span class="ch">13</span> Human in the loop</p>
       <h2 data-gen>The agent proposes. A person decides.</h2>
       <p class="sub hitl-sub rv" style="--d:2">Before a high-impact action, LangGraph saves the run at a checkpoint and stops until a person approves, edits or rejects the plan.</p>
     </header>
@@ -827,10 +781,10 @@
 
 <!-- BUILD:observe START -->
 <!-- ================================================================ 17 · LANGSMITH -->
-<section class="slide" id="observe" data-label="15 · Observability">
+<section class="slide" id="observe" data-label="14 · Observability">
   <div class="frame"><div class="pad">
     <header class="s-head">
-      <p class="eyebrow rv"><span class="ch">15</span> Observability</p>
+      <p class="eyebrow rv"><span class="ch">14</span> Observability</p>
       <h2 data-gen>Every hop, every prompt, on the record</h2>
       <p class="sub obs-sub rv" style="--d:2">LangSmith traces every request: which agent and which model ran each step, what it read, and the time and tokens it took.</p>
     </header>
@@ -867,89 +821,6 @@
   </div></div>
 </section>
 <!-- BUILD:observe END -->
-
-<!-- ================================================================ 18 · COMPANION -->
-<section class="slide" id="companion" data-label="16 · Already built">
-  <div class="frame"><div class="pad">
-    <div class="proof">
-      <div class="proof-text">
-        <p class="eyebrow rv"><span class="ch">16</span> Already built</p>
-        <h2 data-gen>We have already built a harness like this</h2>
-        <p class="rv" style="--d:2"><b>Our system</b> is a working prototype, built by our own team. It runs open-weight models entirely on our own hardware, down to a single laptop: chat, questions about code, and an agent that reads and writes project files, runs commands and checks its own work. Permission modes decide what the agent may do without asking, memory is managed automatically on long tasks, and every step is logged on disk.</p>
-        <p class="muted rv" style="--d:3">A company deployment would run the same ideas on a shared server for many people at once.</p>
-      </div>
-      <div class="proof-stats">
-        <div class="stat card rv" style="--d:3"><p class="stat-num"><span data-count="91">91</span></p><p class="stat-unit">tokens per second</p><p>A 12-billion-parameter model on a 12 GB laptop graphics card. Many times faster than anyone reads.</p></div>
-        <div class="stat card rv" style="--d:4"><p class="stat-num"><span data-count="3">3</span> s</p><p class="stat-unit">to read 12 pages</p><p>The same laptop takes in an 8,100-token document in under three seconds.</p></div>
-        <div class="stat card rv" style="--d:5"><p class="stat-num"><span data-count="13">13</span></p><p class="stat-unit">tokens per second</p><p>With no graphics card at all, on the laptop's processor alone. Slower, but it works.</p></div>
-        <div class="stat card rv" style="--d:6"><p class="stat-num">0</p><p class="stat-unit">bytes sent out</p><p>Every model, prompt and answer stays on the machine unless web search is switched on.</p></div>
-      </div>
-    </div>
-    <p class="caption rv" style="--d:7">Measured on our own test laptop (RTX 5070 Ti Laptop GPU, 12 GB) with Gemma 3 12B, September 2026.</p>
-  </div></div>
-</section>
-
-<!-- ================================================================ 19 · ROUTES -->
-<section class="slide" id="paths" data-label="17 · Four routes">
-  <div class="frame"><div class="pad">
-    <header class="s-head">
-      <p class="eyebrow rv"><span class="ch">17</span> Four routes</p>
-      <h2 data-gen>Four routes to our own AI</h2>
-    </header>
-    <div class="paths rv" style="--d:3">
-      <div class="path-cards" role="tablist" aria-label="Routes" id="pathCards">
-        <button type="button" role="tab" class="path-card" data-path="0"><span class="path-letter">A</span><span class="path-name">Open-weight model, as it is</span><span class="path-short">Download, host, chat</span></button>
-        <button type="button" role="tab" class="path-card is-on" data-path="1"><span class="path-letter">B</span><span class="path-name">Open-weight model + RAG</span><span class="path-short">Answers from our documents</span><span class="badge">Recommended</span></button>
-        <button type="button" role="tab" class="path-card" data-path="2"><span class="path-letter">C</span><span class="path-name">Fine-tune an open-weight model</span><span class="path-short">Retrain it on our examples</span></button>
-        <button type="button" role="tab" class="path-card" data-path="3"><span class="path-letter">D</span><span class="path-name">Train our own from scratch</span><span class="path-short">Build a new model</span></button>
-      </div>
-      <div class="path-detail card" id="pathDetail" role="tabpanel">
-        <div class="path-text">
-          <h3 id="pathTitle"></h3>
-          <p id="pathDesc"></p>
-          <dl class="kv kv-grid">
-            <div><dt>Time to first results</dt><dd id="pathTime"></dd></div>
-            <div><dt>Good for</dt><dd id="pathGood"></dd></div>
-            <div><dt>Watch out for</dt><dd id="pathWatch"></dd></div>
-          </dl>
-        </div>
-        <div class="meters" id="pathMeters"></div>
-      </div>
-      <div class="reco-line">
-        <p class="callout-title">Our recommendation</p>
-        <ol class="reco-flow">
-          <li><b>Now</b> B: open-weight model + RAG, inside our own harness</li>
-          <li><b>Later, if tests show a need</b> add C for specific tasks</li>
-          <li><b>Not needed</b> <s>D: training from scratch</s></li>
-        </ol>
-      </div>
-    </div>
-    <details class="eng-note"><summary>Engineer's note</summary><p>A RAG pipeline: connectors pull documents from their sources; documents are split into passages and embedded; passages go into a vector index alongside keyword search (hybrid search usually beats either alone); a reranker orders the candidates; the top passages go into the prompt with instructions to cite them. Access-control lists are applied at retrieval time, so people only get answers from documents they may open. Fine-tuning today is mostly LoRA or QLoRA: a small adapter trained on one GPU in hours, useful for format, tone and narrow classification, poor at adding facts reliably.</p></details>
-  </div></div>
-</section>
-
-<!-- ================================================================ 20 · PLAN -->
-<section class="slide" id="plan" data-label="18 · The plan">
-  <div class="frame"><div class="pad">
-    <header class="s-head">
-      <p class="eyebrow rv"><span class="ch">18</span> The plan</p>
-      <h2 data-gen>Start small, measure honestly, then grow</h2>
-      <p class="sub rv" style="--d:2">Not a company-wide rollout. A pilot that answers one question with evidence: does our own AI, working from our own documents, save real time for real people?</p>
-    </header>
-    <ol class="timeline">
-      <li class="rv" style="--d:3"><p class="tl-when">Weeks 1–2</p><h3>Choose</h3><p>Pick one department and its documents. Agree what success looks like. Legal reviews the licence of the model we select.</p></li>
-      <li class="rv" style="--d:4"><p class="tl-when">Weeks 3–8</p><h3>Build the pilot</h3><p>One GPU server, bought or rented. An open-weight model with RAG over that department's documents, inside our harness with access rights and an audit log. Twenty to thirty pilot users.</p></li>
-      <li class="rv" style="--d:5"><p class="tl-when">Weeks 9–12</p><h3>Measure</h3><p>Accuracy on a set of real questions with known answers. Time saved, from the users themselves. Cost per user compared with subscriptions.</p></li>
-      <li class="rv" style="--d:6"><p class="tl-when">Next quarter</p><h3>Decide and grow</h3><p>If the numbers hold: more departments and data sources, connected tools, and fine-tuning only where tests show a clear gain.</p></li>
-    </ol>
-    <div class="close-row rv" style="--d:8">
-      <p class="close-line">The next word should be ours.</p>
-      <p>Questions, challenges and objections welcome.</p>
-      <a class="btn btn-primary" href="#top">Back to the start</a>
-    </div>
-    <p class="caption rv" style="--d:9">Prepared for the AI Council · September 2026 · Example figures are illustrative; public figures are cited where they appear; <span data-rate>₹95.96</span> = $1.</p>
-  </div></div>
-</section>
 
 </main>
 </div>

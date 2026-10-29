@@ -187,7 +187,7 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 @keyframes tok-in { 0% { background: var(--hl2); } 100% { background: transparent; } }
 .gen-caret { display: inline-block; width: 0.08em; height: 0.9em; margin-left: 0.06em; vertical-align: -0.1em; background: var(--ours); animation: blink 1s steps(1) infinite; }
 @keyframes blink { 50% { opacity: 0; } }
-.hero-agenda { list-style: none; padding: 0; display: grid; grid-template-columns: 1fr 1fr; column-gap: 28px; }
+.hero-agenda { list-style: none; padding: 0; display: grid; grid-template-columns: repeat(3, auto); column-gap: 28px; }
 .hero-agenda a { display: flex; align-items: baseline; gap: 12px; padding: 10px 0; border-top: 1px solid var(--line); text-decoration: none; font-size: 19px; font-weight: 500; color: var(--ink-2); transition: color 0.2s, padding-left 0.2s; }
 .hero-agenda a span { font: 500 14px/1 var(--mono); color: var(--ours-ink); }
 .hero-agenda a:hover { color: var(--ink); padding-left: 6px; }
@@ -592,45 +592,7 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .cmp tr.em td:last-child { font-weight: 600; }
 .fair { font-size: 18px; color: var(--ink-2); max-width: 110ch; }
 
-/* 11 cost */
-.grid-line { stroke: var(--line); stroke-width: 1; }
-.svg-label { fill: var(--muted); font: 400 12px var(--mono); }
-.calc { display: grid; grid-template-columns: 430px 250px 1fr; gap: 40px; padding: 30px 34px; align-items: start; }
-.calc-inputs { display: grid; gap: 16px; align-content: start; }
-.field { display: grid; gap: 2px; }
-.field label { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; font-size: 17px; font-weight: 500; }
-.field output { font: 600 16px/1.2 var(--mono); color: var(--ink); white-space: nowrap; text-align: right; }
-.field output small { font-weight: 400; color: var(--muted); font-size: 14px; }
-.calc-stats { display: grid; gap: 10px; }
-.calc-stats > div { padding-bottom: 10px; border-bottom: 1px solid var(--line); }
-.calc-stats > div:last-child { border-bottom: 0; padding-bottom: 0; }
-.calc-num { font: 680 32px/1.1 var(--display); letter-spacing: -0.025em; font-variant-numeric: tabular-nums; margin-top: 4px; }
-.calc-num small { display: block; font: 400 15px/1.3 var(--mono); letter-spacing: 0; color: var(--muted); margin-top: 3px; }
-.calc-num.ours { color: var(--ours-ink); }
-.calc-out { display: grid; gap: 10px; align-content: start; }
-.calc-chart { width: 100%; height: auto; }
-.line-cloud { fill: none; stroke: var(--muted); stroke-width: 2.5; stroke-dasharray: 7 6; }
-.line-ours { fill: none; stroke: var(--ours); stroke-width: 3.5; }
-.area-save { fill: var(--ours-soft); opacity: 0.8; }
-.be-dot { fill: var(--paper); stroke: var(--ink); stroke-width: 2.5; }
-.be-label { fill: var(--ink); font: 600 13px var(--mono); paint-order: stroke; stroke: var(--paper); stroke-width: 6px; stroke-linejoin: round; }
-.legend { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
-.key-line { display: inline-block; width: 24px; height: 0; border-top: 3px solid; margin-left: 10px; }
-.key-line:first-child { margin-left: 0; }
-.key-cloud { border-color: var(--muted); border-top-style: dashed; }
-.key-ours { border-color: var(--ours); }
-.key-alt { border-color: var(--ink-2); opacity: 0.45; }
-.line-alt { fill: none; stroke: var(--ink-2); stroke-width: 2; opacity: 0.35; }
-.end-label { font: 600 12px var(--mono); }
-.end-label.sel { fill: var(--ours-ink); }
-.end-label.cloud { fill: var(--muted); }
-.end-label.alt { fill: var(--ink-2); opacity: 0.6; }
-.host-fields { display: grid; gap: 16px; }
-.field select { width: 100%; margin-top: 4px; padding: 8px 12px; border-radius: 10px; border: 1px solid var(--line-2); background: var(--paper); color: var(--ink); font: 500 15px/1.2 var(--mono); }
-.calc-compare { font-size: 15.5px; line-height: 1.45; color: var(--ink-2); }
-.calc-compare b { color: var(--ink); font-weight: 600; }
-
-/* 12 where it pays off: evidence beside the departments */
+/* 11 how AI helps us: evidence beside the departments */
 .pays { display: grid; grid-template-columns: 380px 1fr; gap: 48px; align-items: start; }
 .ev-list { display: grid; gap: 24px; align-content: start; }
 .ev { display: grid; gap: 8px; align-content: start; padding-top: 16px; border-top: 3px solid var(--ink); }
@@ -655,7 +617,7 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .src { font: 400 14px/1 var(--mono); color: #0b1a2c; padding: 7px 12px; border-radius: 999px; background: var(--hl3); animation: pop 0.3s ease-out backwards; }
 .src::before { content: "Source · "; opacity: 0.6; }
 
-/* 13 harness */
+/* 12 harness */
 .harness-intro { display: grid; grid-template-columns: 1fr 360px; gap: 56px; align-items: center; }
 .hi-text { display: grid; gap: 18px; }
 .hi-text h2 { max-width: 20ch; }
@@ -1209,80 +1171,8 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .flow .obs-tiles .obs-wide { grid-column: 1 / -1; }
 /* BUILD:observe END */
 
-/* 18 companion */
-.proof { display: grid; grid-template-columns: 1fr 1fr; gap: 56px; align-items: center; flex: 1; }
-.proof-text { display: grid; gap: 18px; align-content: center; }
-.proof-text p:not(.eyebrow) { font-size: 20px; line-height: 1.55; color: var(--ink-2); }
-.proof-stats { display: grid; grid-template-columns: repeat(2, 1fr); gap: 18px; }
-.stat { padding: 24px 26px; display: grid; gap: 6px; align-content: start; }
-.stat-num { font: 720 64px/1 var(--display); letter-spacing: -0.04em; font-variant-numeric: tabular-nums; }
-.stat-unit { font: 600 13px/1.3 var(--mono); letter-spacing: 0.1em; text-transform: uppercase; color: var(--ours-ink); }
-.stat p:last-child { font-size: 16px; line-height: 1.45; color: var(--ink-2); }
-
-/* 19 routes */
-.kv { display: grid; gap: 12px; }
-.kv dt { font: 400 14px/1.3 var(--mono); color: var(--muted); margin-bottom: 2px; }
-.kv dd { font-size: 19px; color: var(--ink); line-height: 1.4; }
+/* small mono heading used by callouts, panels and the note drawer */
 .callout-title { font: 600 14px/1.3 var(--mono); letter-spacing: 0.12em; text-transform: uppercase; color: var(--ours-ink); }
-.paths { display: grid; gap: 16px; }
-.path-cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
-.path-card {
-  position: relative; display: grid; grid-template-columns: 44px 1fr; grid-template-rows: auto auto; column-gap: 12px; row-gap: 2px; align-items: center;
-  text-align: left; padding: 16px 18px; border: 1.5px solid var(--line); border-radius: 16px; background: var(--paper); color: var(--ink); cursor: pointer;
-  transition: border-color 0.2s, box-shadow 0.2s, transform 0.2s;
-}
-.path-card:hover { border-color: var(--line-2); transform: translateY(-2px); }
-.path-card.is-on { border-color: var(--ink); box-shadow: var(--shadow); }
-.path-letter { grid-row: span 2; width: 44px; height: 44px; border-radius: 12px; display: grid; place-items: center; font: 700 24px/1 var(--display); background: var(--wash); color: var(--muted); transition: all 0.2s; }
-.path-card.is-on .path-letter { background: var(--ink); color: var(--on-ink); }
-.path-name { font-weight: 600; font-size: 18px; line-height: 1.25; }
-.path-short { font-size: 15px; color: var(--muted); }
-.badge { position: absolute; top: -12px; right: 16px; font: 600 12px/1 var(--mono); letter-spacing: 0.1em; text-transform: uppercase; color: #fff; background: var(--ours); border-radius: 999px; padding: 6px 10px; }
-.path-detail { display: grid; grid-template-columns: 1.15fr 1fr; gap: 48px; padding: 28px 34px; }
-.path-text { display: grid; gap: 14px; align-content: start; }
-.path-text h3 { font-size: 28px; }
-.path-text > p { color: var(--ink-2); font-size: 18px; line-height: 1.5; }
-.kv-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px 28px; }
-.kv-grid dd { font-size: 17px; }
-.kv-grid > div:last-child { grid-column: 1 / -1; }
-.meters { display: grid; gap: 16px; align-content: start; }
-.meter-group { display: grid; gap: 7px; }
-.meter-group-title { font: 600 14px/1 var(--mono); letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); }
-.mrow { display: grid; grid-template-columns: 200px 1fr; align-items: center; gap: 14px; font-size: 17px; color: var(--ink-2); }
-.segs { display: grid; grid-template-columns: repeat(5, 1fr); gap: 5px; }
-.segs i { height: 12px; border-radius: 3px; background: var(--wash); transition: background-color 0.35s; transition-delay: calc(var(--k) * 50ms); }
-.take .segs i.on { background: var(--ink-2); }
-.get .segs i.on { background: var(--ours); }
-
-.reco-line { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 18px; }
-.reco-flow { list-style: none; padding: 0; display: flex; flex-wrap: wrap; gap: 10px; }
-.reco-flow li { font-size: 17px; padding: 10px 18px; border-radius: 999px; background: var(--paper); border: 1px solid var(--line); color: var(--ink-2); }
-.reco-flow li b { font: 600 13px/1 var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin-right: 8px; }
-.reco-flow li:first-child { background: var(--ours); border-color: var(--ours); color: #fff; }
-.reco-flow li:first-child b { color: rgba(255, 255, 255, 0.8); }
-.reco-flow s { color: var(--muted); text-decoration-color: var(--faint); }
-
-/* 20 plan */
-.timeline { list-style: none; padding: 0; display: grid; grid-template-columns: repeat(4, 1fr); position: relative; margin-top: 16px; }
-.timeline::before, .timeline::after { content: ""; position: absolute; left: 0; top: 0; height: 3px; border-radius: 2px; }
-.timeline::before { right: 0; background: var(--line); }
-.timeline::after { width: 0; background: var(--ours); transition: width 1.8s cubic-bezier(0.4, 0, 0.2, 1) 0.5s; }
-.deck .slide.on .timeline::after, .flow .timeline::after { width: 100%; }
-.timeline li { position: relative; display: grid; gap: 12px; align-content: start; padding: 38px 32px 0 0; }
-.timeline li::before { content: ""; position: absolute; top: -8px; left: 0; width: 19px; height: 19px; border-radius: 50%; background: var(--paper); border: 3px solid var(--line-2); transition: background-color 0.3s, border-color 0.3s; }
-.deck .slide.on .timeline li::before { background: var(--ours); border-color: var(--ours); }
-.deck .slide.on .timeline li:nth-child(1)::before { transition-delay: 0.5s; }
-.deck .slide.on .timeline li:nth-child(2)::before { transition-delay: 0.95s; }
-.deck .slide.on .timeline li:nth-child(3)::before { transition-delay: 1.4s; }
-.deck .slide.on .timeline li:nth-child(4)::before { transition-delay: 1.85s; }
-.tl-when { font: 600 15px/1 var(--mono); letter-spacing: 0.12em; text-transform: uppercase; color: var(--ours-ink); }
-.timeline h3 { font-size: 32px; }
-.timeline li p:not(.tl-when) { font-size: 19px; line-height: 1.5; color: var(--ink-2); }
-.close-row { display: flex; align-items: center; gap: 12px 28px; flex-wrap: wrap; padding-top: 24px; border-top: 1px solid var(--line); }
-.close-line { font: 700 34px/1.1 var(--display); letter-spacing: -0.025em; }
-.close-row p:not(.close-line) { font-size: 19px; color: var(--ink-2); }
-.close-row .btn { margin-left: auto; }
-
 
 /* engineer's notes: a drawer in deck mode, an inline disclosure in flow mode */
 .deck .eng-note { display: none; }
@@ -1339,23 +1229,17 @@ html[data-tone="dark"] .bar-fill { background: #34d399; }
 .flow .statement-title { font-size: 44px; }
 .flow .lede, .flow .statement-foot { font-size: 18px; }
 .flow .sub { font-size: 17px; }
-.flow .hero, .flow .facts, .flow .stages, .flow .three, .flow .stepper, .flow .gl, .flow .myth-grid, .flow .calc, .flow .pays, .flow .dept-panel,
-.flow .path-detail, .flow .harness-intro, .flow .control-list, .flow .proof, .flow .timeline, .flow .kv-grid { grid-template-columns: 1fr; }
-.flow .ladder-row, .flow .path-cards, .flow .proof-stats { grid-template-columns: 1fr 1fr; gap: 12px; }
+.flow .hero, .flow .facts, .flow .stages, .flow .three, .flow .stepper, .flow .gl, .flow .myth-grid, .flow .pays, .flow .dept-panel,
+.flow .harness-intro, .flow .control-list { grid-template-columns: 1fr; }
+.flow .ladder-row { grid-template-columns: 1fr 1fr; gap: 12px; }
 .flow .myth-grid { grid-auto-rows: auto; }
 .flow .myth-face { min-height: 220px; }
 .flow .gl-detail h3 { font-size: 34px; }
-.flow .timeline { row-gap: 30px; }
-.flow .timeline::before, .flow .timeline::after { display: none; }
-.flow .timeline li { padding: 24px 0 0; border-top: 3px solid var(--ours); }
-.flow .timeline li::before { display: none; }
 .flow .three p { font-size: 22px; }
 .flow .stage-panel { min-height: 440px; }
 .flow .table-wrap { overflow-x: auto; }
 .flow .cmp { min-width: 640px; font-size: 15px; }
-.flow .calc-num { font-size: 26px; }
 .flow .bar-row { grid-template-columns: 96px 1fr 44px; gap: 8px; font-size: 14px; }
-.flow .mrow { grid-template-columns: 140px 1fr; font-size: 15px; }
 .flow .rings-static { display: none; }
 .flow .s-head-row { flex-direction: column; align-items: flex-start; }
 .flow .gen-text { font-size: 24px; }
@@ -1446,7 +1330,6 @@ html[data-tone="dark"] .bar-fill { background: #34d399; }
   .deck #top.on .hero-agenda li:nth-child(1) { animation-delay: 0.66s; }
   .deck #top.on .hero-agenda li:nth-child(2) { animation-delay: 0.74s; }
   .deck #top.on .hero-agenda li:nth-child(3) { animation-delay: 0.82s; }
-  .deck #top.on .hero-agenda li:nth-child(4) { animation-delay: 0.9s; }
 }
 @keyframes pz-float {
   from { transform: translate(calc(var(--fx, 10px) * -1), calc(var(--fy, 6px) * -1)); }
@@ -1614,13 +1497,7 @@ html[data-tone="dark"] .bar-fill { background: #34d399; }
 @keyframes pz-row { from { opacity: 0; transform: translateX(-22px); } }
 @keyframes pz-ping { 0% { transform: scale(1); } 30% { transform: scale(1.8); } 100% { transform: scale(1); } }
 
-/* ---------------------------------------------------------------- 11 cost: a plate under the pay-back label */
-.pz-be-plate { fill: var(--paper); stroke: var(--line); stroke-width: 1; }
-/* the AWS fields are one caption line taller than the on-premises ones and pushed the slide 4 px into the bottom
-   pad; tighten their spacing evenly while they are shown */
-.calc-inputs:has(> .host-fields[data-host="aws"]:not([hidden])), .host-fields[data-host="aws"] { gap: 13px; }
-
-/* ---------------------------------------------------------------- 12 value: highlighter under the numbers, panel after the counts */
+/* ---------------------------------------------------------------- 11 value: highlighter under the numbers, panel after the counts */
 .deck #value .ev-num { background-repeat: no-repeat; background-size: 100% 100%; }
 @media (prefers-reduced-motion: no-preference) {
   .deck #value.on .ev-num { animation: pz-mark 0.9s cubic-bezier(0.6, 0, 0.3, 1) backwards; }
@@ -1630,7 +1507,7 @@ html[data-tone="dark"] .bar-fill { background: #34d399; }
   .deck #value.on .dept.rv { transform: none; transition-delay: 0.95s; transition-duration: 0.7s, 0.95s; transition-timing-function: ease, cubic-bezier(0.16, 0.84, 0.24, 1); }
 }
 
-/* ---------------------------------------------------------------- 13 harness: rings open the next four slides */
+/* ---------------------------------------------------------------- 12 harness: rings open the next four slides */
 .deck #harness .harness-intro { position: relative; }
 /* the rings keep painting above the link layer (labels and strokes on top of the hover band); clicks pass through */
 .deck #ringsIntro { position: relative; z-index: 1; pointer-events: none; }
@@ -1644,46 +1521,7 @@ html[data-tone="dark"] .bar-fill { background: #34d399; }
 .pz-ring-hint b { color: var(--ours-ink); font-weight: 600; }
 .flow .pz-rings, .flow .pz-ring-hint { display: none; }
 
-/* ---------------------------------------------------------------- 18 companion: the stat cards flip up in turn */
-@media (prefers-reduced-motion: no-preference) {
-  .deck #companion .stat.rv { transform: perspective(1100px) rotateX(-70deg) translateY(26px); transform-origin: 50% 100%; }
-  .deck #companion.on .stat.rv { transform: none; transition-duration: 0.5s, 1.05s; transition-timing-function: ease, cubic-bezier(0.2, 0.9, 0.3, 1.12); }
-  .deck #companion.on .stat.rv:nth-child(1) { transition-delay: 0.5s; }
-  .deck #companion.on .stat.rv:nth-child(2) { transition-delay: 0.68s; }
-  .deck #companion.on .stat.rv:nth-child(3) { transition-delay: 0.86s; }
-  .deck #companion.on .stat.rv:nth-child(4) { transition-delay: 1.04s; }
-}
-
-/* ---------------------------------------------------------------- 19 routes: cards dealt in, meters fill */
-@media (prefers-reduced-motion: no-preference) {
-  .deck #paths .paths.rv { opacity: 1; transform: none; transition: none; }
-  .deck #paths.on .path-card { animation: pz-deal 0.75s cubic-bezier(0.18, 0.8, 0.25, 1) backwards; --pz-dx: 0px; --pz-dy: 46px; }
-  .deck #paths.on .path-card:nth-child(1) { animation-delay: 0.42s; --pz-rot: -5deg; }
-  .deck #paths.on .path-card:nth-child(2) { animation-delay: 0.52s; --pz-rot: 3deg; }
-  .deck #paths.on .path-card:nth-child(3) { animation-delay: 0.62s; --pz-rot: -3deg; }
-  .deck #paths.on .path-card:nth-child(4) { animation-delay: 0.72s; --pz-rot: 5deg; }
-  .deck #paths.on .path-card .badge { animation: pz-pop 0.45s cubic-bezier(0.2, 0.8, 0.3, 1.4) 1.2s backwards; }
-  .deck #paths.on .path-detail { animation: pz-rise 0.75s cubic-bezier(0.2, 0.7, 0.2, 1) 0.8s backwards; }
-  .deck #paths.on .segs i { transform-origin: 0 50%; animation: pz-seg 0.42s cubic-bezier(0.3, 0.7, 0.2, 1) backwards; animation-delay: calc(1.15s + var(--pz-r, 0) * 70ms + var(--k, 0) * 45ms); }
-  .deck #paths.on .reco-line > .callout-title { animation: pz-fade 0.6s ease 1.3s backwards; }
-  .deck #paths.on .reco-flow li { animation: pz-pop 0.5s cubic-bezier(0.2, 0.8, 0.3, 1.2) backwards; }
-  .deck #paths.on .reco-flow li:nth-child(1) { animation-delay: 1.4s; }
-  .deck #paths.on .reco-flow li:nth-child(2) { animation-delay: 1.52s; }
-  .deck #paths.on .reco-flow li:nth-child(3) { animation-delay: 1.64s; }
-}
-@keyframes pz-seg { from { opacity: 0; transform: scaleX(0); } }
-
-/* ---------------------------------------------------------------- 20 plan: the closing line writes itself */
-.close-line { isolation: isolate; }
-.close-line:hover .tk { color: #0b1a2c; }
-.close-line:hover .tk::before { opacity: 1; }
-@media (prefers-reduced-motion: no-preference) {
-  .deck #plan.on .close-line .tk { animation: pz-write 1.15s ease-out backwards; animation-delay: calc(1.2s + var(--i, 0) * 150ms); }
-  .deck #plan.on .close-line .tk::before { animation: hl-mark 1.15s ease-out backwards; animation-delay: calc(1.2s + var(--i, 0) * 150ms); }
-}
-@keyframes pz-write { 0% { color: transparent; } 1%, 50% { color: #0b1a2c; } 100% { color: var(--ink); } }
-
-/* ---------------------------------------------------------------- bottom bar: four parts, slide list */
+/* ---------------------------------------------------------------- bottom bar: the parts, slide list */
 /* The bottom bar's #barTrack / #barFill share class names with the probability bars, and their later rules
    (4 px track, scaleX(var(--p)) fill) flattened every .bars chart into an empty line. Restore the bars' own look. */
 .bars .bar-row .bar-track { height: 12px; border-radius: 6px; background: var(--wash); }
