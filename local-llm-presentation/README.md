@@ -26,3 +26,7 @@ Fonts come from Google Fonts when online and fall back to system fonts offline.
   moves one slide. Home and End jump to the first and last slide.
 - On slides with a technical deep-dive, an **Engineer's note** button appears in the bottom bar.
 - Department examples, glossary and myths are the `DEPTS`, `TERMS` and `MYTHS` lists in `app.js`.
+
+`presenter-notes.pdf` holds the presenter's notes: a set-up checklist and running order, then a page per slide
+(what is on screen, what to say, what to click, the facts behind it and likely questions), grouped questions and
+answers, the forty terms, backup material from slides that were cut, and sources.
