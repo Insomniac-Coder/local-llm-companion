@@ -1804,6 +1804,262 @@
 
   /* BUILD:agents START */
   /* ------------------------------------------------------------------ 15: multi-agent orchestration */
+  // A LangGraph supervisor classifies each request by type, sends it down the matching branch, takes the agent's
+  // result back and decides again: another agent, or finish. Four example requests, the same ones slides 16 and 17
+  // reuse; the two-hop "staging feels slow" run (the one slide 17 traces) plays on arrival.
+  const AG_NAME = { rag: 'RAG agent', infra: 'Infra agent', gen: 'General agent' };
+  const AG_NODE = { rag: 'rag_agent', infra: 'infra_agent', gen: 'general_agent' };
+  const AG_TYPE = { rag: 'Knowledge question', infra: 'Infrastructure task', gen: 'Anything else' };
+  const AG_RUNS = [
+    { key: 'vpn', label: 'VPN policy', req: 'What is our VPN policy for contractors?',
+      answer: 'Managed laptops only, and access ends on the contract end date.', cite: 'Security §3.2, §3.4',
+      hops: [{ a: 'rag', tool: 'chroma', did: '<b>RAG agent</b> · ChromaDB: Security §3.2, §3.4', sources: ['Security §3.2', 'Security §3.4'] }] },
+    { key: 'restart', label: 'Restart billing', req: 'Restart the billing service on staging',
+      answer: 'Done: billing on staging restarted and healthy, with 2 of 2 replicas ready.',
+      hops: [{ a: 'infra', tool: 'restart', did: '<b>Infra agent</b> · restart_service: 2 of 2 ready', calls: ['restart_service(staging, billing)'] }],
+      note: 'A staging change runs, then tells us. On production it would wait for a person: next slide.' },
+    { key: 'farewell', label: 'Farewell note', req: 'Write a farewell note for Ravi from the team', why: ' (drafting)',
+      answer: 'Ravi, thank you for four brilliant years. We will miss your calm in every release week.',
+      hops: [{ a: 'gen', tool: 'draft', did: '<b>General agent</b> · drafts the note, no tools' }] },
+    { key: 'slow', label: 'Staging slow', req: 'Staging feels slow: check it and tell me what the runbook says',
+      answer: 'CPU-bound: p95 2.4 s, CPU 92%. Runbook: scale out above 85% CPU for 10 min.', cite: 'Scaling §2',
+      hops: [
+        { a: 'infra', tool: 'metrics', did: '<b>Infra agent</b> · get_metrics: p95 2.4 s, CPU 92%', calls: ['get_metrics(staging, checkout)'] },
+        { a: 'rag', pre: 'Still needs the runbook: ', log: 'needs the runbook', tool: 'chroma', did: '<b>RAG agent</b> · ChromaDB: Scaling §2, Staging §1', sources: ['Scaling §2', 'Staging §1'] },
+      ] },
+  ];
+  const AG_STOP = Symbol('stop'), AG_AWAY = Symbol('away');
+  const agDia = $('#agDia'), agSvg = $('#agEdges'), agSup = $('#agSup'), agRead = $('#agRead'), agLog = $('#agLog');
+  const agReqBox = $('#agReqBox'), agAnsBox = $('#agAnsBox'), agAns = $('#agAns'), agRulesBox = $('#agents .ag-rules');
+  const agNodes = Object.fromEntries($$('.ag-node', agDia).map(n => [n.dataset.a, n]));
+  const agRules = Object.fromEntries($$('.ag-rule', agDia).map(n => [n.dataset.a, n]));
+  const agState = Object.fromEntries($$('#agState dd').map(d => [d.dataset.k, d]));
+  let agKey = 'slow', agRun = 0;
+
+  // request chips, each with a dot for every agent the request will use
+  const agChips = AG_RUNS.map(r => {
+    const b = el('button', 'ag-chip');
+    b.type = 'button';
+    const dots = el('span', 'ag-chip-dots');
+    [...new Set(r.hops.map(h => h.a))].forEach(a => dots.append(el('i', 'ag-c-' + a)));
+    b.append(dots, r.label);
+    b.setAttribute('aria-label', `${r.req} (uses ${r.hops.map(h => AG_NAME[h.a]).join(', then ')})`);
+    b.addEventListener('click', () => agPlay(r.key));
+    return b;
+  });
+  $('#agChips').append(...agChips);
+  $('#agReplay').addEventListener('click', () => agPlay(agKey));
+
+  // edges: one arrow down to each agent and one back up, drawn from the layout (canvas px)
+  const SVGNS = 'http://www.w3.org/2000/svg';
+  const agSvgEl = (tag, cls) => { const n = document.createElementNS(SVGNS, tag); n.setAttribute('class', cls); return n; };
+  const agEdges = {};
+  ['in', 'out', 'rag-down', 'rag-up', 'infra-down', 'infra-up', 'gen-down', 'gen-up'].forEach(k => {
+    const g = agSvgEl('g', 'ag-e ag-c-' + (k.includes('-') ? k.split('-')[0] : 'io'));
+    const line = agSvgEl('path', 'ag-edge'), head = agSvgEl('path', 'ag-head');
+    g.append(line, head);
+    agSvg.append(g);
+    agEdges[k] = { g, line, head, x: 0, y1: 0, y2: 0 };
+  });
+  const agPkt = agSvgEl('circle', 'ag-pkt');
+  agPkt.setAttribute('r', 7);
+  agSvg.append(agPkt);
+  const agBox = n => {
+    let x = 0, y = 0;
+    for (let e = n; e && e !== agDia; e = e.offsetParent) { x += e.offsetLeft; y += e.offsetTop; }
+    return { x, y, w: n.offsetWidth, h: n.offsetHeight };
+  };
+  function agDraw() {
+    if (!agDia.offsetWidth || getComputedStyle(agSvg).display === 'none') return;
+    agSvg.setAttribute('viewBox', `0 0 ${agDia.offsetWidth} ${agDia.offsetHeight}`);
+    const sup = agBox(agSup), req = agBox(agReqBox), ans = agBox(agAnsBox);
+    const top = sup.y, bot = sup.y + sup.h;
+    const set = (k, x, y1, y2) => {   // a vertical arrow from y1 to y2
+      const d = Math.sign(y2 - y1), e = agEdges[k];
+      Object.assign(e, { x, y1, y2 });
+      e.line.setAttribute('d', `M${x} ${y1} L${x} ${y2 - d * 8}`);
+      e.head.setAttribute('d', `M${x - 6} ${y2 - d * 10} L${x + 6} ${y2 - d * 10} L${x} ${y2} Z`);
+    };
+    set('in', req.x + 44, req.y + req.h + 3, top - 3);
+    set('out', ans.x + ans.w - 44, top - 3, ans.y + ans.h + 3);
+    for (const a of ['rag', 'infra', 'gen']) {
+      const n = agBox(agNodes[a]);
+      set(a + '-down', n.x + 30, bot + 3, n.y - 3);
+      set(a + '-up', n.x + n.w - 30, n.y - 3, bot + 3);
+    }
+  }
+  addEventListener('resize', () => setTimeout(agDraw, 200));
+  document.fonts?.ready.then(agDraw);
+  agDraw();
+
+  // the packet: a glowing dot that rides one edge
+  function agTravel(k, ms, me) {
+    const e = agEdges[k];
+    e.g.classList.add('is-run');
+    agPkt.setAttribute('class', 'ag-pkt on ' + [...e.g.classList].find(c => c.startsWith('ag-c-')));
+    return new Promise((res, rej) => {
+      const t0 = performance.now();
+      const tick = now => {
+        if (me !== agRun) { rej(AG_STOP); return; }
+        const t = clamp((now - t0) / ms), ease = t < 0.5 ? 2 * t * t : 1 - (2 - 2 * t) ** 2 / 2;
+        agPkt.setAttribute('cx', e.x);
+        agPkt.setAttribute('cy', e.y1 + (e.y2 - e.y1) * ease);
+        if (t < 1) { requestAnimationFrame(tick); return; }
+        agEdgeDone(k);
+        agPkt.classList.remove('on');
+        res();
+      };
+      requestAnimationFrame(tick);
+    });
+  }
+  const agEdgeDone = k => { agEdges[k].g.classList.remove('is-run'); agEdges[k].g.classList.add('is-done'); };
+  async function agWait(ms, me) {
+    await sleep(ms);
+    if (me !== agRun) throw AG_STOP;
+    if (!isActive('agents')) throw AG_AWAY;
+  }
+
+  // shared state, readout, log
+  const agStr = s => `<span class="ag-q">"${s}"</span>`;
+  const agList = (xs, quote = true) => '[' + xs.map(x => `<span class="ag-q">${quote ? `"${x}"` : x}</span>`).join(', ') + ']';
+  function agSet(k, v, flash) {
+    const dd = agState[k];
+    if (dd.innerHTML === v) return;
+    dd.innerHTML = v;
+    if (flash && !reduced) { dd.classList.remove('flash'); void dd.offsetWidth; dd.classList.add('flash'); }
+  }
+  function agSay(htmlText, flash, thinking) {
+    agRead.innerHTML = htmlText;
+    agRead.classList.toggle('ag-thinking', !!thinking);
+    if (flash && !reduced) { agRead.classList.remove('pop'); void agRead.offsetWidth; agRead.classList.add('pop'); }
+  }
+  function agLogLine(who, text, cls) {
+    const li = el('li', 'ag-c-' + who + (cls ? ' ' + cls : ''));
+    li.innerHTML = `<span class="ag-n">${cls ? 'i' : agLog.querySelectorAll('li:not(.ag-note)').length + 1}</span><span>${text}</span>`;
+    agLog.append(li);
+  }
+  const agLight = a => {
+    Object.entries(agRules).forEach(([k, r]) => r.classList.toggle('is-lit', k === a));
+    agRulesBox.classList.toggle('has-lit', !!a);
+  };
+  const agHot = (a, tool, on) => { const t = tool && $(`[data-tool="${tool}"]`, agNodes[a]); if (t) t.classList.toggle('is-hot', on); };
+
+  // a run is a list of beats; played live they wait and animate, played instantly they give the final state
+  function agBeats(run) {
+    const st = { steps: [], calls: [], sources: [] };
+    const used = [];
+    const B = [];
+    B.push({ ms: 340, go: live => {
+      agLog.replaceChildren();
+      Object.values(agEdges).forEach(e => e.g.classList.remove('is-run', 'is-done'));
+      Object.values(agNodes).forEach(n => n.classList.remove('is-on'));
+      $$('.ag-tools span', agDia).forEach(s => s.classList.remove('is-hot'));
+      agLight(null);
+      agSup.classList.remove('is-on');
+      $('#agReq').textContent = run.req;
+      agAns.innerHTML = '<span class="ag-wait">comes back through the supervisor</span>';
+      agAnsBox.classList.remove('is-done');
+      agSay('Reads each request and picks the agent for it', false);
+      agSet('request', `"${run.req}"`, live);
+      agSet('next', '<span class="ag-q">null</span>', false);
+      agSet('steps', '[]', false);
+      agSet('tool_calls', '[]', false);
+      agSet('sources', '[]', false);
+      agSet('status', agStr('received'), live);
+    } });
+    const classify = () => ({ ms: 540, go: () => { agSup.classList.add('is-on'); agSay('Classifying the request', true, true); agSet('status', agStr('routing'), true); } });
+    B.push({ edge: 'in', ms: 0, go: () => {} });
+    run.hops.forEach((h, i) => {
+      B.push(classify());
+      B.push({ ms: 1000, go: live => {
+        agSay(`${h.pre || 'Type: '}<span class="ag-type ag-c-${h.a}">${AG_TYPE[h.a]}</span>${run.why || ''} → ${AG_NAME[h.a]}`, live);
+        agLight(h.a);
+        used.push(h.a);
+        agSet('next', `<span class="ag-q ag-k ag-c-${h.a}">"${AG_NODE[h.a]}"</span>`, live);
+        agLogLine('sup', `<b class="ag-c-sup">Supervisor</b> → ${AG_NAME[h.a]} · ${h.log || AG_TYPE[h.a].toLowerCase()}`);
+      } });
+      B.push({ edge: h.a + '-down', ms: 0, pre: () => { agSup.classList.remove('is-on'); agSet('status', agStr('running ' + AG_NODE[h.a]), true); },
+        go: () => { agNodes[h.a].classList.add('is-on'); } });
+      B.push({ ms: 300, go: () => { agHot(h.a, h.tool, true); } });
+      B.push({ ms: 950, go: live => {
+        if (h.calls) { st.calls.push(...h.calls); agSet('tool_calls', agList(st.calls, false), live); }
+        if (h.sources) { st.sources.push(...h.sources); agSet('sources', agList(st.sources), live); }
+        agLogLine(h.a, h.did);
+      } });
+      B.push({ edge: h.a + '-up', ms: 0, pre: () => { agHot(h.a, h.tool, false); agNodes[h.a].classList.remove('is-on'); },
+        go: live => { st.steps.push(AG_NODE[h.a]); agSet('steps', '[' + st.steps.map(s => `<span class="ag-q ag-k ag-c-${s.split('_')[0].replace('general', 'gen')}">"${s}"</span>`).join(', ') + ']', live); } });
+    });
+    B.push(classify());
+    B.push({ ms: 650, go: live => {
+      agSay('Done → answer', live);
+      agLight(null);
+      used.forEach(a => agRules[a].classList.add('is-lit'));
+      agSet('next', '<span class="ag-q ag-k">"FINISH"</span>', live);
+      agLogLine('sup', '<b class="ag-c-sup">Supervisor</b> → finish · answer sent');
+    } });
+    B.push({ edge: 'out', ms: 0, pre: () => {}, go: () => { agSup.classList.remove('is-on'); } });
+    B.push({ ms: 0, go: async (live, me) => {
+      agAnsBox.classList.add('is-done');
+      agAns.replaceChildren();
+      if (live) {
+        for (const t of tokenize(run.answer)) {
+          if (me !== agRun) throw AG_STOP;
+          agAns.append(el('span', 'new', t));
+          await sleep(24);
+        }
+      } else agAns.textContent = run.answer;
+      if (run.cite) agAns.append(el('span', 'ag-cite', run.cite));
+      agSet('status', agStr('done'), live);
+      if (run.note) agLogLine('io', run.note, 'ag-note');
+    } });
+    return B;
+  }
+  function agMark() {
+    agChips.forEach((c, i) => { const on = AG_RUNS[i].key === agKey; c.classList.toggle('is-on', on); c.setAttribute('aria-pressed', String(on)); });
+  }
+  function agFinal(run) {
+    const me = ++agRun;
+    agPkt.classList.remove('on');
+    for (const b of agBeats(run)) { b.pre?.(); if (b.edge) agEdgeDone(b.edge); b.go(false, me); }
+  }
+  async function agPlay(key) {
+    agKey = key;
+    agMark();
+    agDraw();
+    const run = AG_RUNS.find(r => r.key === key);
+    if (reduced || !isActive('agents')) { agFinal(run); return; }
+    const me = ++agRun;
+    try {
+      for (const b of agBeats(run)) {
+        b.pre?.();
+        if (b.edge) await agTravel(b.edge, b.edge.includes('-') ? 520 : 420, me);
+        await b.go(true, me);
+        if (b.ms) await agWait(b.ms, me);
+        if (!isActive('agents')) throw AG_AWAY;
+      }
+    } catch (err) {
+      if (err === AG_AWAY && me === agRun) agFinal(run);   // left the slide mid-run: show how it ends
+      else if (err !== AG_STOP && err !== AG_AWAY) throw err;
+    }
+  }
+  agFinal(AG_RUNS[3]);
+  agMark();
+  // On a phone this slide is taller than the deck's 35% visibility threshold can ever reach, so it also enters
+  // (headline and run) once a sixth of it is on screen.
+  if ('IntersectionObserver' in window) {
+    const agSlide = $('#agents');
+    new IntersectionObserver(([e]) => {
+      if (isDeck()) return;
+      if (e.intersectionRatio >= 0.16 && !visible.has('agents')) { visible.add('agents'); cur = slides.indexOf(agSlide); enter(cur); }
+      else if (!e.isIntersecting) visible.delete('agents');
+    }, { threshold: [0, 0.16] }).observe(agSlide);
+  }
+  hooks.agents = () => {
+    agDraw();
+    if (reduced) { agFinal(AG_RUNS.find(r => r.key === agKey)); return; }
+    const me = ++agRun;   // a fresh run once the slide has settled
+    setTimeout(() => { if (me === agRun && isActive('agents')) agPlay(agKey); }, 900);
+  };
   /* BUILD:agents END */
 
   /* BUILD:hitl START */

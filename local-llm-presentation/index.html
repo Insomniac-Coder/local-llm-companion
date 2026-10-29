@@ -669,16 +669,85 @@
     <header class="s-head">
       <p class="eyebrow rv"><span class="ch">13</span> Multi-agent orchestration</p>
       <h2 data-gen>One supervisor, three specialists</h2>
-      <p class="sub rv" style="--d:2">Our LangGraph proof of concept: a supervisor agent reads each request, decides what type it is and routes it to the agent built for that job.</p>
+      <p class="sub ag-sub rv" style="--d:2">Our LangGraph proof of concept routes each request to the agent built for it, and loops back to another agent until the job is done.</p>
     </header>
-    <ul class="control-list rv" style="--d:3">
-      <li><b>Supervisor agent</b>: receives every request, classifies it and routes it; every result comes back to it. Runs on gpt&#8209;oss&#8209;20b.</li>
-      <li><b>RAG agent</b>: knowledge questions, answered from our documents through ChromaDB. Runs on gpt&#8209;oss&#8209;120b.</li>
-      <li><b>Infra agent</b>: infrastructure tasks such as checking, restarting or scaling a service. Runs on gpt&#8209;oss&#8209;120b.</li>
-      <li><b>General agent</b>: the fallback for drafting and general questions. Runs on gemma&#8209;3&#8209;27b.</li>
-      <li><b>Why a graph, not a chain</b>: it can loop back, keeps one shared state, chooses the next step at run time and recovers from failures.</li>
-      <li class="muted">The interactive diagram for this slide is being finished.</li>
-    </ul>
+    <div class="ag-main">
+      <div class="ag-board card rv" style="--d:3">
+        <div class="ag-bar">
+          <span class="ag-kicker">Try a request</span>
+          <div class="ag-chips" id="agChips" role="group" aria-label="Example requests"></div>
+          <button type="button" class="btn btn-small" id="agReplay">Replay</button>
+        </div>
+        <div class="ag-dia" id="agDia">
+          <svg class="ag-edges" id="agEdges" aria-hidden="true"></svg>
+          <div class="ag-io">
+            <p class="ag-bubble ag-req" id="agReqBox"><span class="ag-tag">Request</span><span id="agReq"></span></p>
+            <p class="ag-bubble ag-ans" id="agAnsBox" aria-live="polite"><span class="ag-tag">Answer</span><span id="agAns"></span></p>
+          </div>
+          <div class="ag-sup" id="agSup">
+            <span class="ag-sup-icon" aria-hidden="true"><svg viewBox="0 0 32 32"><circle cx="16" cy="9" r="4.5"/><path d="M16 13.5v5M16 18.5L7 23M16 18.5L25 23M16 18.5V24"/><circle cx="6" cy="25" r="2.6"/><circle cx="16" cy="26" r="2.6"/><circle cx="26" cy="25" r="2.6"/></svg></span>
+            <div class="ag-sup-id">
+              <p class="ag-sup-name">Supervisor agent <span class="ag-lg">LangGraph</span></p>
+              <p class="ag-sup-model">gpt-oss-20b · small and fast, for routing</p>
+            </div>
+            <div class="ag-read">
+              <p class="ag-read-k">Routes by request type</p>
+              <p class="ag-read-v" id="agRead" aria-live="polite">Reads each request and picks the agent for it</p>
+            </div>
+          </div>
+          <ul class="ag-rules" aria-label="Routing rule">
+            <li class="ag-rule ag-c-rag" data-a="rag"><b>Knowledge question</b><span>policies, docs, runbooks</span><em>→ RAG agent</em></li>
+            <li class="ag-rule ag-c-infra" data-a="infra"><b>Infrastructure task</b><span>check, restart, scale</span><em>→ Infra agent</em></li>
+            <li class="ag-rule ag-c-gen" data-a="gen"><b>Anything else</b><span>drafting · the fallback</span><em>→ General agent</em></li>
+          </ul>
+          <ul class="ag-agents" aria-label="The three agents">
+            <li class="ag-node ag-c-rag" data-a="rag">
+              <p class="ag-node-head"><i class="ag-dot" aria-hidden="true"></i><b>RAG agent</b><span class="ag-model">gpt-oss-120b</span></p>
+              <p class="ag-tools"><span data-tool="chroma">ChromaDB</span><span>all-MiniLM-L6-v2</span></p>
+            </li>
+            <li class="ag-node ag-c-infra" data-a="infra">
+              <p class="ag-node-head"><i class="ag-dot" aria-hidden="true"></i><b>Infra agent</b><span class="ag-model">gpt-oss-120b</span></p>
+              <p class="ag-tools"><span data-tool="metrics">metrics</span><span>logs</span><span data-tool="restart">restart</span><span>scale</span></p>
+            </li>
+            <li class="ag-node ag-c-gen" data-a="gen">
+              <p class="ag-node-head"><i class="ag-dot" aria-hidden="true"></i><b>General agent</b><span class="ag-model">gemma-3-27b</span></p>
+              <p class="ag-tools"><span data-tool="draft">no tools · drafting</span></p>
+            </li>
+          </ul>
+        </div>
+      </div>
+      <aside class="ag-side card rv" style="--d:4" aria-label="The run">
+        <section class="ag-sec">
+          <p class="ag-side-k">Shared state <span>saved after every step</span></p>
+          <dl class="ag-state" id="agState">
+            <div><dt>request</dt><dd data-k="request"></dd></div>
+            <div><dt>next</dt><dd data-k="next"></dd></div>
+            <div><dt>steps</dt><dd data-k="steps"></dd></div>
+            <div><dt>tool_calls</dt><dd data-k="tool_calls"></dd></div>
+            <div><dt>sources</dt><dd data-k="sources"></dd></div>
+            <div><dt>status</dt><dd data-k="status"></dd></div>
+          </dl>
+        </section>
+        <section class="ag-sec">
+          <p class="ag-side-k">Step log</p>
+          <ol class="ag-log" id="agLog" aria-live="polite"></ol>
+        </section>
+        <p class="ag-side-foot">Each step gets the smallest model that does it well.</p>
+      </aside>
+    </div>
+    <div class="ag-why rv" style="--d:5">
+      <div class="ag-why-head">
+        <h3>Why LangGraph, not a chain</h3>
+        <p>LangChain supplies the standard parts: connectors to our private model, the ChromaDB retriever, tools. LangGraph wires them into a graph.</p>
+      </div>
+      <ul class="ag-why-list">
+        <li><p class="ag-why-t"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.6-5.9"/><path d="M19.5 3.5v4h-4"/></svg>Cycles</p><p>It can loop back to retry, refine or ask another agent. A chain only runs forward.</p></li>
+        <li><p class="ag-why-t"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8.5 4C6.5 4 6 5 6 6.5v3C6 11 5 12 3.5 12 5 12 6 13 6 14.5v3C6 19 6.5 20 8.5 20M15.5 4c2 0 2.5 1 2.5 2.5v3c0 1.5 1 2.5 2.5 2.5-1.5 0-2.5 1-2.5 2.5v3c0 1.5-.5 2.5-2.5 2.5"/></svg>Explicit state</p><p>One shared, typed state that every agent reads and writes, saved after every step.</p></li>
+        <li><p class="ag-why-t"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="2.2"/><circle cx="19" cy="5" r="2.2"/><circle cx="19" cy="19" r="2.2"/><path d="M7.2 12H11c2 0 2.5-1.2 3.2-3.4L15 6.3c.3-.9.9-1.3 1.8-1.3M11 12c2 0 2.5 1.2 3.2 3.4l.8 2.3c.3.9.9 1.3 1.8 1.3"/></svg>Conditional routing</p><p>The next step is chosen from the state at run time, not fixed in advance.</p></li>
+        <li><p class="ag-why-t"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7 3v5.5c0 4.5-3 7.8-7 9.5-4-1.7-7-5-7-9.5V6z"/><path d="M8.8 12.2l2.2 2.2 4.4-4.6"/></svg>Reliability</p><p>Retries, timeouts, fallbacks and resumable runs: one failure no longer breaks everything.</p></li>
+      </ul>
+    </div>
+    <details class="eng-note"><summary>Engineer's note</summary><p>The proof of concept is a LangGraph <code>StateGraph(State)</code>. The state is typed: <code>messages</code>, a list merged by the <code>add_messages</code> reducer, and <code>next</code>, the agent to run. The supervisor node calls our private model (<code>gpt-oss-20b</code>) with structured output, so it can only answer <code>rag</code>, <code>infra</code>, <code>general</code> or <code>FINISH</code>; <code>add_conditional_edges</code> routes on <code>next</code>, and every agent has an edge back to the supervisor, which is what makes the loop. LangChain's <code>ChatOpenAI(base_url=…)</code> points every node at the OpenAI-compatible API of our own model server.</p><p>Each sub-agent is a prebuilt ReAct agent (<code>create_react_agent</code>; <code>create_agent</code> in LangChain 1.0). The RAG agent's tool is a ChromaDB retriever with <code>all-MiniLM-L6-v2</code> embeddings; the Infra agent's tools wrap approved runbooks and APIs (<code>get_metrics</code>, <code>get_logs</code>, <code>restart_service</code>); the General agent has none. A checkpointer saves the state after every step under a <code>thread_id</code>, which gives memory and resumable runs; <code>recursion_limit</code> stops a run that loops too long; an <code>interrupt</code> before infra write actions on production hands the decision to a person (next slide); and LangSmith traces every node (two slides on). Models and figures shown are illustrative.</p></details>
   </div></div>
 </section>
 <!-- BUILD:agents END -->
