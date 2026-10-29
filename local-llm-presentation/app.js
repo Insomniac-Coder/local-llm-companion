@@ -577,7 +577,7 @@
     if (K === 1) return 'Always the same word. Right for facts, numbers and code.';
     if (band === 'high') return 'Odd words creep in. Fine for brainstorming, risky for anything factual.';
     if (top >= 0.9) return 'Almost always the same word. Right for facts, numbers and code.';
-    if (T < 0.4) return 'Usually the top word, now and then the runner-up. Still a careful setting.';
+    if (T < 0.4) return 'Usually the top word, now and then the\u00a0runner-up. Still a careful setting.';
     if (band !== 'none') return 'Mostly sensible, but a nonsense word can now slip through.';
     return T <= 1.1 ? 'Mostly sensible, with some variety. The\u00a0usual setting for chat.' : 'Varied, yet top-K keeps every pick sensible. Good for drafting ideas.';
   }
