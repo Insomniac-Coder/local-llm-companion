@@ -406,6 +406,7 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 /* BUILD:memory START */
 /* 7 memory: without and with. Two mirrored chat apps get the same messages; only the right one resends the thread. */
 .mem-pad { gap: 22px; }
+.mem-pad h2 { max-width: none; }   /* one line even in the fallback fonts, which set it ~1230 px wide */
 .mem-stage { display: grid; grid-template-columns: minmax(0, 1fr) 196px minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); gap: 24px; height: 540px; flex: none; }
 .mem-pane { display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
 .mem-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 18px; border-bottom: 1px solid var(--line); }
@@ -465,8 +466,10 @@ h3 { font-size: 27px; font-weight: 620; line-height: 1.18; letter-spacing: -0.01
 .mem-cols i { width: 12px; height: calc(var(--h, 0) * 32px); min-height: 0; border-radius: 2px; background: var(--line-2); transition: height 0.6s cubic-bezier(0.2, 0.7, 0.2, 1), background-color 0.3s; }
 .mem-cols i.now { background: var(--ink-2); }
 .mem-keeps .mem-cols i.now { background: var(--ours); }
-.mem-count { display: grid; justify-items: start; min-width: 62px; }
-.mem-count b { font: 680 28px/1 var(--display); letter-spacing: -0.02em; font-variant-numeric: tabular-nums; color: var(--ink); }
+.mem-count { display: grid; justify-items: start; }
+.mem-count b { display: grid; font: 680 28px/1 var(--display); letter-spacing: -0.02em; font-variant-numeric: tabular-nums; color: var(--ink); }
+/* an invisible "~000" holds the count's widest width in whichever font renders it, so the chart beside it never shifts while the count climbs */
+.mem-count b::before { content: "~000"; height: 0; overflow: hidden; visibility: hidden; }
 .mem-count span { font: 400 13px/1.3 var(--mono); color: var(--muted); }
 .mem-keeps .mem-count b { color: var(--ours-ink); }
 

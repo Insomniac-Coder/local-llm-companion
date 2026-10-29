@@ -881,10 +881,26 @@
     }
     memCols(s, n);
   }
+  // typing steps: tokens, except that a phrase held together by a no-break space (from the start of its first word
+  // to the end of its last) arrives in one step, so words already on screen never jump to the next line
+  function memSteps(text) {
+    const out = [];
+    let glue = false;
+    for (const t of tokenize(text)) {
+      if (t[0] === ' ' && out.length) {
+        let k = out.length - 1;
+        while (k > 0 && !/^[ \n]/.test(out[k])) k--;
+        out.push(out.splice(k).join('') + t);
+        glue = true;
+      } else if (glue && !/^[ \n]/.test(t)) out[out.length - 1] += t;
+      else { out.push(t); glue = false; }
+    }
+    return out;
+  }
   async function memType(a, s, n, me) {
     const span = el('span', 'mem-text');
     a.replaceChildren(span);
-    for (const t of tokenize(MEM_TURNS[n - 1].a[s])) {
+    for (const t of memSteps(MEM_TURNS[n - 1].a[s])) {
       if (me !== memRun) return;
       span.textContent += t;
       await sleep(34);
@@ -917,6 +933,7 @@
     wrap.classList.add('mem-going');
     wrap.style.height = '0px';
     pill.style.opacity = '0';
+    old[0].style.marginTop = '0px';   // turn 1 stops being the first child: keep it from taking a gap before it folds
     s1.chat.prepend(wrap);
     old.forEach(g => { g.style.height = g.offsetHeight + 'px'; g.classList.add('mem-going'); });
     void s1.chat.offsetHeight;
