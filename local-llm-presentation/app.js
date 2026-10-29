@@ -884,6 +884,470 @@
 
   /* BUILD:polish START */
   /* ------------------------------------------------------------------ deck-wide polish */
+  // Entrances are CSS keyed to .slide.on (styles.css, BUILD:polish). This adds what CSS cannot do alone: decorative
+  // layers, a few measurements, the cost chart drawing itself, clickable harness rings, the four-part bar and the
+  // slide list. Everything is skipped or shown in its final state under reduced motion and in flow (phone) mode.
+  const SVGNS = 'http://www.w3.org/2000/svg';
+  const svgEl = (tag, attrs = {}) => { const n = document.createElementNS(SVGNS, tag); for (const k in attrs) n.setAttribute(k, attrs[k]); return n; };
+  const motionOn = () => !reduced && isDeck();
+  const chain = (id, fn) => { const prev = hooks[id]; hooks[id] = () => fn(prev); };
+  const frameOf = id => $(`#${id} > .frame`);
+  // position of a node inside its slide's 1600 × 860 canvas, from layout offsets (unaffected by any transform)
+  const canvasPos = n => { let x = 0, y = 0; for (let p = n; p && !p.classList?.contains('frame'); p = p.offsetParent) { x += p.offsetLeft; y += p.offsetTop; } return { x, y, w: n.offsetWidth, h: n.offsetHeight }; };
+
+  // .pz-in marks a slide for a moment after it arrives, for entrances that must not replay on every click
+  const pzTimers = new Map();
+  const classWatch = new MutationObserver(recs => {
+    for (const r of recs) {
+      const s = r.target, on = s.classList.contains('on'), was = (r.oldValue || '').split(/\s+/).includes('on');
+      if (on === was) continue;
+      clearTimeout(pzTimers.get(s));
+      s.classList.toggle('pz-in', on);
+      if (on) pzTimers.set(s, setTimeout(() => s.classList.remove('pz-in'), 2600));
+    }
+  });
+  slides.forEach(s => classWatch.observe(s, { attributes: true, attributeFilter: ['class'], attributeOldValue: true }));
+
+  /* finish: a slow drifting glow behind every dark slide */
+  $$('.slide.dark').forEach(s => { const g = el('div', 'pz-glow'); g.setAttribute('aria-hidden', 'true'); s.prepend(g); });
+
+  /* finish: a soft sheen that follows the cursor across plain cards */
+  let sheenCard = null, sheenXY = null, sheenRaf = 0;
+  document.addEventListener('pointermove', e => {
+    if (!isDeck() || e.pointerType === 'touch') return;
+    const c = e.target.closest?.('.slide.on .card') || null;
+    if (c && !c.dataset.pzSheen) {
+      c.dataset.pzSheen = getComputedStyle(c).backgroundImage === 'none' ? 'on' : 'off';
+      c.classList.toggle('pz-sheen', c.dataset.pzSheen === 'on');
+    }
+    sheenCard = c && c.classList.contains('pz-sheen') ? c : null;
+    if (!sheenCard) return;
+    sheenXY = [e.clientX, e.clientY];
+    if (!sheenRaf) sheenRaf = requestAnimationFrame(() => {
+      sheenRaf = 0;
+      if (!sheenCard || !sheenXY) return;
+      const r = sheenCard.getBoundingClientRect();
+      sheenCard.style.setProperty('--pz-mx', Math.round((sheenXY[0] - r.left) / S) + 'px');
+      sheenCard.style.setProperty('--pz-my', Math.round((sheenXY[1] - r.top) / S) + 'px');
+    });
+  }, { passive: true });
+
+  /* 1 title: a quiet field of candidate tokens floating in the clear space above and below the live demo */
+  const FIELD_WORDS = [' our', ' private', ' servers', ' inside', ' network', ' rules', ' ours',
+    ' documents', ' own', ' hardware', ' knowledge', ' secure'];
+  const topFrame = frameOf('top'), genCard = $('#genDemo');
+  const field = el('div', 'pz-field');
+  field.setAttribute('aria-hidden', 'true');
+  const fieldToks = FIELD_WORDS.map((w, k) => {
+    const t = el('span', 'pz-tok', w);
+    t.style.background = HL[(k * 2) % HL.length];
+    t.style.fontSize = [16, 18, 15, 17][k % 4] + 'px';
+    t.style.setProperty('--fx', (6 + (k * 5) % 8) + 'px');
+    t.style.setProperty('--fy', (3 + (k * 3) % 4) + 'px');
+    t.style.setProperty('--dur', (9 + (k * 7) % 8) + 's');
+    t.style.setProperty('--bdur', (5 + (k * 3) % 5) + 's');
+    t.style.setProperty('--del', -((k * 1.7) % 9).toFixed(1) + 's');
+    return t;
+  });
+  field.append(...fieldToks);
+  topFrame?.prepend(field);
+  function placeField() {
+    if (!isDeck() || !genCard || !topFrame) return;
+    const c = canvasPos(genCard), rnd = seeded(5171);
+    const x0 = c.x + 4, x1 = c.x + c.w - 4;
+    // clear space above and below the card; the demo text can grow by a line, so keep well clear of its edges
+    const bands = [[66, c.y - 56], [c.y + c.h + 54, 860 - 52 - 10]];
+    const placed = [];
+    fieldToks.forEach((t, k) => {
+      t.hidden = false;
+      const w = t.offsetWidth || 90, h = t.offsetHeight || 31;
+      t.hidden = true;
+      for (let tries = 0; tries < 80; tries++) {
+        const [y0, y1] = bands[(k + tries) % 2];
+        if (y1 - y0 < h) continue;
+        const x = x0 + rnd() * (x1 - x0 - w), y = y0 + rnd() * (y1 - y0 - h);
+        // the float moves each chip by up to 14 × 7 px either way: keep a gap twice that
+        if (placed.some(p => x < p.x + p.w + 44 && x + w + 44 > p.x && y < p.y + p.h + 22 && y + h + 22 > p.y)) continue;
+        placed.push({ x, y, w, h });
+        t.style.left = Math.round(x) + 'px';
+        t.style.top = Math.round(y) + 'px';
+        t.hidden = false;
+        break;
+      }
+    });
+  }
+  chain('top', prev => { prev?.(); placeField(); });
+
+  /* 3 learn: "15 trillion+" counts up */
+  {
+    const b = $('#learn .stage-stat b'), t = b?.firstChild;
+    const m = t?.nodeType === 3 ? t.nodeValue.match(/^(\d+)([\s\S]*)$/) : null;
+    if (m) { const n = el('span', null, m[1]); n.dataset.count = m[1]; t.replaceWith(n, m[2]); }
+  }
+
+  /* 4 work: the prompt splits into its six tokens one after another */
+  $$('#work .frame-v[data-frame="1"] .tk-chip').forEach((c, k) => c.style.setProperty('--pz-k', k));
+
+  /* 7 frozen: frost crystallises in the empty corner while the points freeze into place */
+  const frost = (() => {
+    const frame = frameOf('frozen');
+    if (!frame) return null;
+    const W = 660, H = 400, rnd = seeded(20260929);
+    const svg = svgEl('svg', { class: 'pz-frost', viewBox: `0 0 ${W} ${H}`, 'aria-hidden': 'true' });
+    const defs = svgEl('defs');
+    const fade = svgEl('radialGradient', { id: 'pzFrostFade', gradientUnits: 'userSpaceOnUse', cx: W, cy: 0, r: 640 });
+    [[0, 1], [0.7, 0.8], [1, 0]].forEach(([o, a]) => fade.append(svgEl('stop', { offset: o, 'stop-color': '#fff', 'stop-opacity': a })));
+    const mask = svgEl('mask', { id: 'pzFrostMask', maskUnits: 'userSpaceOnUse', x: 0, y: 0, width: W, height: H });
+    mask.append(svgEl('rect', { x: 0, y: 0, width: W, height: H, fill: 'url(#pzFrostFade)' }));
+    defs.append(fade, mask);
+    const g = svgEl('g', { class: 'pz-frost-g', mask: 'url(#pzFrostMask)' });
+    const tips = [];
+    // keep every stroke inside the box so nothing pokes out of the canvas
+    const clip = (x, y, dx, dy) => {
+      let t = 1;
+      if (x + dx < 2) t = Math.min(t, (2 - x) / dx);
+      if (x + dx > W - 2) t = Math.min(t, (W - 2 - x) / dx);
+      if (y + dy < 2) t = Math.min(t, (2 - y) / dy);
+      if (y + dy > H - 2) t = Math.min(t, (H - 2 - y) / dy);
+      return Math.max(0, t);
+    };
+    const paths = [[], [], []];
+    const grow = (x, y, ang, len, depth) => {
+      const dx = Math.cos(ang) * len, dy = Math.sin(ang) * len, t = clip(x, y, dx, dy);
+      if (t * len < 6) return;
+      const ex = x + dx * t, ey = y + dy * t;
+      paths[depth].push(`M${x.toFixed(1)} ${y.toFixed(1)}L${ex.toFixed(1)} ${ey.toFixed(1)}`);
+      if (depth === 2 || (depth === 1 && t * len < 44)) return;
+      // ice grows in sixty-degree side branches that shorten towards the tip
+      const step = depth ? 19 : 31, n = Math.floor((t * len) / step);
+      for (let i = 1; i <= n; i++) {
+        const f = (i - 0.35) / n, bx = x + dx * t * f, by = y + dy * t * f;
+        const bl = len * (depth ? 0.34 : 0.33) * (1 - f * 0.78) * (0.8 + rnd() * 0.4);
+        grow(bx, by, ang - Math.PI / 3, bl, depth + 1);
+        grow(bx, by, ang + Math.PI / 3, bl * (0.8 + rnd() * 0.3), depth + 1);
+      }
+      if (depth === 0) tips.push([ex, ey]);
+      else if (rnd() < 0.18) tips.push([ex, ey]);
+    };
+    const deg = Math.PI / 180;
+    [[W - 26, 0, 124, 300], [W - 250, 0, 101, 190], [W, 196, 172, 250], [W - 430, 0, 86, 104]]
+      .forEach(([x, y, a, l]) => grow(x, y, a * deg, l, 0));
+    paths.forEach((ds, depth) => g.append(svgEl('path', { class: 'pz-fr', d: ds.join(''), 'stroke-width': [1.5, 1, 0.75][depth], opacity: [0.6, 0.46, 0.34][depth] })));
+    tips.slice(0, 14).forEach(([x, y], k) => {
+      const s = 3 + (k % 3);
+      const sp = svgEl('path', { class: 'pz-spark', d: `M${x} ${y - s * 2}L${x + s * 0.45} ${y - s * 0.45}L${x + s * 2} ${y}L${x + s * 0.45} ${y + s * 0.45}L${x} ${y + s * 2}L${x - s * 0.45} ${y + s * 0.45}L${x - s * 2} ${y}L${x - s * 0.45} ${y - s * 0.45}Z` });
+      sp.style.setProperty('--tw', (2.6 + (k % 4) * 0.7) + 's');
+      sp.style.setProperty('--twd', (1.8 + (k * 0.37) % 2.4).toFixed(2) + 's');
+      g.append(sp);
+    });
+    svg.append(defs, g);
+    frame.prepend(svg);
+    return { fade, R: 640 };
+  })();
+  let frostRun = 0;
+  chain('frozen', prev => {
+    prev?.();
+    if (!frost) return;
+    const me = ++frostRun;
+    if (!motionOn()) { frost.fade.setAttribute('r', frost.R); return; }
+    frost.fade.setAttribute('r', 1);
+    const t0 = performance.now();
+    const tick = now => {
+      if (me !== frostRun) return;
+      const k = clamp((now - t0 - 350) / 2100);
+      frost.fade.setAttribute('r', Math.max(1, frost.R * (1 - Math.pow(1 - k, 2.2))).toFixed(1));
+      if (k < 1 && isActive('frozen')) requestAnimationFrame(tick); else frost.fade.setAttribute('r', frost.R);
+    };
+    requestAnimationFrame(tick);
+  });
+
+  /* 9 myths: work out where each card is dealt from (a point just below the middle of the table) */
+  function measureDeal() {
+    const grid = $('.myth-grid');
+    if (!grid || !isDeck()) return;
+    const gp = canvasPos(grid), ox = gp.w / 2, oy = gp.h + 40;
+    $$('.myth', grid).forEach((c, k) => {
+      const p = canvasPos(c), cx = p.x - gp.x + p.w / 2, cy = p.y - gp.y + p.h / 2;
+      c.style.setProperty('--pz-k', k);
+      c.style.setProperty('--pz-dx', Math.round((ox - cx) * 0.42) + 'px');
+      c.style.setProperty('--pz-dy', Math.round((oy - cy) * 0.42) + 'px');
+      c.style.setProperty('--pz-rot', ((k % 2 ? 1 : -1) * (4 + ((k * 7) % 5))) + 'deg');
+    });
+  }
+  chain('myths', prev => { prev?.(); measureDeal(); });
+
+  /* 8 terms: number the chips so they cascade in reading order */
+  chain('terms', prev => { prev?.(); $$('#glTerms .term-chip').forEach((c, k) => c.style.setProperty('--pz-k', k)); });
+
+  /* 11 cost: the pay-back label sits where two lines cross; give it a paper plate so no line shows between its words */
+  function plateBreakEven() {
+    const lab = $('.be-label', calcSvg);
+    $('.pz-be-plate', calcSvg)?.remove();
+    if (!lab) return;
+    const b = lab.getBBox();
+    if (!b.width) return;
+    lab.before(svgEl('rect', { class: 'pz-be-plate', x: (b.x - 7).toFixed(1), y: (b.y - 3).toFixed(1), width: (b.width + 14).toFixed(1), height: (b.height + 6).toFixed(1), rx: 6 }));
+  }
+  new MutationObserver(recs => { if (recs.some(r => [...r.addedNodes].some(n => !n.classList?.contains('pz-be-plate')))) plateBreakEven(); })
+    .observe(calcSvg, { childList: true });
+  plateBreakEven();
+  document.fonts?.ready.then(plateBreakEven);
+
+  /* 11 cost: the three lines draw themselves, then the savings area and the pay-back point appear */
+  let costRun = 0;
+  function drawCostIn() {
+    const me = ++costRun;
+    const plan = [['.line-cloud', '.end-label.cloud'], ['.line-ours', '.end-label.sel'], ['.line-alt', '.end-label.alt']]
+      .map(([ls, es], k) => ({ ln: $(ls, calcSvg), end: $(es, calcSvg), start: 620 + k * 170, dur: 900 }))
+      .filter(p => p.ln);
+    plan.forEach(p => {
+      p.a = ['x1', 'y1', 'x2', 'y2'].map(n => +p.ln.getAttribute(n));
+      p.ln.setAttribute('x2', p.a[0]);
+      p.ln.setAttribute('y2', p.a[1]);
+      p.end?.animate({ opacity: [0, 1] }, { duration: 400, delay: p.start + p.dur - 120, easing: 'ease-out', fill: 'backwards' });
+    });
+    $$('.area-save', calcSvg).forEach(n => n.animate({ opacity: [0, getComputedStyle(n).opacity] }, { duration: 600, delay: 1650, easing: 'ease-out', fill: 'backwards' }));
+    $$('.be-dot, .pz-be-plate, .be-label', calcSvg).forEach((n, k) => n.animate({ opacity: [0, 1] }, { duration: 420, delay: 1720 + k * 80, easing: 'ease-out', fill: 'backwards' }));
+    const t0 = performance.now();
+    const ease = k => (k < 0.5 ? 4 * k * k * k : 1 - Math.pow(-2 * k + 2, 3) / 2);
+    const tick = now => {
+      const live = me === costRun && isActive('cost');
+      let done = true;
+      for (const p of plan) {
+        if (!p.ln.isConnected) continue;
+        const k = live ? clamp((now - t0 - p.start) / p.dur) : 1;
+        if (k < 1) done = false;
+        p.ln.setAttribute('x2', (p.a[0] + (p.a[2] - p.a[0]) * ease(k)).toFixed(2));
+        p.ln.setAttribute('y2', (p.a[1] + (p.a[3] - p.a[1]) * ease(k)).toFixed(2));
+      }
+      if (!done) requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
+  chain('cost', prev => { prev?.(); if (motionOn()) drawCostIn(); });
+
+  /* 12 value: the department panel arrives after the two numbers have counted up, then starts typing */
+  let valueRun = 0;
+  chain('value', prev => {
+    const me = ++valueRun;
+    if (!motionOn()) { prev?.(); return; }
+    setTimeout(() => { if (me === valueRun && isActive('value')) prev?.(); }, 900);
+  });
+
+  /* 13 harness: each ring links to the slide that opens it up, without changing how the rings look */
+  const RING_TO = { rag: 'rag', perm: 'rag', tools: 'agents', guard: 'hitl', audit: 'observe' };
+  const ringHint = el('p', 'pz-ring-hint rv');
+  ringHint.style.setProperty('--d', 3);
+  ringHint.setAttribute('aria-live', 'polite');
+  const HINT_ICON = '<svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="8.6"/><circle cx="10" cy="10" r="4.6"/></svg>';
+  const restHint = () => { ringHint.innerHTML = HINT_ICON; ringHint.append(el('span', null, 'The next four slides open these rings. Click a ring to go there.')); };
+  const ringLinks = svgEl('svg', { class: 'pz-rings rv', viewBox: '0 0 360 360', role: 'group', 'aria-label': 'The harness rings' });
+  ringLinks.style.setProperty('--d', 3);
+  RINGS.forEach(([key, name], i) => {
+    const target = document.getElementById(RING_TO[key]);
+    if (!target) return;
+    // ring geometry mirrors ringsSvg(): radius 174 − 26 per ring, the model's core is 40
+    const r = 174 - i * 26, inner = i < RINGS.length - 1 ? r - 26 : 40;
+    const a = svgEl('a', { href: '#' + target.id, 'aria-label': `${name}: go to ${target.dataset.label}` });
+    a.append(svgEl('circle', { class: 'pz-band', cx: 180, cy: 180, r: (r + inner) / 2, 'stroke-width': r - inner }));
+    const show = () => {
+      ringHint.innerHTML = HINT_ICON;
+      const s = el('span');
+      s.append(el('b', null, name), ` → ${target.dataset.label}`);
+      ringHint.append(s);
+    };
+    a.addEventListener('pointerenter', show);
+    a.addEventListener('focus', show);
+    a.addEventListener('pointerleave', restHint);
+    a.addEventListener('blur', restHint);
+    ringLinks.append(a);
+  });
+  ringsIntro.before(ringLinks);
+  $('#harness .hi-text')?.append(ringHint);
+  restHint();
+
+  /* 19 routes: number the meter rows so they fill top to bottom */
+  $$('#pathMeters .mrow').forEach((r, k) => r.style.setProperty('--pz-r', k));
+
+  /* 20 plan: the closing line is split into tokens that write themselves with the highlighter rhythm */
+  {
+    const line = $('#plan .close-line');
+    if (line) {
+      let i = 0;
+      const frag = document.createDocumentFragment();
+      for (const t of tokenize(line.textContent)) {
+        const lead = t.match(/^\s*/)[0];
+        if (lead) frag.append(lead);
+        if (lead === t) continue;
+        const s = el('span', 'tk', t.slice(lead.length));
+        s.style.setProperty('--i', i);
+        s.style.setProperty('--hl', HL[i++ % HL.length]);
+        frag.append(s);
+      }
+      line.replaceChildren(frag);
+    }
+  }
+
+  /* bottom bar: the four parts of the talk on the progress track, read from the title slide's agenda */
+  const PZ_PARTS = (() => {
+    const parts = $$('.hero-agenda a[href^="#"]').map(a => ({
+      jump: slides.findIndex(s => s.id === a.getAttribute('href').slice(1)),
+      name: [...a.childNodes].filter(n => n.nodeType === 3).map(n => n.nodeValue).join('').trim() || a.textContent.trim(),
+    })).filter(p => p.jump >= 0).sort((p, q) => p.jump - q.jump);
+    if (!parts.length) parts.push({ jump: 0, name: 'The talk' });
+    parts.forEach((p, k) => { p.from = k ? p.jump : 0; });
+    parts.forEach((p, k) => { p.to = k < parts.length - 1 ? parts[k + 1].from - 1 : slides.length - 1; });
+    return parts;
+  })();
+  const partOf = i => Math.max(0, PZ_PARTS.findIndex(p => i >= p.from && i <= p.to));
+  const COUNT_WORDS = ['One', 'Two', 'Three', 'Four', 'Five', 'Six', 'Seven', 'Eight'];
+  const partName = k => `Part ${k + 1} of ${PZ_PARTS.length} · ${PZ_PARTS[k].name}`;
+  const slideName = s => (s.dataset.label || s.id).replace(/^\d+\s*·\s*/, '');
+  const pzTrack = el('div', 'pz-track');
+  const pzLabel = el('p', 'pz-label');
+  const pzSegs = el('div', 'pz-segs');
+  pzSegs.setAttribute('role', 'group');
+  pzSegs.setAttribute('aria-label', 'Parts of the talk');
+  let peek = -1;
+  const segBtns = PZ_PARTS.map((p, k) => {
+    const b = el('button', 'pz-seg');
+    b.type = 'button';
+    b.style.flexGrow = p.to - p.from + 1;
+    b.setAttribute('aria-label', `Go to part ${k + 1} of ${PZ_PARTS.length}: ${p.name}, slides ${p.from + 1} to ${p.to + 1}`);
+    const track = el('span', 'pz-seg-bar');
+    track.append(el('span', 'pz-seg-fill'));
+    b.append(track);
+    b.addEventListener('click', () => go(p.jump));
+    b.addEventListener('pointerenter', () => { peek = k; paintParts(); });
+    b.addEventListener('pointerleave', () => { peek = -1; paintParts(); });
+    b.addEventListener('focus', () => { peek = k; paintParts(); });
+    b.addEventListener('blur', () => { peek = -1; paintParts(); });
+    return b;
+  });
+  pzSegs.append(...segBtns);
+  pzTrack.append(pzLabel, pzSegs);
+  $('#barTrack').after(pzTrack);
+
+  // the slide counter opens the slide list
+  const barCount = $('#barCount');
+  const countBtn = el('button', 'pz-count');
+  countBtn.type = 'button';
+  countBtn.setAttribute('aria-haspopup', 'dialog');
+  countBtn.setAttribute('aria-expanded', 'false');
+  countBtn.setAttribute('aria-controls', 'pzNav');
+  countBtn.innerHTML = '<svg class="pz-count-ico" viewBox="0 0 14 14" aria-hidden="true"><rect width="6" height="6" rx="1.5"/><rect x="8" width="6" height="6" rx="1.5"/><rect y="8" width="6" height="6" rx="1.5"/><rect x="8" y="8" width="6" height="6" rx="1.5"/></svg>';
+  barCount.replaceWith(countBtn);
+  countBtn.append(barCount);
+
+  const nav = $('#pzNav'), navGrid = $('#pzNavGrid');
+  $('#pzNavTitle').textContent = `All ${slides.length} slides`;
+  navGrid.replaceChildren(...PZ_PARTS.map((p, k) => {
+    const sec = el('section', 'pz-nav-part');
+    sec.append(el('p', 'pz-nav-pn', `Part ${k + 1}`), el('p', 'pz-nav-pt', p.name));
+    const list = el('ol', 'pz-nav-list');
+    for (let i = p.from; i <= p.to; i++) {
+      const a = el('a', 'pz-nav-item');
+      a.setAttribute('href', '#' + slides[i].id);
+      a.dataset.i = i;
+      a.append(el('span', 'pz-nav-n', String(i + 1).padStart(2, '0')), el('span', 'pz-nav-t', slideName(slides[i])));
+      const li = el('li');
+      li.append(a);
+      list.append(li);
+    }
+    sec.append(list);
+    return sec;
+  }));
+  const navItems = $$('.pz-nav-item', nav);
+  const navOpen = () => !nav.hidden;
+  let navBack = null;
+  function markNav() {
+    navItems.forEach(a => { if (+a.dataset.i === cur) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current'); });
+    $$('.pz-nav-part', nav).forEach((s, k) => s.classList.toggle('is-cur', k === partOf(cur)));
+  }
+  function openNav() {
+    if (!isDeck() || navOpen()) return;
+    markNav();
+    navBack = document.activeElement;
+    nav.hidden = false;
+    countBtn.setAttribute('aria-expanded', 'true');
+    navItems.find(a => +a.dataset.i === cur)?.focus({ preventScroll: true });
+  }
+  function closeNav(jumped = false) {
+    if (!navOpen()) return;
+    nav.hidden = true;
+    countBtn.setAttribute('aria-expanded', 'false');
+    const back = !jumped && navBack?.isConnected && navBack !== document.body ? navBack : countBtn;
+    back.focus?.({ preventScroll: true });
+  }
+  countBtn.addEventListener('click', () => (navOpen() ? closeNav() : openNav()));
+  // an item is a plain #link: the deck's own link handler moves to the slide; this only closes the list
+  nav.addEventListener('click', e => {
+    if (e.target.closest('[data-pz-close]')) closeNav();
+    else if (e.target.closest('.pz-nav-item')) closeNav(true);
+  });
+  const partStarts = PZ_PARTS.map(p => navItems.findIndex(a => +a.dataset.i === p.from));
+  addEventListener('keydown', e => {
+    const mods = e.ctrlKey || e.metaKey || e.altKey;
+    if (navOpen()) {
+      const i = navItems.indexOf(document.activeElement);
+      const to = j => navItems[clamp(j, 0, navItems.length - 1)].focus();
+      const across = d => { // same row in the neighbouring part
+        const k = partOf(i < 0 ? cur : +navItems[i].dataset.i), row = i < 0 ? 0 : i - partStarts[k];
+        const n = clamp(k + d, 0, PZ_PARTS.length - 1), p = PZ_PARTS[n];
+        to(partStarts[n] + Math.min(row, p.to - p.from));
+      };
+      let handled = !mods;
+      if (handled) switch (e.key) {
+        case 'Escape': case 'g': case 'G': closeNav(); break;
+        case 'ArrowDown': to(i + 1); break;
+        case 'ArrowUp': to(i < 0 ? 0 : i - 1); break;
+        case 'ArrowRight': across(1); break;
+        case 'ArrowLeft': across(-1); break;
+        case 'Home': case 'PageUp': to(0); break;
+        case 'End': case 'PageDown': to(navItems.length - 1); break;
+        case ' ': if (i >= 0) navItems[i].click(); else handled = false; break;
+        case 'Tab': {
+          const f = $$('button, a', nav), j = f.indexOf(document.activeElement);
+          f[((e.shiftKey ? j - 1 : j + 1) + f.length) % f.length].focus();
+          break;
+        }
+        default: handled = false;
+      }
+      if (e.key === 'Escape') handled = true;
+      if (handled) { e.preventDefault(); e.stopImmediatePropagation(); }
+      return;
+    }
+    if ((e.key === 'g' || e.key === 'G') && !mods && isDeck() && !e.target.closest?.('input, textarea, select, [contenteditable]')) {
+      e.preventDefault();
+      openNav();
+    }
+  }, true);
+  // while the list is open the wheel belongs to it, not to the deck
+  addEventListener('wheel', e => { if (navOpen()) e.stopImmediatePropagation(); }, { capture: true, passive: true });
+
+  function paintParts() {
+    const k = partOf(cur);
+    segBtns.forEach((b, j) => {
+      const p = PZ_PARTS[j];
+      b.style.setProperty('--f', cur > p.to ? 1 : cur < p.from ? 0 : (cur - p.from + 1) / (p.to - p.from + 1));
+      b.classList.toggle('is-peek', j === peek);
+      if (j === k) b.setAttribute('aria-current', 'step'); else b.removeAttribute('aria-current');
+    });
+    pzLabel.classList.toggle('is-peek', peek >= 0);
+    pzLabel.textContent = peek >= 0 ? `Go to part ${peek + 1} · ${PZ_PARTS[peek].name}`
+      : cur === 0 ? `${COUNT_WORDS[PZ_PARTS.length - 1] || PZ_PARTS.length} parts` : partName(k);
+    countBtn.setAttribute('aria-label', `Slide ${cur + 1} of ${slides.length}. Open the slide list (G)`);
+    if (navOpen()) markNav();
+  }
+  // updateBar() rewrites the counter on every move: follow it rather than touching go()
+  new MutationObserver(paintParts).observe(barCount, { childList: true, characterData: true, subtree: true });
+  paintParts();
+
+  // layout-dependent pieces are measured in canvas px; redo them when fonts arrive or the mode changes
+  const remeasure = () => { if (isDeck()) { placeField(); measureDeal(); } else closeNav(); };
+  document.fonts?.ready.then(remeasure);
+  let pzResize = 0;
+  addEventListener('resize', () => { clearTimeout(pzResize); pzResize = setTimeout(remeasure, 200); });
   /* BUILD:polish END */
 
   /* ------------------------------------------------------------------ start */

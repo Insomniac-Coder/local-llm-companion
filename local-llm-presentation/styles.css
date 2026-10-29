@@ -604,5 +604,398 @@ html[data-tone="dark"] .bar-fill { background: #34d399; }
 .flow #hostSeg { flex-wrap: wrap; white-space: normal; }
 
 /* BUILD:polish START */
-/* deck-wide polish: per-slide motion and finish */
+/* deck-wide polish: per-slide motion and finish.
+   Rules: motion lives inside (prefers-reduced-motion: no-preference) and under .deck; it animates only transform,
+   opacity, filter and SVG stroke; every entrance is keyed to .slide.on, so it replays on each visit and stops when
+   the slide leaves. Nothing here changes how a slide looks once its entrance has finished. */
+
+/* ---------------------------------------------------------------- finish */
+/* light slides: a faint paper wash (emerald haze top right, sky haze bottom left) */
+.deck .slide:not(.dark) {
+  background-image:
+    radial-gradient(60% 70% at 100% 0%, rgba(5, 150, 105, 0.05), transparent 72%),
+    radial-gradient(55% 65% at 0% 100%, rgba(56, 189, 248, 0.07), transparent 70%);
+}
+/* dark slides: a slow drifting glow behind the content (layer added by app.js) */
+.pz-glow {
+  position: absolute; inset: -30%; pointer-events: none;
+  background:
+    radial-gradient(28% 32% at 72% 30%, rgba(52, 211, 153, 0.12), transparent 100%),
+    radial-gradient(30% 34% at 28% 72%, rgba(96, 165, 250, 0.11), transparent 100%);
+}
+.flow .pz-glow { display: none; }
+@media (prefers-reduced-motion: no-preference) {
+  .deck .slide.on > .pz-glow { animation: pz-drift 26s ease-in-out infinite alternate; }
+}
+@keyframes pz-drift {
+  0% { transform: translate3d(-4%, 3%, 0) rotate(0deg); }
+  100% { transform: translate3d(4%, -3%, 0) rotate(10deg); }
+}
+
+/* cursor-follow sheen on plain cards (deck mode, hover only; app.js tags eligible cards and feeds the position) */
+.deck .slide.on .card.pz-sheen:hover {
+  background-image: radial-gradient(380px circle at var(--pz-mx, 50%) var(--pz-my, 50%), rgba(5, 150, 105, 0.065), transparent 70%);
+}
+
+/* ---------------------------------------------------------------- slide transitions */
+@media (prefers-reduced-motion: no-preference) {
+  .deck .track { transition: transform 0.8s cubic-bezier(0.72, 0, 0.18, 1); }
+  /* the slide that leaves recedes; the one that arrives resolves out of a light blur (no scale: hooks measure it) */
+  .deck .slide:not(.on) > .frame { animation: pz-recede 0.8s cubic-bezier(0.45, 0, 0.3, 1) forwards; }
+  .deck .slide.on > .frame { animation: pz-resolve 0.72s cubic-bezier(0.25, 0.6, 0.3, 1) 0.08s backwards; }
+}
+@keyframes pz-recede { to { opacity: 0.18; transform: translate(-50%, -50%) scale(calc(var(--s, 1) * 0.93)); } }
+@keyframes pz-resolve { from { opacity: 0.35; filter: blur(9px); } }
+
+/* shared entrance keyframes */
+@keyframes pz-rise { from { opacity: 0; transform: translateY(22px); } }
+@keyframes pz-pop { from { opacity: 0; transform: translateY(10px) scale(0.9); } }
+@keyframes pz-draw { from { transform: scaleX(0); } }
+@keyframes pz-fade { from { opacity: 0; } }
+@keyframes pz-flash { 0% { opacity: 0; } 35% { opacity: 1; } 100% { opacity: 0; } }
+
+/* ---------------------------------------------------------------- 1 title: drifting tokens, lifted demo card */
+.pz-field { position: absolute; inset: 0; z-index: -1; pointer-events: none; }
+.pz-tok {
+  position: absolute; font: 400 17px/1 var(--mono); padding: 7px 10px; border-radius: 8px; white-space: pre;
+  color: color-mix(in srgb, #0b1a2c 62%, transparent); opacity: 0.5;
+}
+.flow .pz-field { display: none; }
+.deck #genDemo { position: relative; }
+.deck #genDemo::after {
+  content: ""; position: absolute; inset: 0; z-index: -1; border-radius: inherit; pointer-events: none;
+  box-shadow: 0 34px 80px rgba(11, 26, 44, 0.16); opacity: 0;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .deck #top .pz-field { opacity: 0; transition: opacity 0.6s ease; }
+  .deck #top.on .pz-field { opacity: 1; transition: opacity 1.6s ease 0.5s; }
+  .deck #top.on .pz-tok { animation: pz-float var(--dur, 12s) ease-in-out var(--del, 0s) infinite alternate, pz-breathe var(--bdur, 7s) ease-in-out var(--del, 0s) infinite alternate; }
+  .deck #top #genDemo.rv { transform: translateY(54px) scale(0.965); }
+  .deck #top.on #genDemo.rv { transform: none; transition-duration: 0.9s, 1.25s; transition-timing-function: ease, cubic-bezier(0.16, 0.84, 0.24, 1); }
+  .deck #top.on #genDemo::after { animation: pz-flash 2.2s ease-in-out 0.25s backwards; }
+  .deck #top.on .hero-agenda li { animation: pz-rise 0.6s cubic-bezier(0.2, 0.7, 0.2, 1) backwards; }
+  .deck #top.on .hero-agenda li:nth-child(1) { animation-delay: 0.66s; }
+  .deck #top.on .hero-agenda li:nth-child(2) { animation-delay: 0.74s; }
+  .deck #top.on .hero-agenda li:nth-child(3) { animation-delay: 0.82s; }
+  .deck #top.on .hero-agenda li:nth-child(4) { animation-delay: 0.9s; }
+}
+@keyframes pz-float {
+  from { transform: translate(calc(var(--fx, 10px) * -1), calc(var(--fy, 6px) * -1)); }
+  to { transform: translate(var(--fx, 10px), var(--fy, 6px)); }
+}
+@keyframes pz-breathe { from { opacity: 0.3; } to { opacity: 0.62; } }
+
+/* ---------------------------------------------------------------- 2 what: highlighter strokes, ladder rungs rise */
+.deck #what .fact-word { background-repeat: no-repeat; background-size: 100% 100%; }
+.deck #what .ladder-row li { position: relative; }
+.deck #what .ladder-row li.ours::after {
+  content: ""; position: absolute; left: 0; right: 0; top: -3px; height: 3px; border-radius: 2px; pointer-events: none;
+  background: #34d399; box-shadow: 0 0 14px 3px rgba(16, 185, 129, 0.55); opacity: 0;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .deck #what.on .fact-word { animation: pz-mark 0.7s cubic-bezier(0.6, 0, 0.3, 1) backwards; }
+  .deck #what.on .fact:nth-child(1) .fact-word { animation-delay: 0.7s; }
+  .deck #what.on .fact:nth-child(2) .fact-word { animation-delay: 0.82s; }
+  .deck #what.on .fact:nth-child(3) .fact-word { animation-delay: 0.94s; }
+  .deck #what.on .ladder-row li { animation: pz-rung 0.7s cubic-bezier(0.2, 0.75, 0.25, 1) backwards; }
+  .deck #what.on .ladder-row li:nth-child(1) { animation-delay: 0.95s; }
+  .deck #what.on .ladder-row li:nth-child(2) { animation-delay: 1.05s; }
+  .deck #what.on .ladder-row li:nth-child(3) { animation-delay: 1.15s; }
+  .deck #what.on .ladder-row li:nth-child(4) { animation-delay: 1.25s; }
+  .deck #what.on .ladder-row li:nth-child(5) { animation-delay: 1.35s; }
+  .deck #what.on .ladder-row li:nth-child(6) { animation-delay: 1.45s; }
+  .deck #what.on .ladder-row li.ours::after { animation: pz-flash 1.3s ease-in-out backwards; }
+  .deck #what.on .ladder-row li.ours:nth-child(1)::after { animation-delay: 1.75s; }
+  .deck #what.on .ladder-row li.ours:nth-child(2)::after { animation-delay: 1.87s; }
+  .deck #what.on .ladder-row li.ours:nth-child(3)::after { animation-delay: 1.99s; }
+}
+@keyframes pz-mark { from { background-size: 0% 100%; } }
+@keyframes pz-rung { from { opacity: 0; transform: translateY(34px); } }
+
+/* ---------------------------------------------------------------- 3 learn: the stage rules draw left to right */
+.deck #learn .stage { position: relative; border-top-color: transparent; }
+.deck #learn .stage::before { content: ""; position: absolute; left: 0; right: 0; top: -3px; height: 3px; background: var(--ink); transform-origin: 0 50%; }
+.deck #learn .stage:nth-child(1) { --pz-s: 0.36s; }
+.deck #learn .stage:nth-child(2) { --pz-s: 0.82s; }
+.deck #learn .stage:nth-child(3) { --pz-s: 1.28s; }
+@media (prefers-reduced-motion: no-preference) {
+  .deck #learn .stage.rv { opacity: 1; transform: none; transition: none; }
+  /* one pen stroke crossing the three stages, each stage's text rising once its rule is drawn */
+  .deck #learn.on .stage::before { animation: pz-draw 0.5s cubic-bezier(0.5, 0, 0.4, 1) var(--pz-s) backwards; }
+  .deck #learn.on .stage > * { animation: pz-rise 0.7s cubic-bezier(0.2, 0.7, 0.2, 1) backwards; animation-delay: calc(var(--pz-s) + 0.2s); }
+  .deck #learn.on .stage > :nth-child(2) { animation-delay: calc(var(--pz-s) + 0.26s); }
+  .deck #learn.on .stage > :nth-child(3) { animation-delay: calc(var(--pz-s) + 0.32s); }
+  .deck #learn.on .stage > :nth-child(4) { animation-delay: calc(var(--pz-s) + 0.38s); }
+}
+
+/* ---------------------------------------------------------------- 4 work: the six steps arrive in order, tokens split */
+@media (prefers-reduced-motion: no-preference) {
+  .deck #work.on #steps > li { animation: pz-rise 0.6s cubic-bezier(0.2, 0.7, 0.2, 1) backwards; }
+  .deck #work.on #steps > li:nth-child(1) { animation-delay: 0.42s; }
+  .deck #work.on #steps > li:nth-child(2) { animation-delay: 0.5s; }
+  .deck #work.on #steps > li:nth-child(3) { animation-delay: 0.58s; }
+  .deck #work.on #steps > li:nth-child(4) { animation-delay: 0.66s; }
+  .deck #work.on #steps > li:nth-child(5) { animation-delay: 0.74s; }
+  .deck #work.on #steps > li:nth-child(6) { animation-delay: 0.82s; }
+  .deck #work.on .frame-v.is-on .tok-row .tk-chip { animation: pz-pop 0.42s cubic-bezier(0.2, 0.8, 0.3, 1.25) backwards; animation-delay: calc(0.12s + var(--pz-k, 0) * 70ms); }
+  .deck #work.on.pz-in .frame-v.is-on .tok-row .tk-chip { animation-delay: calc(0.95s + var(--pz-k, 0) * 110ms); }
+}
+
+/* ---------------------------------------------------------------- 7 frozen: frost forms, the points freeze, RAG glows */
+.pz-frost { position: absolute; top: 0; right: 0; width: 660px; height: 400px; z-index: -1; pointer-events: none; overflow: visible; }
+.pz-frost .pz-fr { fill: none; stroke: #bae6fd; stroke-linecap: round; }
+.pz-frost .pz-spark { fill: #e0f2fe; opacity: 0; transform-box: fill-box; transform-origin: center; }
+.flow .pz-frost { display: none; }
+.deck #frozen .three p { position: relative; }
+.deck #frozen .three p::before {
+  content: ""; position: absolute; left: 0; right: 0; top: -2px; height: 2px; pointer-events: none;
+  background: #bae6fd; box-shadow: 0 0 12px 2px rgba(186, 230, 253, 0.7); opacity: 0;
+}
+.deck #frozen .statement-foot b { display: inline-block; }
+@media (prefers-reduced-motion: no-preference) {
+  .deck #frozen.on .statement-title { animation: pz-freeze 2s ease-out 0.95s backwards; }
+  .deck #frozen .three p.rv { opacity: 1; transform: none; transition: none; }
+  .deck #frozen.on .three p { animation: pz-settle 0.95s cubic-bezier(0.2, 0.8, 0.2, 1) backwards; }
+  .deck #frozen.on .three p:nth-child(1) { animation-delay: 0.7s; }
+  .deck #frozen.on .three p:nth-child(2) { animation-delay: 0.84s; }
+  .deck #frozen.on .three p:nth-child(3) { animation-delay: 0.98s; }
+  .deck #frozen.on .three p:nth-child(4) { animation-delay: 1.12s; }
+  .deck #frozen.on .three p::before { animation: pz-flash 1.2s ease-out backwards; }
+  .deck #frozen.on .three p:nth-child(1)::before { animation-delay: 1.15s; }
+  .deck #frozen.on .three p:nth-child(2)::before { animation-delay: 1.29s; }
+  .deck #frozen.on .three p:nth-child(3)::before { animation-delay: 1.43s; }
+  .deck #frozen.on .three p:nth-child(4)::before { animation-delay: 1.57s; }
+  .deck #frozen.on .statement-foot b { animation: pz-rag 1.4s ease-out 1.75s both, pz-rag-breathe 3.6s ease-in-out 3.15s infinite alternate; }
+  .deck #frozen.on .pz-spark { animation: pz-twinkle var(--tw, 3.2s) ease-in-out var(--twd, 1.6s) infinite; }
+  .deck #frozen.on .pz-frost-g { animation: pz-frost-breathe 5s ease-in-out 2.6s infinite alternate; }
+}
+@keyframes pz-frost-breathe { from { opacity: 1; } to { opacity: 0.72; } }
+.deck #frozen .statement-foot b { filter: drop-shadow(0 0 6px rgba(52, 211, 153, 0.4)); }
+@keyframes pz-freeze {
+  0% { filter: brightness(1) drop-shadow(0 0 0 rgba(186, 230, 253, 0)); }
+  40% { filter: brightness(1.12) drop-shadow(0 0 22px rgba(186, 230, 253, 0.5)); }
+  100% { filter: brightness(1) drop-shadow(0 0 0 rgba(186, 230, 253, 0)); }
+}
+@keyframes pz-settle {
+  0% { opacity: 0; transform: translateY(-28px) scale(1.015); }
+  62% { opacity: 1; transform: translateY(2px) scale(1); }
+  100% { opacity: 1; transform: none; }
+}
+@keyframes pz-rag {
+  0% { filter: drop-shadow(0 0 0 rgba(52, 211, 153, 0)); }
+  35% { filter: drop-shadow(0 0 16px rgba(52, 211, 153, 0.95)); }
+  100% { filter: drop-shadow(0 0 6px rgba(52, 211, 153, 0.4)); }
+}
+@keyframes pz-rag-breathe {
+  from { filter: drop-shadow(0 0 6px rgba(52, 211, 153, 0.4)); }
+  to { filter: drop-shadow(0 0 11px rgba(52, 211, 153, 0.62)); }
+}
+@keyframes pz-twinkle { 0%, 100% { opacity: 0; transform: scale(0.4); } 45% { opacity: 0.85; transform: scale(1); } }
+
+/* ---------------------------------------------------------------- 8 terms: the forty chips cascade in */
+@media (prefers-reduced-motion: no-preference) {
+  .deck #terms.on.pz-in .term-chip { animation: pz-pop 0.45s cubic-bezier(0.2, 0.8, 0.3, 1.2) backwards; animation-delay: calc(0.5s + var(--pz-k, 0) * 19ms); }
+  .deck #terms.on.pz-in .gl-filters .chip { animation: pz-pop 0.45s cubic-bezier(0.2, 0.8, 0.3, 1.2) backwards; }
+  .deck #terms.on.pz-in .gl-filters .chip:nth-child(1) { animation-delay: 0.36s; }
+  .deck #terms.on.pz-in .gl-filters .chip:nth-child(2) { animation-delay: 0.4s; }
+  .deck #terms.on.pz-in .gl-filters .chip:nth-child(3) { animation-delay: 0.44s; }
+  .deck #terms.on.pz-in .gl-filters .chip:nth-child(4) { animation-delay: 0.48s; }
+  .deck #terms.on.pz-in .gl-filters .chip:nth-child(5) { animation-delay: 0.52s; }
+}
+
+/* ---------------------------------------------------------------- 9 myths: the ten cards are dealt onto the table */
+@media (prefers-reduced-motion: no-preference) {
+  .deck #myths .myth-grid.rv { opacity: 1; transform: none; transition: none; }
+  .deck #myths.on .myth { animation: pz-deal 0.8s cubic-bezier(0.18, 0.8, 0.25, 1) backwards; animation-delay: calc(0.42s + var(--pz-k, 0) * 80ms); }
+}
+@keyframes pz-deal {
+  0% { opacity: 0; transform: translate(var(--pz-dx, 0px), var(--pz-dy, 60px)) rotate(var(--pz-rot, -6deg)) scale(0.88); }
+  28% { opacity: 1; }
+  100% { opacity: 1; transform: none; }
+}
+
+/* ---------------------------------------------------------------- 10 compare: rows slide in, our column brightens */
+.deck #compare .cmp td:last-child { position: relative; isolation: isolate; }
+.deck #compare .cmp td:last-child::before { content: ""; position: absolute; inset: 0; z-index: -1; pointer-events: none; background: var(--ours-soft); opacity: 0; }
+.deck #compare .cmp thead th.ours::before { transform-origin: 50% 50%; }
+@media (prefers-reduced-motion: no-preference) {
+  .deck #compare.on .cmp tr { animation: pz-row 0.6s cubic-bezier(0.2, 0.7, 0.2, 1) backwards; }
+  .deck #compare.on .cmp thead tr { animation-delay: 0.45s; }
+  .deck #compare.on .cmp tbody tr:nth-child(1) { animation-delay: 0.55s; }
+  .deck #compare.on .cmp tbody tr:nth-child(2) { animation-delay: 0.61s; }
+  .deck #compare.on .cmp tbody tr:nth-child(3) { animation-delay: 0.67s; }
+  .deck #compare.on .cmp tbody tr:nth-child(4) { animation-delay: 0.73s; }
+  .deck #compare.on .cmp tbody tr:nth-child(5) { animation-delay: 0.79s; }
+  .deck #compare.on .cmp tbody tr:nth-child(6) { animation-delay: 0.85s; }
+  .deck #compare.on .cmp tbody tr:nth-child(7) { animation-delay: 0.91s; }
+  .deck #compare.on .cmp tbody tr:nth-child(8) { animation-delay: 0.97s; }
+  .deck #compare.on .cmp tbody tr:nth-child(9) { animation-delay: 1.03s; }
+  .deck #compare.on .cmp td:last-child::before { animation: pz-flash 1.3s ease-in-out backwards; }
+  .deck #compare.on .cmp tbody tr:nth-child(1) td:last-child::before { animation-delay: 1.3s; }
+  .deck #compare.on .cmp tbody tr:nth-child(2) td:last-child::before { animation-delay: 1.36s; }
+  .deck #compare.on .cmp tbody tr:nth-child(3) td:last-child::before { animation-delay: 1.42s; }
+  .deck #compare.on .cmp tbody tr:nth-child(4) td:last-child::before { animation-delay: 1.48s; }
+  .deck #compare.on .cmp tbody tr:nth-child(5) td:last-child::before { animation-delay: 1.54s; }
+  .deck #compare.on .cmp tbody tr:nth-child(6) td:last-child::before { animation-delay: 1.6s; }
+  .deck #compare.on .cmp tbody tr:nth-child(7) td:last-child::before { animation-delay: 1.66s; }
+  .deck #compare.on .cmp tbody tr:nth-child(8) td:last-child::before { animation-delay: 1.72s; }
+  .deck #compare.on .cmp tbody tr:nth-child(9) td:last-child::before { animation-delay: 1.78s; }
+  .deck #compare.on .cmp thead th.ours::before { animation: pz-ping 1.1s ease-out 1.25s backwards; }
+}
+@keyframes pz-row { from { opacity: 0; transform: translateX(-22px); } }
+@keyframes pz-ping { 0% { transform: scale(1); } 30% { transform: scale(1.8); } 100% { transform: scale(1); } }
+
+/* ---------------------------------------------------------------- 11 cost: a plate under the pay-back label */
+.pz-be-plate { fill: var(--paper); stroke: var(--line); stroke-width: 1; }
+/* the AWS fields are one caption line taller than the on-premises ones and pushed the slide 4 px into the bottom
+   pad; tighten their spacing evenly while they are shown */
+.calc-inputs:has(> .host-fields[data-host="aws"]:not([hidden])), .host-fields[data-host="aws"] { gap: 13px; }
+
+/* ---------------------------------------------------------------- 12 value: highlighter under the numbers, panel after the counts */
+.deck #value .ev-num { background-repeat: no-repeat; background-size: 100% 100%; }
+@media (prefers-reduced-motion: no-preference) {
+  .deck #value.on .ev-num { animation: pz-mark 0.9s cubic-bezier(0.6, 0, 0.3, 1) backwards; }
+  .deck #value.on .ev:nth-child(1) .ev-num { animation-delay: 0.75s; }
+  .deck #value.on .ev:nth-child(2) .ev-num { animation-delay: 0.9s; }
+  .deck #value .dept.rv { transform: translateX(48px); }
+  .deck #value.on .dept.rv { transform: none; transition-delay: 0.95s; transition-duration: 0.7s, 0.95s; transition-timing-function: ease, cubic-bezier(0.16, 0.84, 0.24, 1); }
+}
+
+/* ---------------------------------------------------------------- 13 harness: rings open the next four slides */
+.deck #harness .harness-intro { position: relative; }
+/* the rings keep painting above the link layer (labels and strokes on top of the hover band); clicks pass through */
+.deck #ringsIntro { position: relative; z-index: 1; pointer-events: none; }
+.pz-rings { position: absolute; z-index: 0; grid-area: 1 / 2; align-self: center; justify-self: end; width: 360px; height: 360px; overflow: visible; }
+.pz-rings a { outline: none; cursor: pointer; }
+.pz-band { fill: none; stroke: color-mix(in srgb, var(--ours-soft) 80%, var(--paper)); opacity: 0; pointer-events: stroke; transition: opacity 0.25s; }
+.pz-rings a:hover .pz-band, .pz-rings a:focus-visible .pz-band, .pz-rings a.is-peek .pz-band { opacity: 1; }
+.pz-rings a:focus-visible .pz-band { stroke: color-mix(in srgb, var(--ours) 26%, var(--paper)); }
+.pz-ring-hint { display: flex; align-items: center; gap: 10px; font: 400 15px/1.4 var(--mono); color: var(--muted); }
+.pz-ring-hint svg { flex: none; width: 20px; height: 20px; fill: none; stroke: var(--ours); stroke-width: 1.6; }
+.pz-ring-hint b { color: var(--ours-ink); font-weight: 600; }
+.flow .pz-rings, .flow .pz-ring-hint { display: none; }
+
+/* ---------------------------------------------------------------- 18 companion: the stat cards flip up in turn */
+@media (prefers-reduced-motion: no-preference) {
+  .deck #companion .stat.rv { transform: perspective(1100px) rotateX(-70deg) translateY(26px); transform-origin: 50% 100%; }
+  .deck #companion.on .stat.rv { transform: none; transition-duration: 0.5s, 1.05s; transition-timing-function: ease, cubic-bezier(0.2, 0.9, 0.3, 1.12); }
+  .deck #companion.on .stat.rv:nth-child(1) { transition-delay: 0.5s; }
+  .deck #companion.on .stat.rv:nth-child(2) { transition-delay: 0.68s; }
+  .deck #companion.on .stat.rv:nth-child(3) { transition-delay: 0.86s; }
+  .deck #companion.on .stat.rv:nth-child(4) { transition-delay: 1.04s; }
+}
+
+/* ---------------------------------------------------------------- 19 routes: cards dealt in, meters fill */
+@media (prefers-reduced-motion: no-preference) {
+  .deck #paths .paths.rv { opacity: 1; transform: none; transition: none; }
+  .deck #paths.on .path-card { animation: pz-deal 0.75s cubic-bezier(0.18, 0.8, 0.25, 1) backwards; --pz-dx: 0px; --pz-dy: 46px; }
+  .deck #paths.on .path-card:nth-child(1) { animation-delay: 0.42s; --pz-rot: -5deg; }
+  .deck #paths.on .path-card:nth-child(2) { animation-delay: 0.52s; --pz-rot: 3deg; }
+  .deck #paths.on .path-card:nth-child(3) { animation-delay: 0.62s; --pz-rot: -3deg; }
+  .deck #paths.on .path-card:nth-child(4) { animation-delay: 0.72s; --pz-rot: 5deg; }
+  .deck #paths.on .path-card .badge { animation: pz-pop 0.45s cubic-bezier(0.2, 0.8, 0.3, 1.4) 1.2s backwards; }
+  .deck #paths.on .path-detail { animation: pz-rise 0.75s cubic-bezier(0.2, 0.7, 0.2, 1) 0.8s backwards; }
+  .deck #paths.on .segs i { transform-origin: 0 50%; animation: pz-seg 0.42s cubic-bezier(0.3, 0.7, 0.2, 1) backwards; animation-delay: calc(1.15s + var(--pz-r, 0) * 70ms + var(--k, 0) * 45ms); }
+  .deck #paths.on .reco-line > .callout-title { animation: pz-fade 0.6s ease 1.3s backwards; }
+  .deck #paths.on .reco-flow li { animation: pz-pop 0.5s cubic-bezier(0.2, 0.8, 0.3, 1.2) backwards; }
+  .deck #paths.on .reco-flow li:nth-child(1) { animation-delay: 1.4s; }
+  .deck #paths.on .reco-flow li:nth-child(2) { animation-delay: 1.52s; }
+  .deck #paths.on .reco-flow li:nth-child(3) { animation-delay: 1.64s; }
+}
+@keyframes pz-seg { from { opacity: 0; transform: scaleX(0); } }
+
+/* ---------------------------------------------------------------- 20 plan: the closing line writes itself */
+.close-line { isolation: isolate; }
+.close-line:hover .tk { color: #0b1a2c; }
+.close-line:hover .tk::before { opacity: 1; }
+@media (prefers-reduced-motion: no-preference) {
+  .deck #plan.on .close-line .tk { animation: pz-write 1.15s ease-out backwards; animation-delay: calc(1.2s + var(--i, 0) * 150ms); }
+  .deck #plan.on .close-line .tk::before { animation: hl-mark 1.15s ease-out backwards; animation-delay: calc(1.2s + var(--i, 0) * 150ms); }
+}
+@keyframes pz-write { 0% { color: transparent; } 1%, 50% { color: #0b1a2c; } 100% { color: var(--ink); } }
+
+/* ---------------------------------------------------------------- bottom bar: four parts, slide list */
+/* The bottom bar's #barTrack / #barFill share class names with the probability bars, and their later rules
+   (4 px track, scaleX(var(--p)) fill) flattened every .bars chart into an empty line. Restore the bars' own look. */
+.bars .bar-row .bar-track { height: 12px; border-radius: 6px; background: var(--wash); }
+.bars .bar-row .bar-fill { width: calc(var(--w, 0) * 100%); transform: none; border-radius: 6px; background: var(--line-2); transition: width 0.55s cubic-bezier(0.2, 0.7, 0.2, 1), background-color 0.3s; }
+.bars .bar-row.chosen .bar-fill { background: var(--ours); }
+.deck #barTrack { display: none; }
+/* the right-hand group (note, arrows, counter) never squeezes: its column is at least as wide as its content, and
+   stays equal to the left one (so the track stays centred) whenever the window allows */
+.deck .bar { grid-template-columns: minmax(0, 1fr) minmax(120px, 360px) minmax(max-content, 1fr); }
+.deck .bar .pill { white-space: nowrap; }
+.deck .bar .icon-btn { flex: none; }
+@media (max-width: 1199px) {
+  .deck .bar { grid-template-columns: minmax(150px, 1fr) minmax(120px, 300px) minmax(max-content, 1fr); gap: 18px; padding-left: 22px; }
+}
+/* too narrow for the slide's name beside the brand: the part name in the middle says where we are */
+@media (max-width: 1023px) { .deck .bar-label { display: none; } }
+.pz-track { display: grid; gap: 7px; min-width: 0; }
+.flow .pz-track { display: none; }
+.pz-label {
+  font: 500 12px/1.1 var(--mono); letter-spacing: 0.1em; text-transform: uppercase; text-align: center;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; opacity: 0.72; transition: opacity 0.2s, color 0.2s;
+}
+.pz-label.is-peek { opacity: 1; color: #047857; }
+html[data-tone="dark"] .pz-label.is-peek { color: #6ee7b7; }
+.pz-segs { display: flex; align-items: center; gap: 5px; }
+.pz-seg { flex: 1 1 0; min-width: 16px; height: 14px; padding: 0; border: 0; border-radius: 4px; background: transparent; color: inherit; cursor: pointer; display: grid; align-items: center; }
+.pz-seg-bar { display: block; height: 4px; border-radius: 2px; overflow: hidden; background: rgba(95, 111, 134, 0.22); transition: transform 0.2s, background-color 0.2s; }
+.pz-seg-fill { display: block; height: 100%; background: #059669; transform-origin: 0 50%; transform: scaleX(var(--f, 0)); transition: transform 0.6s cubic-bezier(0.4, 0, 0.2, 1); }
+html[data-tone="dark"] .pz-seg-fill { background: #34d399; }
+.pz-seg:hover .pz-seg-bar, .pz-seg:focus-visible .pz-seg-bar, .pz-seg.is-peek .pz-seg-bar { transform: scaleY(1.75); background-color: rgba(95, 111, 134, 0.34); }
+.pz-seg:focus-visible { outline-offset: 2px; }
+
+.pz-count { display: inline-flex; align-items: center; gap: 8px; height: 36px; padding: 0 8px; border: 0; border-radius: 999px; background: transparent; color: inherit; cursor: pointer; transition: background-color 0.2s; }
+.pz-count:hover, .pz-count[aria-expanded="true"] { background: rgba(95, 111, 134, 0.14); }
+.pz-count .bar-count { min-width: 5em; }
+.pz-count-ico { width: 14px; height: 14px; flex: none; fill: currentColor; opacity: 0.6; }
+@media (max-width: 1199px) { .pz-count-ico { display: none; } }
+
+.pz-nav { position: fixed; z-index: 50; left: 0; right: 0; top: 0; bottom: var(--bar); display: grid; place-items: center; padding: 24px; }
+.pz-nav-scrim { position: absolute; inset: 0; background: rgba(11, 26, 44, 0.42); -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); }
+.pz-nav-panel {
+  position: relative; width: min(1180px, 100%); max-height: 100%; overflow: auto; display: grid; gap: 24px;
+  padding: 28px 32px 32px; border-radius: 22px; background: #ffffff; color: #0b1a2c; box-shadow: 0 30px 90px rgba(11, 26, 44, 0.35);
+}
+.pz-nav-head { display: flex; align-items: flex-start; gap: 24px; }
+.pz-nav-head > div { flex: 1; display: grid; gap: 6px; }
+.pz-nav-kicker { font: 500 13px/1.2 var(--mono); letter-spacing: 0.14em; text-transform: uppercase; color: #5f6f86; }
+.pz-nav-title { font: 650 30px/1.05 var(--display); letter-spacing: -0.02em; color: #0b1a2c; }
+.pz-nav-keys { align-self: center; font: 400 13px/1.2 var(--mono); color: #5f6f86; white-space: nowrap; }
+.pz-nav-keys .kbd { font-size: 13px; padding: 4px 8px; margin: 0 2px; background: #ffffff; color: #0b1a2c; border-color: #c3ccd8; }
+.pz-nav-x { color: #0b1a2c; flex: none; }
+.pz-nav-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 28px; align-items: start; }
+.pz-nav-part { display: grid; gap: 10px; align-content: start; padding-top: 14px; border-top: 3px solid #dce2ea; }
+.pz-nav-part.is-cur { border-top-color: #059669; }
+.pz-nav-pn { font: 600 13px/1 var(--mono); letter-spacing: 0.12em; text-transform: uppercase; color: #047857; }
+.pz-nav-pt { font: 620 20px/1.2 var(--display); letter-spacing: -0.01em; color: #0b1a2c; margin-bottom: 4px; }
+.pz-nav-list { list-style: none; padding: 0; margin: 0; display: grid; gap: 2px; }
+.pz-nav-item {
+  display: grid; grid-template-columns: 30px 1fr; align-items: baseline; gap: 8px; padding: 7px 10px; margin: 0 -10px;
+  border-radius: 10px; text-decoration: none; color: #33425a; font-size: 16px; line-height: 1.3; transition: background-color 0.15s, color 0.15s;
+}
+.pz-nav-item:hover { background: #edf1f6; color: #0b1a2c; }
+.pz-nav-n { font: 500 13px/1 var(--mono); color: #5f6f86; font-variant-numeric: tabular-nums; }
+.pz-nav-item[aria-current] { background: #0b1a2c; color: #ffffff; font-weight: 600; }
+.pz-nav-item[aria-current] .pz-nav-n { color: #6ee7b7; }
+.pz-nav-item:focus-visible { outline-offset: 1px; }
+/* short windows: tighter list so all twenty fit without scrolling */
+@media (max-height: 700px) {
+  .pz-nav { padding: 14px; }
+  .pz-nav-panel { gap: 14px; padding: 18px 24px 20px; }
+  .pz-nav-kicker { display: none; }
+  .pz-nav-title { font-size: 24px; }
+  .pz-nav-grid { gap: 22px; }
+  .pz-nav-part { gap: 6px; padding-top: 10px; }
+  .pz-nav-pt { font-size: 18px; margin-bottom: 2px; }
+  .pz-nav-list { gap: 1px; }
+  .pz-nav-item { padding: 4px 10px; font-size: 15px; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .pz-nav:not([hidden]) .pz-nav-scrim { animation: pz-fade 0.25s ease; }
+  .pz-nav:not([hidden]) .pz-nav-panel { animation: pz-nav-in 0.32s cubic-bezier(0.2, 0.8, 0.2, 1); }
+}
+@keyframes pz-nav-in { from { opacity: 0; transform: translateY(14px) scale(0.985); } }
 /* BUILD:polish END */
