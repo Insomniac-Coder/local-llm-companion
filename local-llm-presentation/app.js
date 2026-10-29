@@ -821,6 +821,162 @@
 
   /* BUILD:hitl START */
   /* ------------------------------------------------------------------ 16: human in the loop */
+  // The run plays up to the checkpoint and stops there. Nothing happens until the presenter approves, edits or
+  // rejects; each choice resumes the same run from checkpoint 7. "Restart the server" wipes the screen and
+  // restores the run from the saved checkpoint, still waiting.
+  const HITL_AFTER = { 3: ['460 ms', '66%'], 4: ['380 ms', '54%'], 5: ['340 ms', '45%'], 6: ['320 ms', '38%'] };
+  const hitlSteps = $$('#hitlSteps .hitl-step');
+  const hitlCard = $('#hitlCard'), hitlLog = $('#hitlLog'), hitlFill = $('#hitlFill'), hitlOverlay = $('#hitlOverlay');
+  const hitlBtn = { approve: $('#hitlApprove'), edit: $('#hitlEdit'), reject: $('#hitlReject'), restart: $('#hitlRestart') };
+  let hitlRun = 0, hitlState = 'idle', hitlEditing = false, hitlReplicas = 3;
+  const hitlPause = ms => sleep(reduced ? 0 : ms);
+
+  function hitlMark(i, cls) {
+    hitlSteps[i].classList.remove('done', 'wait', 'stop', 'skip');
+    if (cls) hitlSteps[i].classList.add(cls);
+  }
+  const hitlReach = i => hitlFill.style.setProperty('--p', i / (hitlSteps.length - 1));
+  function hitlLine(time, text, kind) {
+    const li = el('li', kind || null);
+    li.append(el('time', null, time), el('span', null, text));
+    hitlLog.append(li);
+    return li;
+  }
+  function hitlEnable(on) {
+    for (const b of Object.values(hitlBtn)) b.disabled = !on;
+  }
+  function hitlSetEditing(on) {
+    hitlEditing = on;
+    $('#hitlNew').hidden = on;
+    $('#hitlStepper').hidden = !on;
+    $('#hitlEditVal').textContent = hitlReplicas;
+    $('#hitlLess').disabled = hitlReplicas <= 3;
+    $('#hitlMore').disabled = hitlReplicas >= 6;
+    hitlBtn.approve.textContent = on ? `Approve ${hitlReplicas} replicas` : 'Approve';
+    hitlBtn.edit.textContent = on ? 'Cancel edit' : 'Edit';
+    hitlBtn.reject.hidden = on;
+  }
+  function hitlReset() {
+    hitlRun++;
+    hitlState = 'idle';
+    hitlReplicas = 3;
+    hitlSteps.forEach((_, i) => hitlMark(i));
+    hitlReach(0);
+    $('#hitlDecideLabel').textContent = 'A person decides';
+    $('#hitlDecideNote').textContent = 'approve · edit · reject';
+    $('#hitlExecNote').textContent = 'apply the change';
+    $('#hitlNew').textContent = '4';
+    hitlLog.replaceChildren();
+    hitlCard.classList.remove('waiting', 'decided');
+    hitlOverlay.hidden = true;
+    $('#hitlKicker').textContent = 'Approval needed · Infra agent';
+    $('#hitlActions').hidden = false;
+    hitlBtn.restart.hidden = false;
+    $('#hitlDecision').hidden = true;
+    hitlSetEditing(false);
+    hitlEnable(false);
+  }
+  function hitlWait(restored) {
+    for (let i = 0; i < 3; i++) hitlMark(i, 'done');
+    hitlMark(3, 'wait');
+    hitlReach(3);
+    hitlCard.classList.add('waiting');
+    hitlState = 'waiting';
+    const text = restored ? 'Restored after the restart: still paused at checkpoint 7' : 'Paused at checkpoint 7: nothing has changed in production';
+    const status = $('li.status', hitlLog);
+    if (status) status.lastChild.textContent = text; else hitlLine('10:41', text, 'status');
+    hitlEnable(true);
+  }
+  async function hitlToCheckpoint() {
+    const me = ++hitlRun;
+    for (let i = 0; i < 3; i++) {
+      await hitlPause(i ? 520 : 700);
+      if (me !== hitlRun || !isActive('hitl')) return;
+      hitlMark(i, 'done');
+      hitlReach(i);
+    }
+    await hitlPause(520);
+    if (me !== hitlRun || !isActive('hitl')) return;
+    hitlWait(false);
+  }
+  async function hitlDecide(kind) {
+    if (hitlState !== 'waiting') return;
+    const me = ++hitlRun;
+    const n = kind === 'edit' ? hitlReplicas : 4;
+    hitlState = 'resuming';
+    hitlEnable(false);
+    hitlSetEditing(false);
+    $('#hitlNew').textContent = String(n);
+    hitlCard.classList.remove('waiting');
+    const status = $('li.status', hitlLog);
+    if (status) { status.className = ''; status.lastChild.textContent = 'Paused at checkpoint 7 and waited for a person'; }
+    const reject = kind === 'reject';
+    const [p95, cpu] = HITL_AFTER[n] || HITL_AFTER[4];
+    const lines = reject ? [
+      ['10:42', 'Rejected: “Not during the sale; watch it for 15 minutes”', 'no'],
+      ['10:42', 'Resumed at checkpoint 7: no change made', ''],
+      ['10:42', 'The agent will alert again if p95 stays above 2 s', ''],
+      ['10:42', 'Reported back; the decision is in the trace', 'ok'],
+    ] : [
+      ['10:42', kind === 'edit' ? `Edited by the on-call engineer: ${n} replicas` : 'Approved by the on-call engineer', 'ok'],
+      ['10:42', `Resumed at checkpoint 7: scaled 2 → ${n} replicas`, 'ok'],
+      ['10:47', `Verified: p95 ${p95}, CPU ${cpu}`, 'ok'],
+      ['10:47', kind === 'edit' ? 'Reported back; the edit is in the trace' : 'Reported back; the decision is in the trace', 'ok'],
+    ];
+    $('#hitlDecideLabel').textContent = reject ? 'Rejected' : kind === 'edit' ? 'Edited' : 'Approved';
+    $('#hitlDecideNote').textContent = kind === 'edit' ? `${n} replicas, not 4` : 'on-call engineer';
+    const stamp = $('#hitlDecision');
+    stamp.textContent = reject ? 'Rejected · no change made · 10:42' : kind === 'edit' ? `Approved with an edit: ${n} replicas · 10:42` : 'Approved by the on-call engineer · 10:42';
+    stamp.className = 'hitl-decision' + (reject ? ' no' : '');
+    $('#hitlActions').hidden = true;
+    stamp.hidden = false;
+    $('#hitlKicker').textContent = 'Decision recorded · Infra agent';
+    hitlBtn.restart.hidden = true;
+    hitlCard.classList.add('decided');
+    $('#hitlExecNote').textContent = reject ? 'skipped' : `scaled 2 → ${n}`;
+    hitlMark(3, 'done');
+    for (let k = 0; k < 4; k++) {
+      await hitlPause(k ? 650 : 250);
+      if (me !== hitlRun) return;
+      const i = 4 + k;
+      hitlMark(i, reject && (i === 5 || i === 6) ? 'skip' : reject && i === 4 ? 'stop' : 'done');
+      hitlReach(i);
+      hitlLine(...lines[k]);
+    }
+    hitlState = 'done';
+  }
+  async function hitlRestart() {
+    if (hitlState !== 'waiting') return;
+    const me = ++hitlRun;
+    hitlState = 'restarting';
+    hitlSetEditing(false);
+    hitlEnable(false);
+    hitlCard.classList.remove('waiting');
+    hitlOverlay.classList.remove('restored');
+    $('#hitlOverlayText').textContent = 'Server restarting…';
+    hitlOverlay.hidden = false;
+    hitlSteps.forEach((_, i) => hitlMark(i));
+    hitlReach(0);
+    await hitlPause(1300);
+    if (me !== hitlRun) return;
+    hitlOverlay.classList.add('restored');
+    $('#hitlOverlayText').textContent = 'Loaded checkpoint 7 from the database';
+    for (let i = 0; i < 3; i++) { hitlMark(i, 'done'); hitlReach(i); await hitlPause(150); }
+    await hitlPause(800);
+    if (me !== hitlRun) return;
+    hitlOverlay.hidden = true;
+    hitlWait(true);
+  }
+  hitlBtn.approve.addEventListener('click', () => hitlDecide(hitlEditing ? 'edit' : 'approve'));
+  hitlBtn.edit.addEventListener('click', () => { if (hitlState === 'waiting') hitlSetEditing(!hitlEditing); });
+  hitlBtn.reject.addEventListener('click', () => hitlDecide('reject'));
+  hitlBtn.restart.addEventListener('click', hitlRestart);
+  $('#hitlLess').addEventListener('click', () => { hitlReplicas = Math.max(3, hitlReplicas - 1); hitlSetEditing(true); });
+  $('#hitlMore').addEventListener('click', () => { hitlReplicas = Math.min(6, hitlReplicas + 1); hitlSetEditing(true); });
+  $('#hitlReplay').addEventListener('click', () => { hitlReset(); hitlToCheckpoint(); });
+  hitlReset();
+  // coming back to a run that is waiting for a decision keeps it waiting; anything else replays from the start
+  hooks.hitl = () => { if (hitlState !== 'waiting') { hitlReset(); hitlToCheckpoint(); } };
   /* BUILD:hitl END */
 
   /* BUILD:observe START */

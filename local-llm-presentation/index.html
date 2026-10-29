@@ -428,8 +428,69 @@
   <div class="frame"><div class="pad">
     <header class="s-head">
       <p class="eyebrow rv"><span class="ch">14</span> Human in the loop</p>
-      <h2 data-gen>Human in the loop</h2>
+      <h2 data-gen>The agent proposes. A person decides.</h2>
+      <p class="sub hitl-sub rv" style="--d:2">Before a high-impact action, LangGraph saves the run at a checkpoint and stops until a person approves, edits or rejects the plan.</p>
     </header>
+    <div class="hitl-track rv" style="--d:3">
+      <span class="hitl-fill" id="hitlFill" aria-hidden="true"></span>
+      <ol class="hitl-steps" id="hitlSteps" aria-label="The run, step by step">
+        <li class="hitl-step" data-step="request"><span class="hitl-dot"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14v10H10l-4 4v-4H5z"/></svg></span><b>Request</b><span class="hitl-note">“Checkout is slow”</span></li>
+        <li class="hitl-step" data-step="route"><span class="hitl-dot"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M12 3v6M12 15v6M3 12h6M15 12h6"/></svg></span><b>Supervisor</b><span class="hitl-note">routes to Infra</span></li>
+        <li class="hitl-step" data-step="plan"><span class="hitl-dot"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="7" rx="1.5"/><rect x="4" y="13" width="16" height="7" rx="1.5"/><path d="M8 7.5h.01M8 16.5h.01"/></svg></span><b>Infra agent</b><span class="hitl-note" id="hitlPlanNote">plans 2 → 4 replicas</span></li>
+        <li class="hitl-step" data-step="checkpoint"><span class="hitl-dot"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6v12M15 6v12"/></svg></span><b>Checkpoint</b><span class="hitl-note">#7 · state saved</span></li>
+        <li class="hitl-step" data-step="decide"><span class="hitl-dot"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="3.5"/><path d="M5 20c1.2-3.6 3.8-5.4 7-5.4s5.8 1.8 7 5.4"/></svg></span><b id="hitlDecideLabel">A person decides</b><span class="hitl-note" id="hitlDecideNote">approve, edit, reject</span></li>
+        <li class="hitl-step" data-step="execute"><span class="hitl-dot"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5l11 7-11 7z"/></svg></span><b>Execute</b><span class="hitl-note" id="hitlExecNote">apply the change</span></li>
+        <li class="hitl-step" data-step="verify"><span class="hitl-dot"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg></span><b>Verify</b><span class="hitl-note">latency and CPU</span></li>
+        <li class="hitl-step" data-step="report"><span class="hitl-dot"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h9l3 3v15H6z"/><path d="M9 11h6M9 15h6"/></svg></span><b>Report</b><span class="hitl-note">back to the team</span></li>
+      </ol>
+    </div>
+    <div class="hitl-main">
+      <article class="hitl-card card rv" style="--d:4" id="hitlCard" aria-labelledby="hitlCardTitle">
+        <header class="hitl-card-head">
+          <span class="hitl-pause" aria-hidden="true"></span>
+          <span class="hitl-card-kicker" id="hitlKicker">Approval needed · Infra agent</span>
+          <span class="hitl-risk">High · production change</span>
+          <span class="hitl-time">10:41</span>
+        </header>
+        <div class="hitl-card-body">
+          <h3 id="hitlCardTitle">Scale checkout-service on production</h3>
+          <p class="hitl-why">Why: <span class="hitl-metric">p95 latency 2.4 s</span> against a 0.5 s target, <span class="hitl-metric">CPU 92%</span> for 14 minutes <span class="hitl-illus">(illustrative)</span></p>
+          <div class="hitl-diff" aria-label="Proposed change">
+            <p class="hitl-diff-file">deployment/checkout-service · production</p>
+            <p class="hitl-del"><span aria-hidden="true">−</span> replicas: 2</p>
+            <p class="hitl-add"><span aria-hidden="true">+</span> replicas: <span class="hitl-new" id="hitlNew">4</span><span class="hitl-stepper" id="hitlStepper" hidden><button type="button" class="hitl-step-btn" id="hitlLess" aria-label="One replica fewer">−</button><output id="hitlEditVal" aria-live="polite">3</output><button type="button" class="hitl-step-btn" id="hitlMore" aria-label="One replica more">+</button></span></p>
+          </div>
+          <p class="hitl-meta">Asked by the checkout team in chat · may approve: the on-call engineer</p>
+          <div class="hitl-actions" id="hitlActions">
+            <button type="button" class="btn hitl-approve" id="hitlApprove">Approve</button>
+            <button type="button" class="btn" id="hitlEdit">Edit</button>
+            <button type="button" class="btn hitl-reject" id="hitlReject">Reject</button>
+          </div>
+          <p class="hitl-decision" id="hitlDecision" hidden></p>
+          <footer class="hitl-card-foot">
+            <span class="hitl-saved" id="hitlSaved">Saved at checkpoint 7 · thread infra-0412</span>
+            <button type="button" class="btn btn-small" id="hitlRestart">Restart the server</button>
+          </footer>
+        </div>
+        <div class="hitl-overlay" id="hitlOverlay" hidden><span class="hitl-spinner" aria-hidden="true"></span><p id="hitlOverlayText">Server restarting…</p></div>
+      </article>
+      <div class="hitl-side">
+        <section class="hitl-log card rv" style="--d:5" aria-labelledby="hitlLogTitle">
+          <div class="hitl-log-head"><p class="callout-title" id="hitlLogTitle">What happens next</p><button type="button" class="btn btn-small" id="hitlReplay">Replay</button></div>
+          <ol class="hitl-lines" id="hitlLog" aria-live="polite"></ol>
+        </section>
+        <section class="hitl-policy rv" style="--d:6" aria-labelledby="hitlPolicyTitle">
+          <p class="callout-title" id="hitlPolicyTitle">Which actions wait for a person</p>
+          <ul>
+            <li class="hitl-auto"><b>Runs on its own</b><span>Reading metrics, logs and documents</span></li>
+            <li class="hitl-notify"><b>Runs, then tells us</b><span>Changes on staging</span></li>
+            <li class="hitl-hold"><b>Waits for a person</b><span>Production changes, deletions, payments, emails outside the company</span></li>
+          </ul>
+          <p class="caption">Who may approve is itself an access right, checked like any other.</p>
+        </section>
+      </div>
+    </div>
+    <details class="eng-note"><summary>Engineer's note</summary><p>LangGraph pauses a run with <code>interrupt()</code>, called inside the node that is about to act, or with <code>interrupt_before=["execute"]</code> when the graph is compiled. Both need a checkpointer, which saves the run's state under its <code>thread_id</code>. The caller gets an <code>__interrupt__</code> payload describing the proposed change, and that is what the approval screen shows.</p><p>The decision resumes the same thread: <code>graph.invoke(Command(resume={"action": "edit", "replicas": 3}), config)</code>, and the node receives it as the return value of <code>interrupt()</code>. Edits can also be written into the saved state with <code>graph.update_state</code>. Because the checkpoint lives in a database (SQLite or Postgres), a restart while waiting loses nothing. In production, add a timeout and escalation for unanswered approvals and record who approved; the pause, the decision and the resume all appear in the LangSmith trace on the next slide.</p></details>
   </div></div>
 </section>
 <!-- BUILD:hitl END -->
