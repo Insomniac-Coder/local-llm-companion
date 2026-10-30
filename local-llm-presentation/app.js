@@ -854,9 +854,9 @@
   // dials from Facts to Brainstorm to Chat, drawing 12 answers on the way; touching anything hands over control.
   const CTL_WORDS = [['safe', 2.3], ['private', 2.0], ['secure', 1.7], ['protected', 1.4], ['yours', 0.9], ['moving', -0.2], ['guessing', -0.9], ['in a volcano', -2.6]];
   const CTL_ODD = 5;                       // index of the first nonsense word
-  const CTL_PRESETS = { facts: [0.2, 1], chat: [0.7, 5], brainstorm: [1.3, 8] };
-  const CTL_MAX = 0.15, CTL_SWEEP = 220;   // gauge: 0 to 15% over a 220° arc, square-root scale so the low band is readable
-  const CTL_BANDS = [0.01, 0.05];          // low below 1%, medium to 5%, high above
+  const CTL_PRESETS = { facts: [0.2, 1], chat: [0.7, 5], brainstorm: [1.0, 8] };
+  const CTL_MAX = 0.10, CTL_SWEEP = 220;   // gauge: 0 to 10% over a 220° arc, square-root scale so the low band is readable
+  const CTL_BANDS = [0.01, 0.04];          // low below 1%, medium to 4%, high above
   const CTL_TRACE = 0.045;                 // a cut word shown as 4% or less keeps an empty track: under two stripes of hatching
                                            // (about 14 px) the bar reads as a glitch, not as a hatched bar
   const ctlT = $('#ctlT'), ctlK = $('#ctlK'), ctlBars = $('#ctlBars'), ctlGauge = $('#ctlGauge'), ctlChips = $('#ctlChips');
@@ -913,7 +913,7 @@
   (() => {
     const b1 = gAngle(CTL_BANDS[0]), b2 = gAngle(CTL_BANDS[1]), gap = 1.6;
     let s = `<path class="ctl-band low" d="${gArc(0, b1 - gap / 2)}"/><path class="ctl-band mid" d="${gArc(b1 + gap / 2, b2 - gap / 2)}"/><path class="ctl-band high" d="${gArc(b2 + gap / 2, CTL_SWEEP)}"/>`;
-    for (const [v, lab] of [[0, '0%'], [CTL_BANDS[0], '1%'], [CTL_BANDS[1], '5%'], [CTL_MAX, '15%']]) {
+    for (const [v, lab] of [[0, '0%'], [CTL_BANDS[0], '1%'], [CTL_BANDS[1], '4%'], [CTL_MAX, '10%']]) {
       const [x, y] = gPoint(gAngle(v), G.r + G.w / 2 + 14);
       const anchor = x < G.cx - 8 ? 'end' : x > G.cx + 8 ? 'start' : 'middle';
       s += `<text class="ctl-tick" x="${x.toFixed(1)}" y="${(y + 4.5).toFixed(1)}" text-anchor="${anchor}">${lab}</text>`;
@@ -935,7 +935,7 @@
     if (top >= 0.9) return 'Almost always the same word. Right for facts, numbers and code.';
     if (T < 0.4) return 'Usually the top word, now and then the\u00a0runner-up. Still a careful setting.';
     if (band !== 'none') return 'Mostly sensible, but a nonsense word can now slip through.';
-    return T <= 1.1 ? 'Mostly sensible, with some variety. The\u00a0usual setting for chat.' : 'Varied, yet top-K keeps every pick sensible. Good for drafting ideas.';
+    return T <= 0.8 ? 'Mostly sensible, with some variety. The\u00a0usual setting for chat.' : 'Varied, yet top-K keeps every pick sensible. Good for drafting ideas.';
   }
 
   function ctlRender(T, K) {
